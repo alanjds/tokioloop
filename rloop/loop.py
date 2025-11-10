@@ -316,10 +316,6 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         interleave=None,
         all_errors=False,
     ):
-        # TODO
-        if ssl:
-            raise NotImplementedError
-
         if server_hostname is not None and not ssl:
             raise ValueError('server_hostname is only meaningful with ssl')
 
@@ -385,7 +381,7 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
                         happy_eyeballs_delay,
                         loop=self,
                     )
-                )[0]  # can't use sock, _, _ as it keeks a reference to exceptions
+                )[0]  # can't use sock, _, _ as it keeps a reference to exceptions
 
             if sock is None:
                 exceptions = [exc for sub in exceptions for exc in sub]
@@ -421,16 +417,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         rsock = (sock.fileno(), sock.family)
         sock.detach()
 
-        # TODO: ssl
-        transport, protocol = self._tcp_conn(rsock, protocol_factory)
-        # transport, protocol = await self._create_connection_transport(
-        #     sock,
-        #     protocol_factory,
-        #     ssl,
-        #     server_hostname,
-        #     ssl_handshake_timeout=ssl_handshake_timeout,
-        #     ssl_shutdown_timeout=ssl_shutdown_timeout,
-        # )
+        if ssl:
+            transport, protocol = self._ssl_conn(rsock, protocol_factory, server_hostname, ssl)
+        else:
+            transport, protocol = self._tcp_conn(rsock, protocol_factory)
 
         return transport, protocol
 
