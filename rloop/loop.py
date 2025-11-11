@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import warnings
+import logging
 from asyncio.coroutines import iscoroutine as _iscoroutine, iscoroutinefunction as _iscoroutinefunction
 from asyncio.events import _get_running_loop, _set_running_loop
 from asyncio.futures import Future as _Future, isfuture as _isfuture, wrap_future as _wrap_future
@@ -30,6 +31,8 @@ from .subprocess import (
     _ThreadedChildWatcher,
 )
 from .utils import _can_use_pidfd, _HAS_IPv6, _interleave_addrinfos, _ipaddr_info, _noop, _set_reuseport
+
+logger = logging.getLogger(__name__)
 
 
 class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
@@ -418,8 +421,10 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         sock.detach()
 
         if ssl:
+            logger.debug('Creating SSL connection')
             transport, protocol = self._ssl_conn(rsock, protocol_factory, server_hostname, ssl)
         else:
+            logger.debug('Creating TCP connection')
             transport, protocol = self._tcp_conn(rsock, protocol_factory)
 
         return transport, protocol
@@ -481,10 +486,6 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         ssl_shutdown_timeout=None,
         start_serving=True,
     ):
-        # TODO
-        if ssl:
-            raise NotImplementedError
-
         if isinstance(ssl, bool):
             raise TypeError('ssl argument must be an SSLContext or None')
 
@@ -570,11 +571,12 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
             rsocks.append((sock.fileno(), sock.family))
             sock.detach()
 
-        # TODO: ssl
-        # server = self._tcp_server(sockets, rsocks, protocol_factory, backlog,
-        #                 ssl, ssl_handshake_timeout,
-        #                 ssl_shutdown_timeout)
-        server = Server(self._tcp_server(sockets, rsocks, protocol_factory, backlog))
+        if ssl:
+            logger.debug('Creating SSL server')
+            server = Server(self._ssl_server(sockets, rsocks, protocol_factory, ssl, backlog))
+        else:
+            logger.debug('Creating TCP server')
+            server = Server(self._tcp_server(sockets, rsocks, protocol_factory, backlog))
 
         if start_serving:
             await server.start_serving()

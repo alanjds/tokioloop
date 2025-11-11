@@ -8,7 +8,7 @@ mod log;
 mod py;
 mod server;
 mod sock;
-mod ssl;
+// mod ssl;
 mod tcp;
 mod time;
 mod udp;
@@ -25,12 +25,15 @@ pub(crate) fn get_lib_version() -> &'static str {
 
 #[pymodule(gil_used = false)]
 fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
+    // Initialize logging
+    env_logger::init();
+
     module.add("__version__", get_lib_version())?;
 
     event_loop::init_pymodule(module)?;
     handles::init_pymodule(module)?;
     server::init_pymodule(module)?;
-    ssl::init_pymodule(module)?;
+    // ssl::init_pymodule(module)?;
 
     Ok(())
 }

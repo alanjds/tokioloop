@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
+use log::debug;
 use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use pyo3::prelude::*;
 
@@ -17,7 +18,7 @@ use crate::{
     log::{LogExc, log_exc_to_py_ctx},
     py::{copy_context, weakset},
     server::Server,
-    ssl::{SSLReadHandle, SSLTransport, SSLWriteHandle},
+    // ssl::{SSLReadHandle, SSLTransport, SSLWriteHandle},
     tcp::{TCPReadHandle, TCPServer, TCPServerRef, TCPTransport, TCPWriteHandle},
     time::Timer,
     udp::{UDPReadHandle, UDPTransport, UDPWriteHandle},
@@ -28,7 +29,7 @@ enum IOHandle {
     Signals,
     TCPListener(TCPListenerHandleData),
     TCPStream(Interest),
-    SSLStream(Interest),
+    // SSLStream(Interest),
     UDPSocket(Interest),
 }
 
@@ -77,7 +78,7 @@ pub struct EventLoop {
     task_factory: RwLock<Py<PyAny>>,
     tcp_lstreams: papaya::HashMap<usize, papaya::HashSet<usize>>,
     tcp_transports: papaya::HashMap<usize, Py<TCPTransport>>,
-    ssl_transports: papaya::HashMap<usize, Py<SSLTransport>>,
+    // ssl_transports: papaya::HashMap<usize, Py<SSLTransport>>,
     udp_transports: papaya::HashMap<usize, Py<UDPTransport>>,
     thread_id: atomic::AtomicI64,
     watcher_child: RwLock<Py<PyAny>>,
@@ -155,7 +156,7 @@ impl EventLoop {
                         IOHandle::Py(handle) => self.handle_io_py(py, event, handle, &mut cb_handles),
                         IOHandle::TCPListener(handle) => self.handle_io_tcpl(py, handle, &io_handles, &mut cb_handles),
                         IOHandle::TCPStream(_) => self.handle_io_tcps(event, &mut cb_handles),
-                        IOHandle::SSLStream(_) => self.handle_io_ssls(event, &mut cb_handles),
+                        // IOHandle::SSLStream(_) => self.handle_io_ssls(event, &mut cb_handles),
                         IOHandle::UDPSocket(_) => self.handle_io_udp(event, &mut cb_handles),
                         IOHandle::Signals => self.handle_io_signals(py, &mut state.buf, &mut cb_handles),
                     }
@@ -232,7 +233,6 @@ impl EventLoop {
     ) {
         if let Source::TCPListener(listener) = &handle.source {
             let guard_poll = self.io.lock().unwrap();
-            let transports = self.tcp_transports.pin();
             let streams = self.tcp_lstreams.pin();
             let lstreams = streams.get(&handle.server.fd).unwrap().pin();
             while let Ok((stream, _)) = listener.accept() {
@@ -241,10 +241,18 @@ impl EventLoop {
                 #[allow(clippy::cast_possible_wrap)]
                 let mut source = Source::FD(fd as i32);
                 let (pytransport, stream_handle) = handle.server.new_stream(py, stream);
-                transports.insert(fd, pytransport);
+                if handle.server.ssl_context.is_some() {
+                    panic!("TODO: SSL Support");
+                    debug!("Server accepted connection, creating SSL transport for fd {}", fd);
+                    debug!("Server SSL transport registered for fd {}", fd);
+                } else {
+                    let bound = pytransport.bind(py);
+                    let tcp_transport = bound.downcast::<TCPTransport>().unwrap().clone().unbind();
+                    self.tcp_transports.pin().insert(fd, tcp_transport);
+                    io_handles.insert(Token(fd), IOHandle::TCPStream(Interest::READABLE));
+                }
                 lstreams.insert(fd);
                 _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
-                io_handles.insert(Token(fd), IOHandle::TCPStream(Interest::READABLE));
                 handles.push_back(stream_handle);
             }
             return;
@@ -259,16 +267,6 @@ impl EventLoop {
             handles_ready.push_back(Box::new(TCPReadHandle { fd }));
         } else if event.is_writable() {
             handles_ready.push_back(Box::new(TCPWriteHandle { fd }));
-        }
-    }
-
-    #[inline]
-    fn handle_io_ssls(&self, event: &event::Event, handles_ready: &mut VecDeque<BoxedHandle>) {
-        let fd = event.token().0;
-        if event.is_readable() {
-            handles_ready.push_back(Box::new(SSLReadHandle { fd }));
-        } else if event.is_writable() {
-            handles_ready.push_back(Box::new(SSLWriteHandle { fd }));
         }
     }
 
@@ -508,83 +506,6 @@ impl EventLoop {
         self.udp_transports.pin().get(&fd).unwrap().clone_ref(py)
     }
 
-    #[inline]
-    pub(crate) fn ssl_stream_add(&self, fd: usize, interest: Interest) {
-        let token = Token(fd);
-        self.handles_io.pin().update_or_insert_with(
-            token,
-            |io_handle| {
-                if let IOHandle::SSLStream(interest_prev) = io_handle {
-                    if *interest_prev == interest {
-                        return IOHandle::SSLStream(interest);
-                    }
-
-                    let interests = *interest_prev | interest;
-                    {
-                        #[allow(clippy::cast_possible_wrap)]
-                        let mut source = Source::FD(fd as i32);
-                        let guard_poll = self.io.lock().unwrap();
-                        _ = guard_poll.registry().reregister(&mut source, token, interests);
-                    }
-                    return IOHandle::SSLStream(interests);
-                }
-                unreachable!()
-            },
-            || {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                {
-                    let guard_poll = self.io.lock().unwrap();
-                    _ = guard_poll.registry().register(&mut source, token, interest);
-                }
-                IOHandle::SSLStream(interest)
-            },
-        );
-    }
-
-    #[inline]
-    pub(crate) fn ssl_stream_rem(&self, fd: usize, interest: Interest) {
-        let token = Token(fd);
-
-        match self.handles_io.pin().remove_if(&token, |_, io_handle| {
-            if let IOHandle::SSLStream(interest_ex) = io_handle {
-                return *interest_ex == interest;
-            }
-            false
-        }) {
-            Ok(None) => {}
-            Ok(_) => {
-                #[allow(clippy::cast_possible_wrap)]
-                let mut source = Source::FD(fd as i32);
-                let guard_poll = self.io.lock().unwrap();
-                _ = guard_poll.registry().deregister(&mut source);
-            }
-            _ => {
-                self.handles_io.pin().update(token, |io_handle| {
-                    if let IOHandle::SSLStream(interest_ex) = io_handle {
-                        let interest_new = interest_ex.remove(interest).unwrap();
-                        #[allow(clippy::cast_possible_wrap)]
-                        let mut source = Source::FD(fd as i32);
-                        let guard_poll = self.io.lock().unwrap();
-                        _ = guard_poll.registry().reregister(&mut source, token, interest_new);
-                        return IOHandle::SSLStream(interest_new);
-                    }
-                    unreachable!()
-                });
-            }
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn ssl_stream_close(&self, py: Python, fd: usize) {
-        self.ssl_transports.pin().remove(&fd);
-    }
-
-    #[inline(always)]
-    pub(crate) fn get_ssl_transport(&self, fd: usize, py: Python) -> Py<SSLTransport> {
-        self.ssl_transports.pin().get(&fd).unwrap().clone_ref(py)
-    }
-
     pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<Py<PyAny>> {
         let handler = self.exc_handler.read().unwrap();
         handler.call1(
@@ -813,7 +734,7 @@ impl EventLoop {
             task_factory: RwLock::new(py.None()),
             tcp_lstreams: papaya::HashMap::with_capacity(32),
             tcp_transports: papaya::HashMap::with_capacity(1024),
-            ssl_transports: papaya::HashMap::with_capacity(1024),
+            // ssl_transports: papaya::HashMap::with_capacity(1024),
             udp_transports: papaya::HashMap::with_capacity(1024),
             thread_id: atomic::AtomicI64::new(0),
             watcher_child: RwLock::new(py.None()),
@@ -1290,43 +1211,25 @@ impl EventLoop {
         Py::new(py, server)
     }
 
+    fn _ssl_server(
+        pyself: Py<Self>,
+        py: Python,
+        socks: Py<PyAny>,
+        rsocks: Vec<(i32, i32)>,
+        protocol_factory: Py<PyAny>,
+        ssl_context: Py<PyAny>,
+        backlog: i32,
+    ) -> PyResult<Py<Server>> {
+        let mut servers = Vec::new();
+        for (fd, family) in rsocks {
+            servers.push(TCPServer::from_fd_ssl(fd, family, backlog, protocol_factory.clone_ref(py), ssl_context.clone_ref(py)));
+        }
+        let server = Server::tcp(pyself.clone_ref(py), socks, servers);
+        Py::new(py, server)
+    }
+
     fn _tcp_stream_bound(&self, fd: usize) -> bool {
         self.tcp_transports.pin().contains_key(&fd)
-    }
-
-    fn _ssl_conn(
-        pyself: Py<Self>,
-        py: Python,
-        sock: (i32, i32),
-        protocol_factory: Py<PyAny>,
-        server_hostname: Option<String>,
-        ssl_context: Py<PyAny>,
-    ) -> PyResult<(Py<SSLTransport>, Py<PyAny>)> {
-        let rself = pyself.get();
-        let transport = SSLTransport::from_py_client(py, &pyself, sock, protocol_factory, server_hostname, ssl_context)?;
-        let fd = transport.fd;
-        let pytransport = Py::new(py, transport)?;
-        let proto = SSLTransport::attach(&pytransport, py)?;
-        rself.ssl_transports.pin().insert(fd, pytransport.clone_ref(py));
-        rself.ssl_stream_add(fd, Interest::READABLE);
-        Ok((pytransport, proto))
-    }
-
-    fn _ssl_server_conn(
-        pyself: Py<Self>,
-        py: Python,
-        sock: (i32, i32),
-        protocol_factory: Py<PyAny>,
-        ssl_context: Py<PyAny>,
-    ) -> PyResult<(Py<SSLTransport>, Py<PyAny>)> {
-        let rself = pyself.get();
-        let transport = SSLTransport::from_py_server(py, &pyself, sock, protocol_factory, ssl_context)?;
-        let fd = transport.fd;
-        let pytransport = Py::new(py, transport)?;
-        let proto = SSLTransport::attach(&pytransport, py)?;
-        rself.ssl_transports.pin().insert(fd, pytransport.clone_ref(py));
-        rself.ssl_stream_add(fd, Interest::READABLE);
-        Ok((pytransport, proto))
     }
 
     fn _udp_conn(

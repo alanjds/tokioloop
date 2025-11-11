@@ -29,6 +29,7 @@ pub(crate) struct TCPServer {
     sfamily: i32,
     backlog: i32,
     protocol_factory: Py<PyAny>,
+    ssl_context: Option<Py<PyAny>>,
 }
 
 impl TCPServer {
@@ -38,6 +39,17 @@ impl TCPServer {
             sfamily,
             backlog,
             protocol_factory,
+            ssl_context: None,
+        }
+    }
+
+    pub(crate) fn from_fd_ssl(fd: i32, sfamily: i32, backlog: i32, protocol_factory: Py<PyAny>, ssl_context: Py<PyAny>) -> Self {
+        Self {
+            fd,
+            sfamily,
+            backlog,
+            protocol_factory,
+            ssl_context: Some(ssl_context),
         }
     }
 
@@ -52,6 +64,7 @@ impl TCPServer {
             pyloop: pyloop.clone_ref(py),
             sfamily: self.sfamily,
             proto_factory: self.protocol_factory.clone_ref(py),
+            ssl_context: self.ssl_context.as_ref().map(|ctx| ctx.clone_ref(py)),
         };
         pyloop.get().tcp_listener_add(listener, sref);
 
@@ -95,33 +108,57 @@ pub(crate) struct TCPServerRef {
     pyloop: Py<EventLoop>,
     sfamily: i32,
     proto_factory: Py<PyAny>,
+    pub ssl_context: Option<Py<PyAny>>,
 }
 
 impl TCPServerRef {
     #[inline]
-    pub(crate) fn new_stream(&self, py: Python, stream: TcpStream) -> (Py<TCPTransport>, BoxedHandle) {
-        let proto = self.proto_factory.bind(py).call0().unwrap();
+    pub(crate) fn new_stream(&self, py: Python, stream: TcpStream) -> (Py<PyAny>, BoxedHandle) {
+        if self.ssl_context.is_some() {
+            panic!("TODO: SSL support");
+            // let transport = crate::ssl::SSLTransport::from_py_server(
+            //     py,
+            //     &self.pyloop,
+            //     (stream.as_raw_fd() as i32, self.sfamily),
+            //     self.proto_factory.clone_ref(py),
+            //     self.ssl_context.as_ref().unwrap().clone_ref(py),
+            // ).unwrap();
+            // let conn_made = transport
+            //     .proto
+            //     .getattr(py, pyo3::intern!(py, "connection_made"))
+            //     .unwrap();
+            // let pytransport = Py::new(py, transport).unwrap();
+            // let conn_handle = Py::new(
+            //     py,
+            //     CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
+            // )
+            // .unwrap();
 
-        let transport = TCPTransport::new(
-            py,
-            self.pyloop.clone_ref(py),
-            stream,
-            proto,
-            self.sfamily,
-            Some(self.fd),
-        );
-        let conn_made = transport
-            .proto
-            .getattr(py, pyo3::intern!(py, "connection_made"))
+            // (pytransport.into_any(), Box::new(conn_handle))
+        } else {
+            let proto = self.proto_factory.bind(py).call0().unwrap();
+
+            let transport = TCPTransport::new(
+                py,
+                self.pyloop.clone_ref(py),
+                stream,
+                proto,
+                self.sfamily,
+                Some(self.fd),
+            );
+            let conn_made = transport
+                .proto
+                .getattr(py, pyo3::intern!(py, "connection_made"))
+                .unwrap();
+            let pytransport = Py::new(py, transport).unwrap();
+            let conn_handle = Py::new(
+                py,
+                CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
+            )
             .unwrap();
-        let pytransport = Py::new(py, transport).unwrap();
-        let conn_handle = Py::new(
-            py,
-            CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
-        )
-        .unwrap();
 
-        (pytransport, Box::new(conn_handle))
+            (pytransport.into_any(), Box::new(conn_handle))
+        }
     }
 }
 struct TCPTransportState {
