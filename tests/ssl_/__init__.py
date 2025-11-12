@@ -24,22 +24,26 @@ class SSLProtocol(asyncio.Protocol):
             raise AssertionError(f'state: {self.state!r}, expected: {expected!r}')
 
     def connection_made(self, transport):
+        print(f'[PROTOCOL] {self.__class__.__name__}: connection_made')
         logger.debug(f'{self.__class__.__name__}: connection_made')
         self.transport = transport
         self._assert_state('INITIAL')
         self.state = 'CONNECTED'
 
     def data_received(self, data):
+        print(f'[PROTOCOL] {self.__class__.__name__}: data_received {len(data)} bytes: {data!r}')
         logger.debug(f'{self.__class__.__name__}: data_received {len(data)} bytes')
         self._assert_state('CONNECTED')
         self.data += data
 
     def eof_received(self):
+        print(f'[PROTOCOL] {self.__class__.__name__}: eof_received')
         self._assert_state('CONNECTED')
         self.state = 'EOF'
         self.transport.close()
 
     def connection_lost(self, exc):
+        print(f'[PROTOCOL] {self.__class__.__name__}: connection_lost')
         logger.debug(f'{self.__class__.__name__}: connection_lost')
         self._assert_state('CONNECTED', 'EOF')
         self.transport = None

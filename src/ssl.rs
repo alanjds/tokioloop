@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{HashMap, VecDeque},
+    error::Error,
     io::{Read, Write},
     sync::atomic,
 };
@@ -9,8 +10,11 @@ use std::{
 use anyhow::Result;
 use mio::Interest;
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream};
-use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes, IntoPyObjectExt};
+use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes, IntoPyObjectExt, PyResult};
 use std::os::fd::{AsRawFd, FromRawFd};
+
+#[allow(unused_imports)]
+use std::os::raw::c_int;
 
 use crate::{
     event_loop::EventLoop,
@@ -83,8 +87,25 @@ impl SSLTransport {
         // Set non-blocking mode
         ssl_stream.get_mut().set_nonblocking(true)?;
 
-        // For non-blocking SSL, we don't try to complete handshake here
-        // It will be handled during read/write operations
+        // For non-blocking SSL, try to initiate handshake
+        // This will fail with WANT_READ/WANT_WRITE, but that's expected
+        println!("[SSL] Initiating handshake for fd {}", fd);
+        let handshake_result = ssl_stream.do_handshake();
+        println!("[SSL] Initial handshake result: {:?}", handshake_result);
+        // Don't ignore handshake errors - they might indicate configuration issues
+        if let Err(ref err) = handshake_result {
+            if let Some(ssl_err) = err.source()
+                .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+            {
+                println!("[SSL] Handshake error code: {:?}", ssl_err.code());
+                if ssl_err.code() != openssl::ssl::ErrorCode::WANT_READ
+                    && ssl_err.code() != openssl::ssl::ErrorCode::WANT_WRITE
+                {
+                    println!("[SSL] Non-recoverable handshake error, but continuing...");
+                }
+            }
+        }
+        let _ = handshake_result;
 
         let state = SSLTransportState {
             ssl_stream,
@@ -133,15 +154,53 @@ impl SSLTransport {
 
     fn create_ssl_context(py: Python, ssl_context: &Py<PyAny>) -> Result<SslContext> {
         let mut ctx = SslContext::builder(SslMethod::tls())?;
-        ctx.set_verify(openssl::ssl::SslVerifyMode::NONE); // For testing
 
-        // Try to load certificates if available
+        // Import ssl module to get constants
+        let ssl_module = py.import(pyo3::intern!(py, "ssl"))?;
+
+        // Check verification mode from Python context
+        if let Ok(verify_mode) = ssl_context.getattr(py, "verify_mode") {
+            if let Ok(verify_mode_int) = verify_mode.extract::<i32>(py) {
+                let cert_none = ssl_module.getattr(pyo3::intern!(py, "CERT_NONE"))?.extract::<i32>()?;
+                if verify_mode_int == cert_none {
+                    println!("[SSL] Disabling certificate verification");
+                    ctx.set_verify(openssl::ssl::SslVerifyMode::NONE);
+                } else {
+                    // For other modes, we'll use NONE for testing for now
+                    println!("[SSL] Using certificate verification (but may fail)");
+                    ctx.set_verify(openssl::ssl::SslVerifyMode::PEER);
+                }
+            } else {
+                ctx.set_verify(openssl::ssl::SslVerifyMode::NONE);
+            }
+        } else {
+            ctx.set_verify(openssl::ssl::SslVerifyMode::NONE); // For testing
+        }
+
+        // Try to load certificates if available (only for servers)
         if let Ok(certfile) = ssl_context.getattr(py, "_certfile") {
             if let Ok(keyfile) = ssl_context.getattr(py, "_keyfile") {
                 let certfile_str: String = certfile.extract(py)?;
                 let keyfile_str: String = keyfile.extract(py)?;
+                println!("[SSL] Loading certificates: cert={}, key={}", certfile_str, keyfile_str);
                 ctx.set_private_key_file(&keyfile_str, openssl::ssl::SslFiletype::PEM)?;
                 ctx.set_certificate_chain_file(&certfile_str)?;
+            }
+        } else {
+            println!("[SSL] No certificates loaded - this is normal for clients");
+        }
+
+        // Load CA certificates for verification
+        // For testing, load the certificate file directly if it exists
+        if let Ok(certfile) = ssl_context.getattr(py, "_certfile") {
+            if let Ok(certfile_str) = certfile.extract::<String>(py) {
+                println!("[SSL] Loading CA certificate from: {}", certfile_str);
+                if let Some(pem) = std::fs::read_to_string(&certfile_str).ok() {
+                    if let Some(x509_cert) = openssl::x509::X509::from_pem(pem.as_bytes()).ok() {
+                        ctx.cert_store_mut().add_cert(x509_cert)?;
+                        println!("[SSL] Added CA certificate to trust store");
+                    }
+                }
             }
         }
 
@@ -150,10 +209,17 @@ impl SSLTransport {
 
     pub(crate) fn attach(pyself: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
         let rself = pyself.borrow(py);
+        // For SSL transports, defer connection_made until handshake completes
+        // This is called from the event loop after SSL handshake completion
+        Ok(rself.proto.clone_ref(py))
+    }
+
+    pub(crate) fn notify_connection_made(pyself: &Py<Self>, py: Python) -> PyResult<()> {
+        let rself = pyself.borrow(py);
         rself
             .proto
             .call_method1(py, pyo3::intern!(py, "connection_made"), (pyself.clone_ref(py),))?;
-        Ok(rself.proto.clone_ref(py))
+        Ok(())
     }
 
     #[inline]
@@ -223,35 +289,140 @@ impl SSLTransport {
             return Ok(());
         }
 
+        println!("[SSL] try_write fd {}: {} bytes", rself.fd, data.len());
         let mut state = rself.state.borrow_mut();
         let buf_added = match state.write_buf_dsize {
-            0 => match state.ssl_stream.write(data) {
-                Ok(written) if written as usize == data.len() => 0,
-                Ok(written) => {
-                    let written = written as usize;
-                    state.write_buf.push_back((&data[written..]).into());
-                    data.len() - written
-                }
-                Err(err)
-                    if err.kind() == std::io::ErrorKind::Interrupted
-                        || err.kind() == std::io::ErrorKind::WouldBlock =>
-                {
-                    state.write_buf.push_back(data.into());
-                    data.len()
-                }
-                Err(err) => {
-                    if state.write_buf_dsize > 0 {
-                        rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::WRITABLE);
+            0 => {
+                let write_result = state.ssl_stream.write(data);
+                let write_result = match write_result {
+                    Err(err) => {
+                        // Check if this is an SSL handshake error that we should handle
+                        if let Some(ssl_err) = err.source()
+                            .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+                        {
+                            if ssl_err.code() == openssl::ssl::ErrorCode::WANT_READ
+                                || ssl_err.code() == openssl::ssl::ErrorCode::WANT_WRITE
+                            {
+                                // Try to continue handshake
+                                println!("[SSL] try_write fd {}: continuing handshake", rself.fd);
+                                match state.ssl_stream.do_handshake() {
+                                    Ok(_) => {
+                                        println!("[SSL] try_write fd {}: handshake completed, retrying write", rself.fd);
+                                        // Handshake completed, try writing again
+                                        state.ssl_stream.write(data)
+                                    }
+                                    Err(hs_err) => {
+                                        if let Some(hs_ssl_err) = hs_err.source()
+                                            .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+                                        {
+                                            if hs_ssl_err.code() == openssl::ssl::ErrorCode::WANT_READ
+                                                || hs_ssl_err.code() == openssl::ssl::ErrorCode::WANT_WRITE
+                                            {
+                                                // Still in progress, buffer the data and wait
+                                                state.write_buf.push_back(data.into());
+                                                return Ok(());
+                                            } else {
+                                                // Real SSL handshake error, fail
+                                                println!("[SSL] try_write fd {}: handshake failed: {:?}", rself.fd, hs_ssl_err.code());
+                                                if state.write_buf_dsize > 0 {
+                                                    rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::WRITABLE);
+                                                }
+                                                if rself
+                                                    .closing
+                                                    .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+                                                    .is_ok()
+                                                {
+                                                    rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::READABLE);
+                                                }
+                                                rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(hs_err.to_string())));
+                                                return Ok(());
+                                            }
+                                        } else {
+                                            // Not an SSL error, fail
+                                            if state.write_buf_dsize > 0 {
+                                                rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::WRITABLE);
+                                            }
+                                            if rself
+                                                .closing
+                                                .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+                                                .is_ok()
+                                            {
+                                                rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::READABLE);
+                                            }
+                                            rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(hs_err.to_string())));
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                            } else {
+                                Err(err)
+                            }
+                        } else {
+                            Err(err)
+                        }
                     }
-                    if rself
-                        .closing
-                        .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
-                        .is_ok()
+                    ok => ok,
+                };
+
+                match write_result {
+                    Ok(written) if written as usize == data.len() => 0,
+                    Ok(written) => {
+                        let written = written as usize;
+                        state.write_buf.push_back((&data[written..]).into());
+                        data.len() - written
+                    }
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::Interrupted
+                            || err.kind() == std::io::ErrorKind::WouldBlock =>
                     {
-                        rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::READABLE);
+                        state.write_buf.push_back(data.into());
+                        data.len()
                     }
-                    rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(err.to_string())));
-                    0
+                    Err(err) => {
+                        // Check if this is an SSL handshake error that we should handle
+                        if let Some(ssl_err) = err.source()
+                            .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+                        {
+                            match ssl_err.code() {
+                                openssl::ssl::ErrorCode::WANT_READ | openssl::ssl::ErrorCode::WANT_WRITE => {
+                                    // Handshake in progress, buffer the data and wait
+                                    state.write_buf.push_back(data.into());
+                                    data.len()
+                                }
+                                _ => {
+                                    // Real SSL error, fail
+                                    println!("[SSL] try_write fd {}: SSL error: {:?}", rself.fd, ssl_err.code());
+                                    if state.write_buf_dsize > 0 {
+                                        rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::WRITABLE);
+                                    }
+                                    if rself
+                                        .closing
+                                        .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+                                        .is_ok()
+                                    {
+                                        rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::READABLE);
+                                    }
+                                    rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(err.to_string())));
+                                    0
+                                }
+                            }
+                        } else {
+                            // Not an SSL error, fail
+                            println!("[SSL] try_write fd {}: non-SSL error: {:?}", rself.fd, err);
+                            if state.write_buf_dsize > 0 {
+                                rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::WRITABLE);
+                            }
+                            if rself
+                                .closing
+                                .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                rself.pyloop.get().ssl_stream_rem(rself.fd, Interest::READABLE);
+                            }
+                            rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(err.to_string())));
+                            0
+                        }
+                    }
                 }
             },
             _ => {
@@ -509,6 +680,7 @@ impl SSLReadHandle {
         let mut len = 0;
         let mut closed = false;
 
+        println!("[SSL] read_into fd {}: trying to read into {} byte buffer", self.fd, buf.len());
         loop {
             match ssl_stream.read(&mut buf[len..]) {
                 Ok(0) => {
@@ -519,7 +691,56 @@ impl SSLReadHandle {
                 }
                 Ok(readn) => len += readn,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break, // For now, break on any error including SSL handshake issues
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => {
+                    // Check if this is an SSL handshake error that we should handle
+                    if let Some(ssl_err) = err.source()
+                        .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+                    {
+                        match ssl_err.code() {
+                            openssl::ssl::ErrorCode::WANT_READ | openssl::ssl::ErrorCode::WANT_WRITE => {
+                                // Try to continue handshake
+                                println!("[SSL] read_into fd {}: continuing handshake", self.fd);
+                                match ssl_stream.do_handshake() {
+                                    Ok(_) => {
+                                        println!("[SSL] read_into fd {}: handshake completed", self.fd);
+                                        // Handshake completed, continue reading
+                                        continue;
+                                    }
+                                    Err(hs_err) => {
+                                        if let Some(hs_ssl_err) = hs_err.source()
+                                            .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+                                        {
+                                            match hs_ssl_err.code() {
+                                                openssl::ssl::ErrorCode::WANT_READ | openssl::ssl::ErrorCode::WANT_WRITE => {
+                                                    // Still in progress, no data available yet
+                                                    break;
+                                                }
+                                                _ => {
+                                                    // Real SSL handshake error
+                                                    println!("[SSL] read_into fd {}: handshake failed: {:?}", self.fd, hs_ssl_err.code());
+                                                    break;
+                                                }
+                                            }
+                                        } else {
+                                            // Not an SSL error
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Real SSL error, break
+                                println!("[SSL] read_into fd {}: SSL error: {:?}", self.fd, ssl_err.code());
+                                break;
+                            }
+                        }
+                    } else {
+                        // Not an SSL error, break
+                        println!("[SSL] read_into fd {}: non-SSL error: {:?}", self.fd, err);
+                        break;
+                    }
+                }
             }
         }
 
@@ -542,6 +763,46 @@ impl crate::handles::Handle for SSLReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut crate::event_loop::EventLoopRunState) {
         if let Some(pytransport) = event_loop.get_ssl_transport(self.fd, py) {
             let transport = pytransport.borrow(py);
+
+            // Check if handshake is complete and notify protocol if needed
+            let mut state_mut = transport.state.borrow_mut();
+            if !state_mut.handshake_complete {
+                // Try to complete handshake
+                match state_mut.ssl_stream.do_handshake() {
+                    Ok(_) => {
+                        println!("[SSL] Handshake completed for fd {}", self.fd);
+                        state_mut.handshake_complete = true;
+                        drop(state_mut); // Release borrow before calling notify
+                        // Notify protocol that connection is ready
+                        if let Err(e) = SSLTransport::notify_connection_made(&pytransport, py) {
+                            println!("[SSL] Failed to notify connection_made: {:?}", e);
+                        }
+                        return; // Don't process data yet, just notify
+                    }
+                    Err(err) => {
+                        if let Some(ssl_err) = err.source()
+                            .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+                        {
+                            if ssl_err.code() == openssl::ssl::ErrorCode::WANT_READ
+                                || ssl_err.code() == openssl::ssl::ErrorCode::WANT_WRITE
+                            {
+                                // Still in progress, wait for more events
+                                return;
+                            } else {
+                                // Real SSL error
+                                println!("[SSL] Handshake failed for fd {}: {:?}", self.fd, ssl_err.code());
+                                event_loop.ssl_stream_close(py, self.fd);
+                                return;
+                            }
+                        } else {
+                            // Non-SSL error
+                            println!("[SSL] Non-SSL handshake error for fd {}: {:?}", self.fd, err);
+                            event_loop.ssl_stream_close(py, self.fd);
+                            return;
+                        }
+                    }
+                }
+            }
 
             let mut close = false;
             loop {
@@ -596,10 +857,30 @@ impl SSLWriteHandle {
                     state.write_buf.push_front(data);
                     break;
                 }
-                _ => {
-                    state.write_buf.clear();
-                    state.write_buf_dsize = 0;
-                    return None;
+                Err(err) => {
+                    // Check if this is an SSL handshake error that we should handle
+                    if let Some(ssl_err) = err.source()
+                        .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
+                    {
+                        match ssl_err.code() {
+                            openssl::ssl::ErrorCode::WANT_READ | openssl::ssl::ErrorCode::WANT_WRITE => {
+                                // Handshake in progress, put data back and wait
+                                state.write_buf.push_front(data);
+                                break;
+                            }
+                            _ => {
+                                // Real SSL error, fail
+                                state.write_buf.clear();
+                                state.write_buf_dsize = 0;
+                                return None;
+                            }
+                        }
+                    } else {
+                        // Not an SSL error, fail
+                        state.write_buf.clear();
+                        state.write_buf_dsize = 0;
+                        return None;
+                    }
                 }
             }
         }

@@ -246,7 +246,7 @@ impl EventLoop {
                     let bound = pytransport.bind(py);
                     let ssl_transport = bound.downcast::<SSLTransport>().unwrap().clone().unbind();
                     self.ssl_transports.pin().insert(fd, ssl_transport);
-                    io_handles.insert(Token(fd), IOHandle::SSLStream(Interest::READABLE));
+                    io_handles.insert(Token(fd), IOHandle::SSLStream(Interest::READABLE | Interest::WRITABLE));
                     handles.push_back(stream_handle);
                     debug!("Server SSL transport registered for fd {}", fd);
                 } else {
@@ -258,7 +258,12 @@ impl EventLoop {
                     handles.push_back(stream_handle);
                 }
                 lstreams.insert(fd);
-                _ = guard_poll.registry().register(&mut source, token, Interest::READABLE);
+                let interests = if handle.server.ssl_context.is_some() {
+                    Interest::READABLE | Interest::WRITABLE
+                } else {
+                    Interest::READABLE
+                };
+                _ = guard_poll.registry().register(&mut source, token, interests);
             }
             return;
         }
@@ -1342,7 +1347,7 @@ impl EventLoop {
         let pytransport = Py::new(py, transport)?;
         let proto = SSLTransport::attach(&pytransport, py)?;
         rself.ssl_transports.pin().insert(fd, pytransport.clone_ref(py));
-        rself.ssl_stream_add(fd, Interest::READABLE);
+        rself.ssl_stream_add(fd, Interest::READABLE | Interest::WRITABLE);
         Ok((pytransport, proto))
     }
 

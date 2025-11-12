@@ -23,6 +23,8 @@ def ssl_context():
     # For testing with self-signed certificates, disable verification
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    # Load default certificates to ensure we have a trust store
+    ctx.load_default_certs()
     return ctx
 
 
@@ -139,14 +141,28 @@ def test_ssl_server(evloop, ssl_context, server_ssl_context):
         with sock:
             sock.bind(('127.0.0.1', 0))
             addr = sock.getsockname()
+            print(f'[TEST] Creating server on {addr}')
+            print(f'[TEST] Server SSL context attrs: {dir(server_ssl_context)}')
+            print(f'[TEST] Client SSL context attrs: {dir(ssl_context)}')
+            if hasattr(server_ssl_context, '_certfile'):
+                print(f'[TEST] Server certfile: {server_ssl_context._certfile}')
+            if hasattr(server_ssl_context, '_keyfile'):
+                print(f'[TEST] Server keyfile: {server_ssl_context._keyfile}')
             server = await loop.create_server(lambda: server_proto, sock=sock, ssl=server_ssl_context)
+            print('[TEST] Server created')
             # Give server time to start
             await asyncio.sleep(0.01)
+            print(f'[TEST] Creating client connection to {addr}')
             transport, protocol = await loop.create_connection(lambda: client_proto, *addr, ssl=ssl_context)
+            print('[TEST] Client connected')
             await client_proto._done
+            print('[TEST] Client done, closing server')
             server.close()
 
     loop.run_until_complete(main())
+    print(f'[TEST] Final states - client: {client_proto.state}, server: {server_proto.state}')
+    print(f'[TEST] Server received: {server_proto.data!r}')
+    print(f'[TEST] Client received: {client_proto.data!r}')
     assert client_proto.state == 'CLOSED'
     assert server_proto.state == 'CLOSED'
     # Check that SSL was actually used
