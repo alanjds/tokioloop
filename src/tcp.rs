@@ -79,25 +79,41 @@ impl TCPServer {
     }
 
     pub(crate) fn streams_close(&self, py: Python, event_loop: &EventLoop) {
-        let mut transports = Vec::new();
+        let mut tcp_transports = Vec::new();
+        let mut ssl_transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
             for stream_fd in &streams.pin() {
-                transports.push(event_loop.get_tcp_transport(*stream_fd, py));
+                if let Some(transport) = event_loop.get_tcp_transport(*stream_fd, py) {
+                    tcp_transports.push(transport);
+                } else if let Some(transport) = event_loop.get_ssl_transport(*stream_fd, py) {
+                    ssl_transports.push(transport);
+                }
             }
         });
-        for transport in transports {
+        for transport in tcp_transports {
+            transport.borrow(py).close(py);
+        }
+        for transport in ssl_transports {
             transport.borrow(py).close(py);
         }
     }
 
     pub(crate) fn streams_abort(&self, py: Python, event_loop: &EventLoop) {
-        let mut transports = Vec::new();
+        let mut tcp_transports = Vec::new();
+        let mut ssl_transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
             for stream_fd in &streams.pin() {
-                transports.push(event_loop.get_tcp_transport(*stream_fd, py));
+                if let Some(transport) = event_loop.get_tcp_transport(*stream_fd, py) {
+                    tcp_transports.push(transport);
+                } else if let Some(transport) = event_loop.get_ssl_transport(*stream_fd, py) {
+                    ssl_transports.push(transport);
+                }
             }
         });
-        for transport in transports {
+        for transport in tcp_transports {
+            transport.borrow(py).abort(py);
+        }
+        for transport in ssl_transports {
             transport.borrow(py).abort(py);
         }
     }
@@ -114,27 +130,39 @@ pub(crate) struct TCPServerRef {
 impl TCPServerRef {
     #[inline]
     pub(crate) fn new_stream(&self, py: Python, stream: TcpStream) -> (Py<PyAny>, BoxedHandle) {
-        if self.ssl_context.is_some() {
-            panic!("TODO: SSL support");
-            // let transport = crate::ssl::SSLTransport::from_py_server(
-            //     py,
-            //     &self.pyloop,
-            //     (stream.as_raw_fd() as i32, self.sfamily),
-            //     self.proto_factory.clone_ref(py),
-            //     self.ssl_context.as_ref().unwrap().clone_ref(py),
-            // ).unwrap();
-            // let conn_made = transport
-            //     .proto
-            //     .getattr(py, pyo3::intern!(py, "connection_made"))
-            //     .unwrap();
-            // let pytransport = Py::new(py, transport).unwrap();
-            // let conn_handle = Py::new(
-            //     py,
-            //     CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
-            // )
-            // .unwrap();
+        if let Some(ssl_context) = &self.ssl_context {
+            // Create SSL transport
+            let fd = stream.as_raw_fd();
+            let socket_family = self.sfamily;
+            let sock = (fd, socket_family);
 
-            // (pytransport.into_any(), Box::new(conn_handle))
+            let transport = match crate::ssl::SSLTransport::new(
+                py,
+                self.pyloop.clone_ref(py),
+                sock,
+                ssl_context.clone_ref(py),
+                self.proto_factory.clone_ref(py),
+                true, // server connection
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("SSL transport creation failed: {:?}", e);
+                    panic!("SSL transport creation failed");
+                }
+            };
+
+            let conn_made = transport
+                .proto
+                .getattr(py, pyo3::intern!(py, "connection_made"))
+                .unwrap();
+            let pytransport = Py::new(py, transport).unwrap();
+            let conn_handle = Py::new(
+                py,
+                CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
+            )
+            .unwrap();
+
+            (pytransport.into_any(), Box::new(conn_handle))
         } else {
             let proto = self.proto_factory.bind(py).call0().unwrap();
 
@@ -653,34 +681,35 @@ impl TCPReadHandle {
 
 impl Handle for TCPReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
-        let pytransport = event_loop.get_tcp_transport(self.fd, py);
-        let transport = pytransport.borrow(py);
+        if let Some(pytransport) = event_loop.get_tcp_transport(self.fd, py) {
+            let transport = pytransport.borrow(py);
 
-        // NOTE: we need to consume all the data coming from the socket even when it exceeds the buffer,
-        //       otherwise we won't get another readable event from the poller
-        let mut close = false;
-        loop {
-            let (data, eof) = match transport.proto_buffered {
-                true => self.recv_buffered(py, &transport),
-                false => self.recv_direct(py, &transport, &mut state.read_buf),
-            };
+            // NOTE: we need to consume all the data coming from the socket even when it exceeds the buffer,
+            //       otherwise we won't get another readable event from the poller
+            let mut close = false;
+            loop {
+                let (data, eof) = match transport.proto_buffered {
+                    true => self.recv_buffered(py, &transport),
+                    false => self.recv_direct(py, &transport, &mut state.read_buf),
+                };
 
-            if let Some(data) = data {
-                _ = transport.protom_recv_data.call1(py, (data,));
-                if !eof {
-                    continue;
+                if let Some(data) = data {
+                    _ = transport.protom_recv_data.call1(py, (data,));
+                    if !eof {
+                        continue;
+                    }
                 }
+
+                if eof {
+                    close = self.recv_eof(py, event_loop, &transport);
+                }
+
+                break;
             }
 
-            if eof {
-                close = self.recv_eof(py, event_loop, &transport);
+            if close {
+                event_loop.tcp_stream_close(py, self.fd);
             }
-
-            break;
-        }
-
-        if close {
-            event_loop.tcp_stream_close(py, self.fd);
         }
     }
 }
@@ -726,32 +755,33 @@ impl TCPWriteHandle {
 
 impl Handle for TCPWriteHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        let pytransport = event_loop.get_tcp_transport(self.fd, py);
-        let transport = pytransport.borrow(py);
-        let stream_close;
+        if let Some(pytransport) = event_loop.get_tcp_transport(self.fd, py) {
+            let transport = pytransport.borrow(py);
+            let stream_close;
 
-        if let Some(written) = self.write(&transport) {
-            if written > 0 {
-                TCPTransport::write_buf_size_decr(&pytransport, py);
+            if let Some(written) = self.write(&transport) {
+                if written > 0 {
+                    TCPTransport::write_buf_size_decr(&pytransport, py);
+                }
+                stream_close = match transport.state.borrow().write_buf.is_empty() {
+                    true => transport.close_from_write_handle(py, false),
+                    false => None,
+                };
+            } else {
+                stream_close = transport.close_from_write_handle(py, true);
             }
-            stream_close = match transport.state.borrow().write_buf.is_empty() {
-                true => transport.close_from_write_handle(py, false),
-                false => None,
-            };
-        } else {
-            stream_close = transport.close_from_write_handle(py, true);
-        }
 
-        if transport.state.borrow().write_buf.is_empty() {
-            event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
-        }
-
-        match stream_close {
-            Some(true) => event_loop.tcp_stream_close(py, self.fd),
-            Some(false) => {
-                _ = transport.state.borrow().stream.shutdown(std::net::Shutdown::Write);
+            if transport.state.borrow().write_buf.is_empty() {
+                event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
             }
-            _ => {}
+
+            match stream_close {
+                Some(true) => event_loop.tcp_stream_close(py, self.fd),
+                Some(false) => {
+                    _ = transport.state.borrow().stream.shutdown(std::net::Shutdown::Write);
+                }
+                _ => {}
+            }
         }
     }
 }
