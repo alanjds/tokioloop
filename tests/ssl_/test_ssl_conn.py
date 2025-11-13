@@ -252,13 +252,11 @@ def test_cross_implementation_server_client(evloop_server, evloop_client, ssl_co
 
 @pytest.mark.timeout(15)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_ssl_server_with_httpx_client(evloop, server_ssl_context):
-    """Test RLoop SSL server with external httpx async client."""
-    import asyncio as asyncio_std
+def test_ssl_server_with_requests_client(evloop, server_ssl_context):
+    """Test EventLoop SSL server with external requests client."""
+    import requests
 
-    import httpx
-
-    # Use EventLoop for server, httpx for client
+    # Use EventLoop for server, requests for client
     server_loop = evloop()
     loopclass = type(server_loop).__name__
 
@@ -272,10 +270,10 @@ def test_ssl_server_with_httpx_client(evloop, server_ssl_context):
         with sock:
             sock.bind((host, port))
             addr = sock.getsockname()
-            logger.debug(f'[HTTPX-TEST] Creating {loopclass} SSL server on {addr}')
+            logger.debug(f'[server] Creating {loopclass} SSL server on {addr}')
             # Create new protocol instance for each connection
             server = await server_loop.create_server(lambda: SSLHTTPServerProtocol(), sock=sock, ssl=server_ssl_context)
-            logger.debug(f'[HTTPX-TEST] {loopclass} SSL server created')
+            logger.debug(f'[server] {loopclass} SSL server created')
 
             # Signal that server is ready
             server_ready.set()
@@ -283,7 +281,7 @@ def test_ssl_server_with_httpx_client(evloop, server_ssl_context):
             # Wait for test completion
             await asyncio.sleep(10)
             server.close()
-            logger.debug('[HTTPX-TEST] {loopclass} server closed')
+            logger.debug('[server] {loopclass} server closed')
 
     # Shared state
     server_ready = threading.Event()
@@ -295,36 +293,25 @@ def test_ssl_server_with_httpx_client(evloop, server_ssl_context):
     # Wait for server to be ready
     server_ready.wait()
 
-    # Test with httpx client
-    async def test_with_httpx():
-        # Create SSL context for httpx
-        ssl_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-        cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
-        certfile = os.path.join(cert_dir, 'cert.pem')
-        ssl_ctx.load_verify_locations(cafile=certfile)
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
+    # Create SSL context for requests
+    ssl_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
+    certfile = os.path.join(cert_dir, 'cert.pem')
+    ssl_ctx.load_verify_locations(cafile=certfile)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
 
-        async with httpx.AsyncClient(verify=ssl_ctx) as client:
-            url = f'https://{host}:{port}/'
-            logger.debug(f'[HTTPX-TEST] Connecting to {url}')
+    url = f'https://{host}:{port}/'
+    logger.debug(f'[client] Connecting to {url}')
 
-            # Since our server is just an echo server, we'll send a raw request
-            # httpx expects HTTP, but our server just echoes, so this will test SSL handshake
-            try:
-                response = await client.get(url, timeout=5.0)
-                logger.debug(f'[HTTPX-TEST] httpx response: {response.status_code}')
-                return response
-            except Exception as e:
-                logger.debug(f'[HTTPX-TEST] httpx failed (expected for echo server): {e}')
-                # This is expected since our server doesn't speak HTTP
-
-    # Run httpx test
-    response = asyncio_std.run(test_with_httpx())
-    logger.info('httpx response: %s', response)
+    response = requests.get(url, verify=False, timeout=5.0, cert=(certfile, os.path.join(cert_dir, 'key.pem')))
 
     # Wait server to stop
     server_thread.join(timeout=10)
+
+    response.raise_for_status()
+    assert response.status_code == 200
+    assert response.content == b'hello SSL world'
 
     # The test passes if no exceptions were thrown during SSL connection establishment
     # The logs showing connection_made and data_received prove SSL worked

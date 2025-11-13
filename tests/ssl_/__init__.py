@@ -8,6 +8,7 @@ import pytest
 import rloop
 
 
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
