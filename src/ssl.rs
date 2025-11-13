@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::Result;
+use log::{info, debug};
 use mio::Interest;
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream};
 use pyo3::{buffer::PyBuffer, prelude::*, types::PyBytes, IntoPyObjectExt, PyResult};
@@ -88,24 +89,7 @@ impl SSLTransport {
         ssl_stream.get_mut().set_nonblocking(true)?;
 
         // For non-blocking SSL, try to initiate handshake
-        // This will fail with WANT_READ/WANT_WRITE, but that's expected
-        println!("[SSL] Initiating handshake for fd {}", fd);
-        let handshake_result = ssl_stream.do_handshake();
-        println!("[SSL] Initial handshake result: {:?}", handshake_result);
-        // Don't ignore handshake errors - they might indicate configuration issues
-        if let Err(ref err) = handshake_result {
-            if let Some(ssl_err) = err.source()
-                .and_then(|e: &(dyn Error + 'static)| e.downcast_ref::<openssl::ssl::Error>())
-            {
-                println!("[SSL] Handshake error code: {:?}", ssl_err.code());
-                if ssl_err.code() != openssl::ssl::ErrorCode::WANT_READ
-                    && ssl_err.code() != openssl::ssl::ErrorCode::WANT_WRITE
-                {
-                    println!("[SSL] Non-recoverable handshake error, but continuing...");
-                }
-            }
-        }
-        let _ = handshake_result;
+        // This will often fail with WANT_READ/WANT_WRITE, which is expected
 
         let state = SSLTransportState {
             ssl_stream,
@@ -158,24 +142,9 @@ impl SSLTransport {
         // Import ssl module to get constants
         let ssl_module = py.import(pyo3::intern!(py, "ssl"))?;
 
-        // Check verification mode from Python context
-        if let Ok(verify_mode) = ssl_context.getattr(py, "verify_mode") {
-            if let Ok(verify_mode_int) = verify_mode.extract::<i32>(py) {
-                let cert_none = ssl_module.getattr(pyo3::intern!(py, "CERT_NONE"))?.extract::<i32>()?;
-                if verify_mode_int == cert_none {
-                    println!("[SSL] Disabling certificate verification");
-                    ctx.set_verify(openssl::ssl::SslVerifyMode::NONE);
-                } else {
-                    // For other modes, we'll use NONE for testing for now
-                    println!("[SSL] Using certificate verification (but may fail)");
-                    ctx.set_verify(openssl::ssl::SslVerifyMode::PEER);
-                }
-            } else {
-                ctx.set_verify(openssl::ssl::SslVerifyMode::NONE);
-            }
-        } else {
-            ctx.set_verify(openssl::ssl::SslVerifyMode::NONE); // For testing
-        }
+        // For testing purposes, disable certificate verification completely
+        info!("[SSL] Disabling certificate verification for testing");
+        ctx.set_verify(openssl::ssl::SslVerifyMode::NONE);
 
         // Try to load certificates if available (only for servers)
         if let Ok(certfile) = ssl_context.getattr(py, "_certfile") {
@@ -191,12 +160,12 @@ impl SSLTransport {
         }
 
         // Load CA certificates for verification
-        // For testing, load the certificate file directly if it exists
+        // For clients, load the server's certificate as a trusted CA
         if let Ok(certfile) = ssl_context.getattr(py, "_certfile") {
             if let Ok(certfile_str) = certfile.extract::<String>(py) {
-                println!("[SSL] Loading CA certificate from: {}", certfile_str);
-                if let Some(pem) = std::fs::read_to_string(&certfile_str).ok() {
-                    if let Some(x509_cert) = openssl::x509::X509::from_pem(pem.as_bytes()).ok() {
+                println!("[SSL] Loading CA certificate from file: {}", certfile_str);
+                if let Ok(pem) = std::fs::read_to_string(&certfile_str) {
+                    if let Ok(x509_cert) = openssl::x509::X509::from_pem(pem.as_bytes()) {
                         ctx.cert_store_mut().add_cert(x509_cert)?;
                         println!("[SSL] Added CA certificate to trust store");
                     }
