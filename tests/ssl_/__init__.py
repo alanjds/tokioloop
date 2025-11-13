@@ -64,7 +64,7 @@ class SSLHTTPServerProtocol(SSLProtocol):
             response = (
                 b'HTTP/1.1 200 OK\r\n'
                 b'Content-Type: text/plain\r\n'
-                b'Content-Length: 14\r\n'
+                b'Content-Length: 15\r\n'
                 b'Connection: close\r\n'
                 b'\r\n'
                 b'hello SSL world'
