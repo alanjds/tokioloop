@@ -26,7 +26,6 @@ def ssl_context():
     """Create a basic SSL context for testing."""
     ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
     # For testing with self-signed certificates, load the server's cert as trusted
-    import os
 
     cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
     certfile = os.path.join(cert_dir, 'cert.pem')
@@ -42,7 +41,6 @@ def server_ssl_context():
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     # For testing, load test certificates for asyncio compatibility
     # The Rust implementation generates its own dummy certificate when no certs are loaded
-    import os
     cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
     # Set attributes that Rust code expects
     ctx._certfile = os.path.join(cert_dir, 'cert.pem')
@@ -250,20 +248,25 @@ def test_cross_implementation_server_client(evloop_server, evloop_client, ssl_co
     assert server_proto.data == b'hello SSL world'
 
 
-@pytest.mark.timeout(15)
+@pytest.mark.timeout(10)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
 def test_ssl_server_with_requests_client(evloop, server_ssl_context):
     """Test EventLoop SSL server with external requests client."""
+
     import requests
 
     # Use EventLoop for server, requests for client
     server_loop = evloop()
-    loopclass = type(server_loop).__name__
 
     host = '127.0.0.1'
     port = random.randint(10000, 20000)
 
-    async def run_server():
+    # Shared state
+    server_ready = threading.Event()
+    server_stop = threading.Event()
+
+    async def run_server(loop, host, port, lifetime=10):
+        loopclass = type(loop).__name__
         sock = socket.socket()
         sock.setblocking(False)
 
@@ -272,47 +275,44 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context):
             addr = sock.getsockname()
             logger.debug(f'[server] Creating {loopclass} SSL server on {addr}')
             # Create new protocol instance for each connection
-            server = await server_loop.create_server(lambda: SSLHTTPServerProtocol(), sock=sock, ssl=server_ssl_context)
+            server = await loop.create_server(lambda: SSLHTTPServerProtocol(), sock=sock, ssl=server_ssl_context)
             logger.debug(f'[server] {loopclass} SSL server created')
 
             # Signal that server is ready
             server_ready.set()
 
-            # Wait for test completion
-            await asyncio.sleep(10)
+            i = 0
+            for i in range(lifetime):
+                await asyncio.sleep(1)
+                if server_stop.is_set():
+                    break
+
+            logger.debug('[server] {loopclass} server closing [lifetime=%s should_stop=%s]', i, server_stop.is_set())
             server.close()
             logger.debug('[server] {loopclass} server closed')
 
-    # Shared state
-    server_ready = threading.Event()
-
     # Start server in thread
-    server_thread = threading.Thread(target=lambda: server_loop.run_until_complete(run_server()))
+    coro = run_server(server_loop, host, port)
+    server_thread = threading.Thread(target=lambda: server_loop.run_until_complete(coro))
     server_thread.start()
 
     # Wait for server to be ready
     server_ready.wait()
 
-    # Create SSL context for requests
-    ssl_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
-    certfile = os.path.join(cert_dir, 'cert.pem')
-    ssl_ctx.load_verify_locations(cafile=certfile)
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-
     url = f'https://{host}:{port}/'
-    logger.debug(f'[client] Connecting to {url}')
+    logger.debug(f'[client] Connecting to {url} via requests')
+    response = requests.get(url, verify=False, timeout=5.0)
 
-    response = requests.get(url, verify=False, timeout=5.0, cert=(certfile, os.path.join(cert_dir, 'key.pem')))
+    # logger.debug(f'[client] Connecting to {host}:{port} via openssl')
+    # openssl_ = subprocess.run(['openssl', 's_client', '-connect', f'{host}:{port}'])
+    # logger.debug('openssl stdout: %s', openssl_.stdout)
+    # logger.debug('openssl stderr: %s', openssl_.stderr)
 
-    # Wait server to stop
-    server_thread.join(timeout=10)
+    # Signal and wait server to stop
+    logger.debug('[client] Signaling the server to stop')
+    server_stop.set()
+    server_thread.join(timeout=3)
 
     response.raise_for_status()
     assert response.status_code == 200
     assert response.content == b'hello SSL world'
-
-    # The test passes if no exceptions were thrown during SSL connection establishment
-    # The logs showing connection_made and data_received prove SSL worked
-    # We don't check protocol state since each connection gets its own instance

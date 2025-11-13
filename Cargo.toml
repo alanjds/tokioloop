@@ -38,6 +38,8 @@ openssl = "0.10"
 papaya = "=0.2"
 pyo3 = { version = "=0.26", features = ["anyhow", "extension-module", "generate-import-lib"] }
 rcgen = "=0.13"
+rustls = { version = "0.23", features = ["std"] }
+rustls-pemfile = "2.0"
 socket2 = { version = "=0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]

@@ -36,6 +36,7 @@ class SSLProtocol(asyncio.Protocol):
         self.data += data
 
     def eof_received(self):
+        logger.debug(f'{self.__class__.__name__}: eof_received')
         self._assert_state('CONNECTED')
         self.state = 'EOF'
         self.transport.close()
@@ -58,6 +59,7 @@ class SSLEchoServerProtocol(SSLProtocol):
 
 class SSLHTTPServerProtocol(SSLProtocol):
     def data_received(self, data):
+        logger.debug('received data=%s', data)
         super().data_received(data)
         if self.transport and b'GET' in data:
             # Send a proper HTTP 200 response
@@ -69,8 +71,11 @@ class SSLHTTPServerProtocol(SSLProtocol):
                 b'\r\n'
                 b'hello SSL world'
             )
+            logger.debug('sending response (len=%s)', len(response))
             self.transport.write(response)
+            logger.debug('closing transport')
             self.transport.close()
+            logger.debug('closed transport')
 
 
 class SSLEchoClientProtocol(SSLProtocol):
@@ -87,8 +92,6 @@ class SSLEchoClientProtocol(SSLProtocol):
 def ssl_context():
     """Create a basic SSL context for testing."""
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    # For testing, we'll use a self-signed certificate
-    # In a real application, you'd load proper certificates
     return ctx
 
 
