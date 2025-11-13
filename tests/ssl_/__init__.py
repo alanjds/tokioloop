@@ -70,6 +70,7 @@ class SSLHTTPServerProtocol(SSLProtocol):
                 b'hello SSL world'
             )
             self.transport.write(response)
+            self.transport.close()
 
 
 class SSLEchoClientProtocol(SSLProtocol):
