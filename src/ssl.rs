@@ -18,6 +18,30 @@ pub(crate) fn create_ssl_config() -> Result<ServerConfig> {
     Ok(config)
 }
 
+/// Debug function to list supported cipher suites
+#[pyfunction]
+pub fn list_rustls_cipher_suites() -> PyResult<Vec<String>> {
+    // List the default cipher suites that rustls supports
+    let default_suites = rustls::crypto::aws_lc_rs::DEFAULT_CIPHER_SUITES;
+    let cipher_suites = default_suites.iter()
+        .map(|cs| format!("{:?}", cs))
+        .collect::<Vec<_>>();
+
+    Ok(cipher_suites)
+}
+
+/// Debug function to list all available cipher suites
+#[pyfunction]
+pub fn list_all_rustls_cipher_suites() -> PyResult<Vec<String>> {
+    // List all cipher suites that rustls supports
+    let all_suites = rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES;
+    let cipher_suites = all_suites.iter()
+        .map(|cs| format!("{:?}", cs))
+        .collect::<Vec<_>>();
+
+    Ok(cipher_suites)
+}
+
 /// Create SSL server configuration from an SSL context
 pub(crate) fn create_ssl_config_from_context(ssl_context: &Bound<PyAny>) -> Result<ServerConfig> {
     // Try to extract certificate and key file paths from the SSL context
@@ -121,6 +145,8 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     }
 }
 
-pub(crate) fn init_pymodule(_module: &Bound<PyModule>) -> PyResult<()> {
+pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(list_rustls_cipher_suites, module)?)?;
+    module.add_function(wrap_pyfunction!(list_all_rustls_cipher_suites, module)?)?;
     Ok(())
 }
