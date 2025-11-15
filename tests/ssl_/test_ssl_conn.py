@@ -294,7 +294,7 @@ def test_cross_implementation_server_client(evloop_server, evloop_client, ssl_co
 
 
 @pytest.mark.timeout(10)
-@pytest.mark.parametrize('evloop', [EVENT_LOOPS[0]], ids=lambda x: type(x()))
+@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
 def test_ssl_server_with_requests_client(evloop, server_ssl_context):
     """Test EventLoop SSL server with external requests client."""
 
