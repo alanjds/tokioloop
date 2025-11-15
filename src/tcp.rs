@@ -132,18 +132,29 @@ impl TCPServerRef {
             transport.initialize_tls_server(ssl_config.clone());
         }
 
-        let conn_made = transport
-            .proto
-            .getattr(py, pyo3::intern!(py, "connection_made"))
-            .unwrap();
         let pytransport = Py::new(py, transport).unwrap();
-        let conn_handle = Py::new(
-            py,
-            CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
-        )
-        .unwrap();
 
-        (pytransport, Box::new(conn_handle))
+        // For SSL connections, delay connection_made until handshake completes
+        let is_ssl = self.ssl_config.is_some();
+        let conn_handle: BoxedHandle = if is_ssl {
+            // For SSL connections, create a dummy handle that does nothing
+            // connection_made will be called later when handshake completes
+            Box::new(Py::new(py, CBHandle::new0(py.None(), py.None())).unwrap())
+        } else {
+            // For non-SSL connections, call connection_made immediately
+            let conn_made = pytransport
+                .borrow(py)
+                .proto
+                .getattr(py, pyo3::intern!(py, "connection_made"))
+                .unwrap();
+            Box::new(Py::new(
+                py,
+                CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
+            )
+            .unwrap())
+        };
+
+        (pytransport, conn_handle)
     }
 
     #[inline]
@@ -207,6 +218,7 @@ struct TCPTransportState {
     stream: TcpStream,
     tls_conn: Option<TLSConnection>,
     handshake_complete: bool,
+    connection_made_called: bool,
     write_buf: VecDeque<Box<[u8]>>,
     write_buf_dsize: usize,
 }
@@ -249,6 +261,7 @@ impl TCPTransport {
             stream,
             tls_conn: None,
             handshake_complete: false,
+            connection_made_called: false,
             write_buf: VecDeque::new(),
             write_buf_dsize: 0,
         };
@@ -725,6 +738,14 @@ impl TCPReadHandle {
                     if !state.handshake_complete && !tls_conn.is_handshaking() {
                         state.handshake_complete = true;
                         log::debug!("SSL read: handshake completed");
+
+                        // For SSL connections, call connection_made after handshake completes
+                        if !state.connection_made_called {
+                            state.connection_made_called = true;
+                            // Call connection_made on the protocol
+                            let pytransport = transport.pyloop.get().get_tcp_transport(self.fd, py);
+                            let _ = transport.proto.call_method1(py, pyo3::intern!(py, "connection_made"), (pytransport.clone_ref(py),));
+                        }
                     } else if !state.handshake_complete {
                         log::debug!("SSL read: still handshaking");
                     }
