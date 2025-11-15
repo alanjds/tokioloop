@@ -73,9 +73,9 @@ class SSLHTTPServerProtocol(SSLProtocol):
             )
             logger.debug('sending response (len=%s)', len(response))
             self.transport.write(response)
-            logger.debug('closing transport')
-            self.transport.close()
-            logger.debug('closed transport')
+            logger.debug('response sent, scheduling connection close')
+            # Schedule close after a short delay to ensure response is sent
+            asyncio.get_event_loop().call_later(0.1, self.transport.close)
 
 
 class SSLEchoClientProtocol(SSLProtocol):
