@@ -6,6 +6,7 @@ import socket
 import ssl
 import threading
 import time
+from threading import Event, Thread
 
 import pytest
 
@@ -55,7 +56,9 @@ EVENT_LOOPS = [
 ]
 
 
-def start_ssl_http_server(loop, server_ssl_context, host='localhost', port=None, lifetime=10):
+def start_ssl_http_server(
+    loop, server_ssl_context, host='localhost', port=None, lifetime=10
+) -> tuple[Thread, Event, tuple[str, int]]:
     """Helper function to start SSL HTTP server for testing."""
     if port is None:
         port = random.randint(10000, 20000)
@@ -396,85 +399,73 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context):
 
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_ssl_server_with_tlslite_client(evloop, server_ssl_context):
-    """Test EventLoop SSL server with tlslite-ng pure Python SSL client."""
+def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
+    """Test EventLoop SSL server with openssl s_client command-line tool."""
 
-    try:
-        from tlslite import TLSConnection
-    except ImportError:
-        pytest.skip('tlslite-ng not available')
+    import subprocess
 
-    # Use EventLoop for server, tlslite-ng for client
+    # Use EventLoop for server, openssl s_client for client
     server_loop = evloop()
 
     server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
 
-    # Create tlslite-ng SSL client
-    logger.debug(f'[client] Connecting to {host}:{port} via tlslite-ng')
+    # Create openssl s_client command with handshake debugging
+    cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
+    cmd = [
+        'openssl',
+        's_client',
+        '-connect',
+        f'{host}:{port}',
+        '-servername',
+        host,
+        '-CAfile',
+        os.path.join(cert_dir, 'cert.pem'),
+        '-ign_eof',
+        '-msg',  # Show handshake messages
+        '-state',  # Show SSL state
+        '-tlsextdebug',  # Show TLS extensions
+    ]
+
+    logger.debug(f'[client] Running: {" ".join(cmd)}')
 
     success = False
     try:
-        # Create socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((host, port))
-        logger.debug('[client] Socket connected')
-
-        # Create TLS connection
-        connection = TLSConnection(sock)
-
-        # Load client certificate for verification (optional)
-        cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
-        with open(os.path.join(cert_dir, 'cert.pem'), 'rb') as f:
-            server_cert_data = f.read()
-
-        # Perform handshake (skip certificate validation for testing)
-        connection.handshakeClientAnonymous()
-        logger.debug('[client] TLS handshake completed')
+        # Start openssl s_client process
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         # Send HTTP request
-        request = b'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
-        connection.send(request)
-        logger.debug('[client] HTTP request sent')
+        http_request = 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+        stdout, stderr = proc.communicate(input=http_request, timeout=10)
 
-        # Read response
-        response_data = b''
-        while True:
-            try:
-                data = connection.recv(4096)
-                if not data:
-                    break
-                response_data += data
-            except:
-                break
+        logger.debug(f'[client] openssl exit code: {proc.returncode}')
 
-        logger.debug(f'[client] Received {len(response_data)} bytes of response')
+        # Log stdout line by line
+        for line in stdout.splitlines():
+            logger.debug(f'[client] openssl stdout: {line[:200]}')
 
-        # Parse response
-        if response_data.startswith(b'HTTP/1.1 200 OK'):
-            logger.debug('[client] Got 200 OK response')
-            # Check for our expected content
-            if b'hello SSL world' in response_data:
-                logger.debug('[client] Response contains expected content')
-                success = True
-            else:
-                logger.debug('[client] Response missing expected content')
+        # Log stderr line by line
+        for line in stderr.splitlines():
+            logger.debug(f'[client] openssl stderr: {line[:200]}')
+
+        # Check if connection was successful and response contains expected content
+        if proc.returncode == 0 and 'hello SSL world' in stdout:
+            logger.debug('[client] openssl client test passed')
+            success = True
         else:
-            logger.debug(f'[client] Unexpected response: {response_data[:100]!r}')
+            logger.debug(f'[client] openssl client test failed - exit code: {proc.returncode}')
 
+    except subprocess.TimeoutExpired:
+        logger.debug('[client] openssl s_client timed out')
+        proc.kill()
+    except FileNotFoundError:
+        logger.debug('[client] openssl command not found')
+        pytest.skip('openssl command not available')
     except Exception as e:
-        logger.debug(f'[client] TLS connection failed: {e}')
-        import traceback
-
-        logger.debug(f'[client] Traceback: {traceback.format_exc()}')
-    finally:
-        try:
-            connection.close()
-        except:
-            pass
+        logger.debug(f'[client] openssl client failed: {e}')
 
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
     server_stop.set()
     server_thread.join(timeout=3)
 
-    assert success, 'tlslite-ng client test failed'
+    assert success, 'openssl s_client test failed'
