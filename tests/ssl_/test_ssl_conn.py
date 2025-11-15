@@ -54,6 +54,48 @@ EVENT_LOOPS = [
     rloop.new_event_loop,
 ]
 
+
+def start_ssl_http_server(loop, server_ssl_context, host='localhost', port=None, lifetime=10):
+    """Helper function to start SSL HTTP server for testing."""
+    if port is None:
+        port = random.randint(10000, 20000)
+
+    server_ready = threading.Event()
+    server_stop = threading.Event()
+    server_addr = None
+
+    async def run_server():
+        nonlocal server_addr
+        loopclass = type(loop).__name__
+        sock = socket.socket()
+        sock.setblocking(False)
+
+        with sock:
+            sock.bind((host, port))
+            server_addr = sock.getsockname()
+            logger.debug(f'[server] Creating {loopclass} SSL server on {server_addr}')
+            server = await loop.create_server(lambda: SSLHTTPServerProtocol(), sock=sock, ssl=server_ssl_context)
+            logger.debug(f'[server] {loopclass} SSL server created')
+
+            server_ready.set()
+
+            i = 0
+            for i in range(lifetime):
+                await asyncio.sleep(1)
+                if server_stop.is_set():
+                    break
+
+            logger.debug(f'[server] {loopclass} server closing [lifetime={i} should_stop={server_stop.is_set()}]')
+            server.close()
+            logger.debug(f'[server] {loopclass} server closed')
+
+    coro = run_server()
+    server_thread = threading.Thread(target=lambda: loop.run_until_complete(coro))
+    server_thread.start()
+    server_ready.wait()
+    return server_thread, server_stop, server_addr
+
+
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
 def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context):
     """Test basic connection with echo server."""
@@ -258,46 +300,7 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context):
     # Use EventLoop for server, raw SSL socket for client
     server_loop = evloop()
 
-    host = 'localhost'
-    port = random.randint(10000, 20000)
-
-    # Shared state
-    server_ready = threading.Event()
-    server_stop = threading.Event()
-
-    async def run_server(loop, host, port, lifetime=10):
-        loopclass = type(loop).__name__
-        sock = socket.socket()
-        sock.setblocking(False)
-
-        with sock:
-            sock.bind((host, port))
-            addr = sock.getsockname()
-            logger.debug(f'[server] Creating {loopclass} SSL server on {addr}')
-            # Create new protocol instance for each connection
-            server = await loop.create_server(lambda: SSLHTTPServerProtocol(), sock=sock, ssl=server_ssl_context)
-            logger.debug(f'[server] {loopclass} SSL server created')
-
-            # Signal that server is ready
-            server_ready.set()
-
-            i = 0
-            for i in range(lifetime):
-                await asyncio.sleep(1)
-                if server_stop.is_set():
-                    break
-
-            logger.debug('[server] {loopclass} server closing [lifetime=%s should_stop=%s]', i, server_stop.is_set())
-            server.close()
-            logger.debug('[server] {loopclass} server closed')
-
-    # Start server in thread
-    coro = run_server(server_loop, host, port)
-    server_thread = threading.Thread(target=lambda: server_loop.run_until_complete(coro))
-    server_thread.start()
-
-    # Wait for server to be ready
-    server_ready.wait()
+    server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
 
     url = f'https://{host}:{port}'
     # Create raw SSL client
@@ -322,46 +325,7 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context):
     # Use EventLoop for server, raw SSL socket for client
     server_loop = evloop()
 
-    host = 'localhost'
-    port = random.randint(10000, 20000)
-
-    # Shared state
-    server_ready = threading.Event()
-    server_stop = threading.Event()
-
-    async def run_server(loop, host, port, lifetime=10):
-        loopclass = type(loop).__name__
-        sock = socket.socket()
-        sock.setblocking(False)
-
-        with sock:
-            sock.bind((host, port))
-            addr = sock.getsockname()
-            logger.debug(f'[server] Creating {loopclass} SSL server on {addr}')
-            # Create new protocol instance for each connection
-            server = await loop.create_server(lambda: SSLHTTPServerProtocol(), sock=sock, ssl=server_ssl_context)
-            logger.debug(f'[server] {loopclass} SSL server created')
-
-            # Signal that server is ready
-            server_ready.set()
-
-            i = 0
-            for i in range(lifetime):
-                await asyncio.sleep(1)
-                if server_stop.is_set():
-                    break
-
-            logger.debug('[server] {loopclass} server closing [lifetime=%s should_stop=%s]', i, server_stop.is_set())
-            server.close()
-            logger.debug('[server] {loopclass} server closed')
-
-    # Start server in thread
-    coro = run_server(server_loop, host, port)
-    server_thread = threading.Thread(target=lambda: server_loop.run_until_complete(coro))
-    server_thread.start()
-
-    # Wait for server to be ready
-    server_ready.wait()
+    server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
 
     # Create raw SSL client
     logger.debug(f'[client] Connecting to {host}:{port} via raw SSL socket')
@@ -443,46 +407,7 @@ def test_ssl_server_with_tlslite_client(evloop, server_ssl_context):
     # Use EventLoop for server, tlslite-ng for client
     server_loop = evloop()
 
-    host = 'localhost'
-    port = random.randint(10000, 20000)
-
-    # Shared state
-    server_ready = threading.Event()
-    server_stop = threading.Event()
-
-    async def run_server(loop, host, port, lifetime=10):
-        loopclass = type(loop).__name__
-        sock = socket.socket()
-        sock.setblocking(False)
-
-        with sock:
-            sock.bind((host, port))
-            addr = sock.getsockname()
-            logger.debug(f'[server] Creating {loopclass} SSL server on {addr}')
-            # Create new protocol instance for each connection
-            server = await loop.create_server(lambda: SSLHTTPServerProtocol(), sock=sock, ssl=server_ssl_context)
-            logger.debug(f'[server] {loopclass} SSL server created')
-
-            # Signal that server is ready
-            server_ready.set()
-
-            i = 0
-            for i in range(lifetime):
-                await asyncio.sleep(1)
-                if server_stop.is_set():
-                    break
-
-            logger.debug('[server] {loopclass] server closing [lifetime=%s should_stop=%s]', i, server_stop.is_set())
-            server.close()
-            logger.debug('[server] {loopclass} server closed')
-
-    # Start server in thread
-    coro = run_server(server_loop, host, port)
-    server_thread = threading.Thread(target=lambda: server_loop.run_until_complete(coro))
-    server_thread.start()
-
-    # Wait for server to be ready
-    server_ready.wait()
+    server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
 
     # Create tlslite-ng SSL client
     logger.debug(f'[client] Connecting to {host}:{port} via tlslite-ng')
