@@ -903,6 +903,7 @@ pub(crate) struct TCPWriteHandle {
 impl TCPWriteHandle {
     #[inline]
     fn write(&self, transport: &TCPTransport) -> Option<usize> {
+        log::debug!("DEBUG: TCPWriteHandle::write called for fd {}", self.fd);
         #[allow(clippy::cast_possible_wrap)]
         let fd = self.fd as i32;
 

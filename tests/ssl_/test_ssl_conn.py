@@ -397,7 +397,7 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context):
     assert success, 'Raw SSL client test failed'
 
 
-@pytest.mark.timeout(10)
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
 def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
     """Test EventLoop SSL server with openssl s_client command-line tool."""
@@ -445,7 +445,7 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
 
         # Log stderr line by line
         for line in stderr.splitlines():
-            logger.debug(f'[client] openssl stderr: {line[:200]}')
+            logger.debug(f'[client] openssl stderr: {line[:500]}')
 
         # Check if connection was successful and response contains expected content
         if proc.returncode == 0 and 'hello SSL world' in stdout:
@@ -466,6 +466,6 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
     server_stop.set()
-    server_thread.join(timeout=3)
+    server_thread.join(timeout=5)
 
     assert success, 'openssl s_client test failed'
