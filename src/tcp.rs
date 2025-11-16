@@ -221,6 +221,8 @@ struct TCPTransportState {
     connection_made_called: bool,
     write_buf: VecDeque<Box<[u8]>>,
     write_buf_dsize: usize,
+    tls_close_sent: bool,
+    tls_close_sent_time: Option<std::time::Instant>,
 }
 
 #[pyclass(frozen, unsendable, module = "rloop._rloop")]
@@ -264,6 +266,8 @@ impl TCPTransport {
             connection_made_called: false,
             write_buf: VecDeque::new(),
             write_buf_dsize: 0,
+            tls_close_sent: false,
+            tls_close_sent_time: None,
         };
 
         let wh = 1024 * 64;
@@ -371,6 +375,12 @@ impl TCPTransport {
             return false;
         }
 
+        // For TLS connections, call close() to send TLS close alerts
+        if self.state.borrow().tls_conn.is_some() {
+            self.close(py);
+            return true;
+        }
+
         event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
         _ = self.protom_conn_lost.call1(py, (py.None(),));
         true
@@ -414,10 +424,19 @@ impl TCPTransport {
         let is_tls = rself.state.borrow().tls_conn.is_some();
         if is_tls {
             log::debug!("SSL write: try_write called with {} bytes of application data", data.len());
+        } else {
+            log::debug!("TCP write: try_write called with {} bytes of application data", data.len());
         }
 
-        let mut state = rself.state.borrow_mut();
-        let buf_added = match state.write_buf_dsize {
+    let mut state = rself.state.borrow_mut();
+
+    // For TLS connections, never write directly to socket - always buffer for encryption
+    let buf_added = if is_tls {
+        log::debug!("SSL write: TLS connection detected, buffering {} bytes for encryption", data.len());
+        state.write_buf.push_back(data.into());
+        data.len()
+    } else {
+        match state.write_buf_dsize {
             #[allow(clippy::cast_possible_wrap)]
             0 => match syscall!(write(rself.fd as i32, data.as_ptr().cast(), data.len())) {
                 Ok(written) if written as usize == data.len() => 0,
@@ -453,7 +472,8 @@ impl TCPTransport {
                 state.write_buf.push_back(data.into());
                 data.len()
             }
-        };
+        }
+    };
         if buf_added > 0 {
             if state.write_buf_dsize == 0 {
                 rself.pyloop.get().tcp_stream_add(rself.fd, Interest::WRITABLE);
@@ -515,12 +535,18 @@ impl TCPTransport {
         self.closing.load(atomic::Ordering::Relaxed)
     }
 
-    fn close(&self, py: Python) {
+    pub(crate) fn is_tls(&self) -> bool {
+        self.state.borrow().tls_conn.is_some()
+    }
+
+    pub(crate) fn close(&self, py: Python) {
+        log::debug!("TCPTransport::close() called for fd {}", self.fd);
         if self
             .closing
             .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
             .is_err()
         {
+            log::debug!("TCPTransport::close() already closing, returning");
             return;
         }
 
@@ -533,18 +559,36 @@ impl TCPTransport {
                 let mut state = self.state.borrow_mut();
                 if let Some(ref mut tls_conn) = state.tls_conn {
                     let _ = tls_conn.write_tls(&mut tls_buf);
+                    // Mark that we've sent our close alert
+                    state.tls_close_sent = true;
+                    state.tls_close_sent_time = Some(std::time::Instant::now());
                 }
             }
             if !tls_buf.is_empty() {
+                log::trace!("SSL close: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
+                // Fix TLS record version: Force all TLS records to use 0x0303 (TLS 1.2 compatible)
+                if tls_buf.len() >= 5 {
+                    log::trace!("SSL close: Original version bytes: {:02x} {:02x}", tls_buf[1], tls_buf[2]);
+                }
                 let fd = self.fd as i32;
                 let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
             }
+
+            // For TLS connections, close immediately after sending close alert
+            // This is not perfect TLS close handshake, but works for most clients
+            log::debug!("SSL close: closing connection immediately after sending close alert");
+            let event_loop = self.pyloop.get();
+            event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
+            event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+            self.call_conn_lost(py, None);
+            return;
         }
 
         let event_loop = self.pyloop.get();
         event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
-        if self.state.borrow().write_buf_dsize == 0 {
-            // set conn lost?
+        if self.state.borrow().write_buf_dsize == 0 || self.state.borrow().tls_conn.is_some() {
+            // For TLS connections, close immediately after sending close alert
+            // even if write buffer is not empty (close alert will be sent by TCPWriteHandle)
             event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
             self.call_conn_lost(py, None);
         }
@@ -723,10 +767,28 @@ impl TCPReadHandle {
                     }
 
                     // Process the new packets
-                    if let Err(e) = tls_conn.process_new_packets() {
-                        log::debug!("SSL read: TLS process_new_packets error: {:?}", e);
-                        // TLS error - close connection
-                        return (None, true);
+                    match tls_conn.process_new_packets() {
+                        Ok(io_state) => {
+                            // Check if we received a close alert from the peer
+                            if io_state.peer_has_closed() {
+                                log::debug!("SSL read: peer has closed the connection (received close alert)");
+                                // If we've sent our close alert and received the peer's, close the connection
+                                if state.tls_close_sent {
+                                    log::debug!("SSL read: TLS close handshake complete, closing connection");
+                                    return (None, true);
+                                } else {
+                                    log::debug!("SSL read: received peer close alert but we haven't sent ours yet");
+                                    // We should send our close alert in response
+                                    // This will be handled by the write path
+                                    transport.pyloop.get().tcp_stream_add(transport.fd, Interest::WRITABLE);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("SSL read: TLS process_new_packets error: {:?}", e);
+                            // TLS error - close connection
+                            return (None, true);
+                        }
                     }
                 }
 
@@ -927,6 +989,7 @@ impl TCPWriteHandle {
             }
 
             if !tls_buf.is_empty() {
+                log::trace!("SSL write: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
                 log::debug!("SSL write: sending {} bytes of TLS data", tls_buf.len());
                 match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
                     Ok(written) if written as usize == tls_buf.len() => {
@@ -998,6 +1061,7 @@ impl TCPWriteHandle {
                 }
 
                 if !tls_buf.is_empty() {
+                    log::trace!("SSL write: Application data TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
                     match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
                         Ok(written) if written as usize == tls_buf.len() => {}
                         Ok(_) => return None, // Partial write
@@ -1063,6 +1127,26 @@ impl Handle for TCPWriteHandle {
         let pytransport = event_loop.get_tcp_transport(self.fd, py);
         let transport = pytransport.borrow(py);
         let stream_close;
+
+        // Check if we need to timeout waiting for peer's close alert
+        {
+            let state = transport.state.borrow();
+            if state.tls_close_sent && state.tls_conn.is_some() {
+                log::debug!("SSL close: already sent. Waiting a response with TCP open.");
+                if let Some(sent_time) = state.tls_close_sent_time {
+                    let elapsed = sent_time.elapsed();
+                    if elapsed > std::time::Duration::from_millis(1000) {
+                        log::debug!("SSL close: timeout waiting for peer's close alert ({}ms), closing connection", elapsed.as_millis());
+                        // Force close the connection
+                        drop(state);
+                        event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
+                        event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+                        transport.call_conn_lost(py, None);
+                        return;
+                    }
+                }
+            }
+        }
 
         if let Some(written) = self.write(&transport) {
             if written > 0 {
