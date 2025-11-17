@@ -107,6 +107,23 @@ known-first-party = ['rloop', 'tests']
 [tool.pytest.ini_options]
 asyncio_mode = 'auto'
 
+log_cli = true
+log_cli_level = "INFO"
+
+doctest_optionflags = [
+    "NORMALIZE_WHITESPACE",
+    "ALLOW_UNICODE",
+    "ALLOW_BYTES",
+    "NUMBER",
+]
+addopts = [
+    "--continue-on-collection-errors",
+    "--ignore-glob=*_BACKUP_*",
+    "-v",
+    "--doctest-modules",
+    "--doctest-ignore-import-errors",
+]
+
 
 [tool.uv]
 package = false
