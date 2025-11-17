@@ -1191,10 +1191,12 @@ impl Handle for TCPWriteHandle {
             if written > 0 {
                 TCPTransport::write_buf_size_decr(&pytransport, py);
             }
-            stream_close = match transport.state.borrow().write_buf.is_empty() {
+            let (write_buf_empty, pending_ssl_close) = {
+                let state = transport.state.borrow();
+                (state.write_buf.is_empty(), state.tls_pending_close)
+            };
+            stream_close = match write_buf_empty {
                 true => {
-                    // Check if we have a pending SSL close
-                    let pending_ssl_close = transport.state.borrow().tls_pending_close;
                     if pending_ssl_close {
                         log::debug!("SSL write: write buffer empty, sending pending close alert for fd {}", self.fd);
                         // Send the close alert now that buffer is empty
