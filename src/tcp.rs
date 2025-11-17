@@ -240,6 +240,7 @@ struct TCPTransportState {
     tls_close_sent: bool,
     tls_close_received: bool,
     tls_close_sent_time: Option<std::time::Instant>,
+    tls_pending_close: bool,
 }
 
 #[pyclass(frozen, unsendable, module = "rloop._rloop")]
@@ -286,6 +287,7 @@ impl TCPTransport {
             tls_close_sent: false,
             tls_close_received: false,
             tls_close_sent_time: None,
+            tls_pending_close: false,
         };
 
         let wh = 1024 * 64;
@@ -568,38 +570,41 @@ impl TCPTransport {
             return;
         }
 
-        // For TLS connections, send a close alert but keep connection open for handshake
+        // For TLS connections
         if self.state.borrow().tls_conn.is_some() {
-            log::debug!("SSL close: sending TLS close alert for fd {}", self.fd);
-            // Try to send any pending TLS data (including close alerts)
-            let mut tls_buf = Vec::new();
-            {
-                let mut state = self.state.borrow_mut();
-                if let Some(ref mut tls_conn) = state.tls_conn {
-                    let _ = tls_conn.write_tls(&mut tls_buf);
-                    // Mark that we've sent our close alert
-                    state.tls_close_sent = true;
-                    state.tls_close_sent_time = Some(std::time::Instant::now());
+            let has_pending_data = !self.state.borrow().write_buf.is_empty();
+            if has_pending_data {
+                log::debug!("SSL close: pending data in write buffer, deferring close alert for fd {}", self.fd);
+                // Mark that we want to close after pending data is sent
+                self.state.borrow_mut().tls_pending_close = true;
+                return;
+            } else {
+                log::debug!("SSL close: no pending data, sending TLS close alert for fd {}", self.fd);
+                // Send close alert immediately since no pending data
+                let mut tls_buf = Vec::new();
+                {
+                    let mut state = self.state.borrow_mut();
+                    if let Some(ref mut tls_conn) = state.tls_conn {
+                        let _ = tls_conn.write_tls(&mut tls_buf);
+                        // Mark that we've sent our close alert
+                        state.tls_close_sent = true;
+                        state.tls_close_sent_time = Some(std::time::Instant::now());
+                    }
                 }
-            }
-            if !tls_buf.is_empty() {
-                log::trace!("SSL close: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
-                // Fix TLS record version: Force all TLS records to use 0x0303 (TLS 1.2 compatible)
-                if tls_buf.len() >= 5 {
-                    log::trace!("SSL close: Original version bytes: {:02x} {:02x}", tls_buf[1], tls_buf[2]);
+                if !tls_buf.is_empty() {
+                    log::trace!("SSL close: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
+                    let fd = self.fd as i32;
+                    let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
                 }
-                let fd = self.fd as i32;
-                let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
-            }
 
-            // For TLS connections, close immediately after sending close alert
-            // This is not perfect TLS close handshake, but works for most clients
-            log::debug!("SSL close: closing connection immediately after sending close alert");
-            let event_loop = self.pyloop.get();
-            event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
-            event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
-            self.call_conn_lost(py, None);
-            return;
+                // Close the connection
+                log::debug!("SSL close: closing connection after sending close alert");
+                let event_loop = self.pyloop.get();
+                event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
+                event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
+                self.call_conn_lost(py, None);
+                return;
+            }
         }
 
         let event_loop = self.pyloop.get();
@@ -1187,7 +1192,33 @@ impl Handle for TCPWriteHandle {
                 TCPTransport::write_buf_size_decr(&pytransport, py);
             }
             stream_close = match transport.state.borrow().write_buf.is_empty() {
-                true => transport.close_from_write_handle(py, false),
+                true => {
+                    // Check if we have a pending SSL close
+                    let pending_ssl_close = transport.state.borrow().tls_pending_close;
+                    if pending_ssl_close {
+                        log::debug!("SSL write: write buffer empty, sending pending close alert for fd {}", self.fd);
+                        // Send the close alert now that buffer is empty
+                        let mut tls_buf = Vec::new();
+                        {
+                            let mut state = transport.state.borrow_mut();
+                            if let Some(ref mut tls_conn) = state.tls_conn {
+                                let _ = tls_conn.write_tls(&mut tls_buf);
+                                state.tls_close_sent = true;
+                                state.tls_close_sent_time = Some(std::time::Instant::now());
+                                state.tls_pending_close = false; // Clear the flag
+                            }
+                        }
+                        if !tls_buf.is_empty() {
+                            log::trace!("SSL close: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
+                            let fd = self.fd as i32;
+                            let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
+                        }
+                        // Now close the connection
+                        Some(true)
+                    } else {
+                        transport.close_from_write_handle(py, false)
+                    }
+                }
                 false => None,
             };
         } else {
