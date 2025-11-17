@@ -592,7 +592,7 @@ impl TCPTransport {
                     }
                 }
                 if !tls_buf.is_empty() {
-                    log::trace!("SSL close: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
+                    log::trace!("SSL close: TLS buffer: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
                     let fd = self.fd as i32;
                     let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
                 }
@@ -1028,7 +1028,7 @@ impl TCPWriteHandle {
             }
 
             if !tls_buf.is_empty() {
-                log::trace!("SSL write: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
+                log::trace!("SSL write: TLS buffer: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
                 log::debug!("SSL write: sending {} bytes of TLS data", tls_buf.len());
                 match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
                     Ok(written) if written as usize == tls_buf.len() => {
@@ -1100,7 +1100,7 @@ impl TCPWriteHandle {
                 }
 
                 if !tls_buf.is_empty() {
-                    log::trace!("SSL write: Application data TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
+                    log::trace!("SSL write: Application data TLS buffer: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
                     match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
                         Ok(written) if written as usize == tls_buf.len() => {}
                         Ok(_) => return None, // Partial write
@@ -1209,7 +1209,7 @@ impl Handle for TCPWriteHandle {
                             }
                         }
                         if !tls_buf.is_empty() {
-                            log::trace!("SSL close: TLS buffer before version fix: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
+                            log::trace!("SSL close: TLS buffer: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
                             let fd = self.fd as i32;
                             let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
                         }
