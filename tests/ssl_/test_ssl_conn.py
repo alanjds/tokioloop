@@ -5,7 +5,6 @@ import random
 import socket
 import ssl
 import threading
-import time
 from threading import Event, Thread
 
 import pytest
@@ -57,7 +56,7 @@ EVENT_LOOPS = [
 
 
 def start_ssl_http_server(
-    loop, server_ssl_context, host='localhost', port=None, lifetime=10
+    loop, server_ssl_context, host='localhost', port=None, lifetime=10, protocol=SSLHTTPServerProtocol
 ) -> tuple[Thread, Event, tuple[str, int]]:
     """Helper function to start SSL HTTP server for testing."""
     if port is None:
@@ -77,7 +76,7 @@ def start_ssl_http_server(
             sock.bind((host, port))
             server_addr = sock.getsockname()
             logger.debug(f'[server] Creating {loopclass} SSL server on {server_addr}')
-            server = await loop.create_server(lambda: SSLHTTPServerProtocol(), sock=sock, ssl=server_ssl_context)
+            server = await loop.create_server(lambda: protocol(), sock=sock, ssl=server_ssl_context)
             logger.debug(f'[server] {loopclass} SSL server created')
 
             server_ready.set()
@@ -224,75 +223,53 @@ def test_ssl_server(evloop, ssl_context, server_ssl_context):
     assert client_proto.data.startswith(b'echo: hello SSL world')
 
 
-@pytest.mark.timeout(15)
+@pytest.mark.timeout(20)
 @pytest.mark.parametrize('evloop_server', EVENT_LOOPS, ids=lambda x: type(x()))
 @pytest.mark.parametrize('evloop_client', EVENT_LOOPS, ids=lambda x: type(x()))
 def test_cross_implementation_server_client(evloop_server, evloop_client, ssl_context, server_ssl_context):
     """Test RLoop SSL client against asyncio SSL server."""
-    import random
     import threading
 
     # Use asyncio for server, RLoop for client
     server_loop = evloop_server()
     client_loop = evloop_client()
+    client_loop_name = type(client_loop).__name__
 
-    server_proto = SSLEchoServerProtocol()
     client_proto = SSLEchoClientProtocol(client_loop.create_future)
 
-    host = '127.0.0.1'
-    port = random.randint(10000, 20000)
-
-    async def run_server():
-        sock = socket.socket()
-        sock.setblocking(False)
-
-        with sock:
-            sock.bind((host, port))
-            addr = sock.getsockname()
-            logger.debug(f'[CROSS-TEST] Creating asyncio SSL server on {addr}')
-            server = await server_loop.create_server(lambda: server_proto, sock=sock, ssl=server_ssl_context)
-            logger.debug('[CROSS-TEST] Asyncio SSL server created')
-
-            logger.debug('[CROSS-TEST: asyncio] Keeping server ready for 10 sec.')
-            await asyncio.sleep(10)
-            server.close()
-            logger.debug('[CROSS-TEST] Asyncio server closed')
-
     async def run_client():
-        addr = (host, port)
-        logger.debug(f'[CROSS-TEST] Creating RLoop SSL client to {addr}')
+        logger.debug(f'[client] Creating {client_loop_name} SSL client to server')
         for i in range(3):
             try:
                 transport, protocol = await client_loop.create_connection(
-                    lambda: client_proto, addr[0], addr[1], ssl=ssl_context
+                    lambda: client_proto, host, port, ssl=ssl_context
                 )  # type: ignore
-                logger.debug(f'[CROSS-TEST [{i}]] RLoop SSL client connected')
+                logger.debug(f'[client [{i}]] {client_loop_name} SSL client connected')
                 await client_proto._done
-                logger.debug(f'[CROSS-TEST [{i}]] RLoop client done')
+                logger.debug(f'[client [{i}]] {client_loop_name} client done')
                 break
             except Exception as e:
-                logger.debug(f'[CROSS-TEST [{i}]] RLoop client failed: {e}')
+                logger.debug(f'[client [{i}]] {client_loop_name} client failed: {e}')
 
-    # Run both loops in threads
-    server_thread = threading.Thread(target=lambda: server_loop.run_until_complete(run_server()))
-    time.sleep(2)
+    server_thread, server_stop, (host, port) = start_ssl_http_server(
+        server_loop, server_ssl_context, protocol=SSLEchoServerProtocol
+    )
+
     client_thread = threading.Thread(target=lambda: client_loop.run_until_complete(run_client()))
-
-    server_thread.start()
     client_thread.start()
+    client_thread.join(timeout=10)
 
-    server_thread.join(timeout=12)
-    client_thread.join(timeout=12)
+    # Signal and wait server to stop
+    logger.debug('[test] Signaling the server to stop')
+    server_stop.set()
+    server_thread.join(timeout=3)
 
     # Check results
-    logger.debug(f'[CROSS-TEST] Server state: {server_proto.state}')
-    logger.debug(f'[CROSS-TEST] Client state: {client_proto.state}')
-    logger.debug(f'[CROSS-TEST] Server received: {server_proto.data!r}')
-    logger.debug(f'[CROSS-TEST] Client received: {client_proto.data!r}')
+    logger.debug(f'[test] Client state: {client_proto.state}')
+    logger.debug(f'[test] Client received: {client_proto.data!r}')
 
-    # For now, just check that server worked (since client has timing issues)
-    assert server_proto.state == 'CLOSED'
-    assert server_proto.data == b'hello SSL world'
+    assert client_proto.state == 'CLOSED'
+    assert client_proto.data == b'echo: hello SSL world'
 
 
 @pytest.mark.timeout(10)
@@ -462,8 +439,6 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
 
         logger.debug('proc.returncode = %s', proc.returncode)
         logger.debug(f"'hello SSL world' in stdout = {'hello SSL world' in stdout}")
-        logger.debug(f'stdout contains: {repr(stdout)}')
-        logger.debug(f'stderr contains: {repr(stderr)}')
 
         # Check if connection was successful and response contains expected content
         if proc.returncode == 0 and 'hello SSL world' in stdout:

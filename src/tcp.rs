@@ -232,6 +232,13 @@ impl TLSConnection {
             TLSConnection::Client(conn) => conn.write_tls(wr),
         }
     }
+
+    fn send_close_notify(&mut self) {
+        match self {
+            TLSConnection::Server(conn) => conn.send_close_notify(),
+            TLSConnection::Client(conn) => conn.send_close_notify(),
+        }
+    }
 }
 
 struct TCPTransportState {
@@ -345,9 +352,12 @@ impl TCPTransport {
 
     pub(crate) fn attach(pyself: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
         let rself = pyself.borrow(py);
-        rself
-            .proto
-            .call_method1(py, pyo3::intern!(py, "connection_made"), (pyself.clone_ref(py),))?;
+        // For SSL connections, delay connection_made until handshake completes
+        if !rself.state.borrow().tls_conn.is_some() {
+            rself
+                .proto
+                .call_method1(py, pyo3::intern!(py, "connection_made"), (pyself.clone_ref(py),))?;
+        }
         Ok(rself.proto.clone_ref(py))
     }
 
@@ -431,8 +441,16 @@ impl TCPTransport {
 
     #[inline(always)]
     fn call_conn_lost(&self, py: Python, err: Option<PyErr>) {
-        _ = self.protom_conn_lost.call1(py, (err,));
+        let err_arg = match err {
+            Some(e) => e.into_py_any(py).unwrap(),
+            None => py.None(),
+        };
+        _ = self.protom_conn_lost.call1(py, (err_arg,));
         self.pyloop.get().tcp_stream_close(py, self.fd);
+    }
+
+    fn call_conn_lost_py(&self, py: Python) {
+        self.call_conn_lost(py, None);
     }
 
     fn try_write(pyself: &Py<Self>, py: Python, data: &[u8]) -> PyResult<()> {
@@ -589,6 +607,8 @@ impl TCPTransport {
                 {
                     let mut state = self.state.borrow_mut();
                     if let Some(ref mut tls_conn) = state.tls_conn {
+                        // Send close notify to initiate TLS close handshake
+                        tls_conn.send_close_notify();
                         let _ = tls_conn.write_tls(&mut tls_buf);
                         // Mark that we've sent our close alert
                         state.tls_close_sent = true;
@@ -601,12 +621,21 @@ impl TCPTransport {
                     let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
                 }
 
-                // Close the connection
-                log::debug!("SSL close: closing connection after sending close alert");
+                // For TLS connections, don't call connection_lost immediately
+                // Wait for peer's close alert or TCP close, but set a timeout
+                log::debug!("SSL close: sent close alert, waiting for peer response");
                 let event_loop = self.pyloop.get();
-                event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
                 event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
-                self.call_conn_lost(py, None);
+                // Keep readable interest to detect peer's close
+
+                // Schedule a timeout to force close the connection
+                let pytransport = event_loop.get_tcp_transport(self.fd, py).unwrap();
+                let _ = event_loop.schedule_later0(
+                    std::time::Duration::from_millis(1000),
+                    pytransport.getattr(py, pyo3::intern!(py, "call_connection_lost")).unwrap(),
+                    None,
+                );
+
                 return;
             }
         }
@@ -756,6 +785,10 @@ impl TCPTransport {
         }
         self.call_conn_lost(py, None);
     }
+
+    fn call_connection_lost(&self, py: Python) {
+        self.call_conn_lost_py(py);
+    }
 }
 
 pub(crate) struct TCPReadHandle {
@@ -801,16 +834,25 @@ impl TCPReadHandle {
                                 log::debug!("SSL read: peer has closed the connection (received close alert)");
                                 state.tls_close_received = true;
 
-                                // If we've sent our close alert and received the peer's, close the connection
-                                if state.tls_close_sent {
-                                    log::debug!("SSL read: TLS close handshake complete, closing connection");
-                                    return (None, true);
-                                } else {
-                                    log::debug!("SSL read: received peer close alert but we haven't sent ours yet");
-                                    // We should send our close alert in response
-                                    // This will be handled by the write path
-                                    transport.pyloop.get().tcp_stream_add(transport.fd, Interest::WRITABLE);
+                                // Send our close alert in response if we haven't already
+                                if !state.tls_close_sent {
+                                    log::debug!("SSL read: sending close alert in response to peer's close alert");
+                                    if let Some(ref mut tls_conn) = state.tls_conn {
+                                        tls_conn.send_close_notify();
+                                        let mut tls_buf = Vec::new();
+                                        let _ = tls_conn.write_tls(&mut tls_buf);
+                                        if !tls_buf.is_empty() {
+                                            let fd = transport.fd as i32;
+                                            let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
+                                        }
+                                        state.tls_close_sent = true;
+                                        state.tls_close_sent_time = Some(std::time::Instant::now());
+                                    }
                                 }
+
+                                // TLS close handshake is complete, close the connection
+                                log::debug!("SSL read: TLS close handshake complete, closing connection");
+                                return (None, true);
                             }
                         }
                         Err(e) => {
@@ -965,6 +1007,13 @@ impl TCPReadHandle {
         {
             return false;
         }
+
+        // For TLS connections that have sent a close alert, call connection_lost when TCP closes
+        if transport.state.borrow().tls_conn.is_some() && transport.state.borrow().tls_close_sent {
+            transport.call_conn_lost(py, None);
+            return true;
+        }
+
         transport.close_from_read_handle(py, event_loop)
     }
 }
@@ -973,7 +1022,8 @@ impl Handle for TCPReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
         let pytransport = match event_loop.get_tcp_transport(self.fd, py) {
             Some(t) => t,
-            None => return, // Transport was closed
+            None => return,  // Transport was closed
+
         };
         let transport = pytransport.borrow(py);
 
@@ -1174,7 +1224,7 @@ impl Handle for TCPWriteHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
         let pytransport = match event_loop.get_tcp_transport(self.fd, py) {
             Some(t) => t,
-            None => return, // Transport was closed
+            None => return,  // Transport was closed
         };
         let transport = pytransport.borrow(py);
         let stream_close;
@@ -1186,7 +1236,7 @@ impl Handle for TCPWriteHandle {
                 log::debug!("SSL close: already sent. Waiting a response with TCP open.");
                 if let Some(sent_time) = state.tls_close_sent_time {
                     let elapsed = sent_time.elapsed();
-                    if elapsed > std::time::Duration::from_millis(1000) {
+                    if elapsed > std::time::Duration::from_millis(3000) {
                         log::debug!("SSL close: timeout waiting for peer's close alert ({}ms), closing connection", elapsed.as_millis());
                         // Force close the connection
                         drop(state);
@@ -1216,6 +1266,8 @@ impl Handle for TCPWriteHandle {
                         {
                             let mut state = transport.state.borrow_mut();
                             if let Some(ref mut tls_conn) = state.tls_conn {
+                                // Send close notify to initiate TLS close handshake
+                                tls_conn.send_close_notify();
                                 let _ = tls_conn.write_tls(&mut tls_buf);
                                 state.tls_close_sent = true;
                                 state.tls_close_sent_time = Some(std::time::Instant::now());
