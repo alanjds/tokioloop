@@ -95,7 +95,9 @@ def start_ssl_http_server(
     coro = run_server()
     server_thread = threading.Thread(target=lambda: loop.run_until_complete(coro))
     server_thread.start()
+    logger.debug('Waiting for server_ready event')
     server_ready.wait()
+    logger.debug(f'Server ready event received, server_addr = {server_addr}')
     return server_thread, server_stop, server_addr
 
 
@@ -407,7 +409,9 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
     # Use EventLoop for server, openssl s_client for client
     server_loop = evloop()
 
+    logger.debug('Starting SSL HTTP server')
     server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
+    logger.debug(f'Server started on {host}:{port}')
 
     # Create openssl s_client command with handshake debugging
     cert_dir = os.path.join(os.path.dirname(__file__), 'certs')
@@ -430,8 +434,17 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
 
     success = False
     try:
+        logger.debug('Starting subprocess.Popen: %s', cmd)
         # Start openssl s_client process
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(
+            ' '.join(cmd),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=True,
+        )
+        logger.debug('subprocess.Popen completed')
 
         # Send HTTP request
         http_request = 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
@@ -447,6 +460,11 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
         for line in stderr.splitlines():
             logger.debug(f'[client] openssl stderr: {line[:500]}')
 
+        logger.debug('proc.returncode = %s', proc.returncode)
+        logger.debug(f"'hello SSL world' in stdout = {'hello SSL world' in stdout}")
+        logger.debug(f'stdout contains: {repr(stdout)}')
+        logger.debug(f'stderr contains: {repr(stderr)}')
+
         # Check if connection was successful and response contains expected content
         if proc.returncode == 0 and 'hello SSL world' in stdout:
             logger.debug('[client] openssl client test passed')
@@ -454,14 +472,16 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
         else:
             logger.debug(f'[client] openssl client test failed - exit code: {proc.returncode}')
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         logger.debug('[client] openssl s_client timed out')
         proc.kill()
+        logger.debug('TimeoutExpired exception caught: %r', e)
     except FileNotFoundError:
         logger.debug('[client] openssl command not found')
         pytest.skip('openssl command not available')
     except Exception as e:
         logger.debug(f'[client] openssl client failed: {e}')
+        logger.debug(f'Exception caught: {type(e).__name__}: {e}', stack_info=True, exc_info=True)
 
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
