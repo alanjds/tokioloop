@@ -24,6 +24,20 @@ use crate::{
     utils::syscall,
 };
 
+/// No-op used for SSL connections where connection_made is called later.
+struct NoOpHandle;
+
+impl Handle for NoOpHandle {
+    fn run(&self, _py: Python, _event_loop: &EventLoop, _state: &mut EventLoopRunState) {
+        log::debug!("NoOpHandle::run() called");
+        // Doing nothing
+    }
+
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
 pub(crate) struct TCPServer {
     pub fd: i32,
     sfamily: i32,
@@ -136,10 +150,12 @@ impl TCPServerRef {
 
         // For SSL connections, delay connection_made until handshake completes
         let is_ssl = self.ssl_config.is_some();
+        log::debug!("new_stream: is_ssl = {}, ssl_config.is_some() = {}", is_ssl, self.ssl_config.is_some());
         let conn_handle: BoxedHandle = if is_ssl {
-            // For SSL connections, create a dummy handle that does nothing
+            // For SSL connections, wait the handshake before scheduling callbacks
             // connection_made will be called later when handshake completes
-            Box::new(Py::new(py, CBHandle::new0(py.None(), py.None())).unwrap())
+            log::debug!("Creating NoOpHandle for SSL connection");
+            Box::new(NoOpHandle)
         } else {
             // For non-SSL connections, call connection_made immediately
             let conn_made = pytransport
@@ -222,6 +238,7 @@ struct TCPTransportState {
     write_buf: VecDeque<Box<[u8]>>,
     write_buf_dsize: usize,
     tls_close_sent: bool,
+    tls_close_received: bool,
     tls_close_sent_time: Option<std::time::Instant>,
 }
 
@@ -267,6 +284,7 @@ impl TCPTransport {
             write_buf: VecDeque::new(),
             write_buf_dsize: 0,
             tls_close_sent: false,
+            tls_close_received: false,
             tls_close_sent_time: None,
         };
 
@@ -550,7 +568,7 @@ impl TCPTransport {
             return;
         }
 
-        // For TLS connections, send a close alert before closing
+        // For TLS connections, send a close alert but keep connection open for handshake
         if self.state.borrow().tls_conn.is_some() {
             log::debug!("SSL close: sending TLS close alert for fd {}", self.fd);
             // Try to send any pending TLS data (including close alerts)
@@ -772,6 +790,8 @@ impl TCPReadHandle {
                             // Check if we received a close alert from the peer
                             if io_state.peer_has_closed() {
                                 log::debug!("SSL read: peer has closed the connection (received close alert)");
+                                state.tls_close_received = true;
+
                                 // If we've sent our close alert and received the peer's, close the connection
                                 if state.tls_close_sent {
                                     log::debug!("SSL read: TLS close handshake complete, closing connection");
@@ -804,9 +824,15 @@ impl TCPReadHandle {
                         // For SSL connections, call connection_made after handshake completes
                         if !state.connection_made_called {
                             state.connection_made_called = true;
-                            // Call connection_made on the protocol
+                            // Schedule connection_made callback through the event loop
                             let pytransport = transport.pyloop.get().get_tcp_transport(self.fd, py);
-                            let _ = transport.proto.call_method1(py, pyo3::intern!(py, "connection_made"), (pytransport.clone_ref(py),));
+                            if let Ok(conn_made) = transport.proto.getattr(py, pyo3::intern!(py, "connection_made")) {
+                                let _ = transport.pyloop.get().schedule1(
+                                    conn_made,
+                                    pytransport.clone_ref(py).into_any(),
+                                    None, // Use default context
+                                );
+                            }
                         }
                     } else if !state.handshake_complete {
                         log::debug!("SSL read: still handshaking");
@@ -857,7 +883,15 @@ impl TCPReadHandle {
             // Check if connection is closed
             let closed = {
                 let mut state = transport.state.borrow_mut();
-                let (_, closed) = self.read_into(&mut state.stream, &mut []);
+                let (bytes_read, closed) = self.read_into(&mut state.stream, &mut []);
+                log::debug!("SSL read: connection closed check - bytes_read={}, closed={}, tls_close_sent={}", bytes_read, closed, state.tls_close_sent);
+                // If we read 0 bytes and we've sent our close alert, consider the connection closed
+                let peer_closed_after_our_alert = bytes_read == 0 && state.tls_close_sent;
+                if peer_closed_after_our_alert {
+                    log::debug!("SSL read: peer closed TCP connection after receiving our close alert - completing handshake");
+                    // Peer closed TCP after receiving our close alert - this completes the handshake
+                    return (None, true);
+                }
                 closed
             };
             return (None, closed);
