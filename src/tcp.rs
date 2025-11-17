@@ -96,7 +96,9 @@ impl TCPServer {
         let mut transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
             for stream_fd in &streams.pin() {
-                transports.push(event_loop.get_tcp_transport(*stream_fd, py));
+                if let Some(transport) = event_loop.get_tcp_transport(*stream_fd, py) {
+                    transports.push(transport);
+                }
             }
         });
         for transport in transports {
@@ -108,7 +110,9 @@ impl TCPServer {
         let mut transports = Vec::new();
         event_loop.with_tcp_listener_streams(self.fd as usize, |streams| {
             for stream_fd in &streams.pin() {
-                transports.push(event_loop.get_tcp_transport(*stream_fd, py));
+                if let Some(transport) = event_loop.get_tcp_transport(*stream_fd, py) {
+                    transports.push(transport);
+                }
             }
         });
         for transport in transports {
@@ -830,11 +834,13 @@ impl TCPReadHandle {
                         if !state.connection_made_called {
                             state.connection_made_called = true;
                             // Schedule connection_made callback through the event loop
-                            let pytransport = transport.pyloop.get().get_tcp_transport(self.fd, py);
+                            let transport_arg = transport.pyloop.get().get_tcp_transport(self.fd, py)
+                                .map(|t| t.clone_ref(py).into_any())
+                                .unwrap_or_else(|| py.None());
                             if let Ok(conn_made) = transport.proto.getattr(py, pyo3::intern!(py, "connection_made")) {
                                 let _ = transport.pyloop.get().schedule1(
                                     conn_made,
-                                    pytransport.clone_ref(py).into_any(),
+                                    transport_arg,
                                     None, // Use default context
                                 );
                             }
@@ -965,7 +971,10 @@ impl TCPReadHandle {
 
 impl Handle for TCPReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
-        let pytransport = event_loop.get_tcp_transport(self.fd, py);
+        let pytransport = match event_loop.get_tcp_transport(self.fd, py) {
+            Some(t) => t,
+            None => return, // Transport was closed
+        };
         let transport = pytransport.borrow(py);
 
         // NOTE: we need to consume all the data coming from the socket even when it exceeds the buffer,
@@ -1163,7 +1172,10 @@ impl TCPWriteHandle {
 
 impl Handle for TCPWriteHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        let pytransport = event_loop.get_tcp_transport(self.fd, py);
+        let pytransport = match event_loop.get_tcp_transport(self.fd, py) {
+            Some(t) => t,
+            None => return, // Transport was closed
+        };
         let transport = pytransport.borrow(py);
         let stream_close;
 

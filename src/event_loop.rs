@@ -296,9 +296,7 @@ impl EventLoop {
 
     #[inline(always)]
     fn wake(&self) {
-        if self.idle.load(atomic::Ordering::Acquire) {
-            _ = self.waker.wake();
-        }
+        _ = self.waker.wake();
     }
 
     pub(crate) fn tcp_listener_add(&self, listener: TcpListener, server: TCPServerRef) {
@@ -346,6 +344,8 @@ impl EventLoop {
                         let guard_poll = self.io.lock().unwrap();
                         _ = guard_poll.registry().reregister(&mut source, token, interests);
                     }
+                    // Wake the event loop since interest changed
+                    self.wake();
                     return IOHandle::TCPStream(interests);
                 }
                 unreachable!()
@@ -357,6 +357,8 @@ impl EventLoop {
                     let guard_poll = self.io.lock().unwrap();
                     _ = guard_poll.registry().register(&mut source, token, interest);
                 }
+                // Wake the event loop since new interest registered
+                self.wake();
                 IOHandle::TCPStream(interest)
             },
         );
@@ -408,8 +410,8 @@ impl EventLoop {
     }
 
     #[inline(always)]
-    pub(crate) fn get_tcp_transport(&self, fd: usize, py: Python) -> Py<TCPTransport> {
-        self.tcp_transports.pin().get(&fd).unwrap().clone_ref(py)
+    pub(crate) fn get_tcp_transport(&self, fd: usize, py: Python) -> Option<Py<TCPTransport>> {
+        self.tcp_transports.pin().get(&fd).map(|t| t.clone_ref(py))
     }
 
     pub(crate) fn with_tcp_listener_streams<T>(&self, fd: usize, func: T)
