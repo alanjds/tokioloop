@@ -11,7 +11,7 @@ pub(crate) fn create_ssl_config() -> Result<ServerConfig> {
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let key_der = PrivateKeyDer::from(key_der);
 
-    let config = ServerConfig::builder()
+    let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)?;
 
@@ -71,7 +71,7 @@ pub(crate) fn create_ssl_config_from_context(ssl_context: &Bound<PyAny>) -> Resu
             _ => return Err(anyhow::anyhow!("failed to parse private key")),
         };
 
-        let config = ServerConfig::builder()
+        let config = ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)?;
 
@@ -85,7 +85,7 @@ pub(crate) fn create_ssl_config_from_context(ssl_context: &Bound<PyAny>) -> Resu
 /// Create SSL client configuration from an SSL context
 pub(crate) fn create_ssl_client_config_from_context(_ssl_context: &Bound<PyAny>) -> Result<rustls::ClientConfig> {
     // For testing, create a client config that accepts any certificate
-    let config = rustls::ClientConfig::builder()
+    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS12])
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(NoCertificateVerification))
         .with_no_client_auth();
