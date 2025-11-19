@@ -24,6 +24,8 @@ use crate::{
     utils::syscall,
 };
 
+use rustls::Connection as TLSConnection;
+
 /// No-op used for SSL connections where connection_made is called later.
 struct NoOpHandle;
 
@@ -185,61 +187,6 @@ impl TCPServerRef {
         None // TODO: Pass SSL config through the server reference
     }
 }
-enum TLSConnection {
-    Server(rustls::ServerConnection),
-    Client(rustls::ClientConnection),
-}
-
-impl TLSConnection {
-    fn read_tls(&mut self, rd: &mut std::io::Cursor<&[u8]>) -> Result<usize, std::io::Error> {
-        match self {
-            TLSConnection::Server(conn) => conn.read_tls(rd),
-            TLSConnection::Client(conn) => conn.read_tls(rd),
-        }
-    }
-
-    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
-        match self {
-            TLSConnection::Server(conn) => conn.process_new_packets(),
-            TLSConnection::Client(conn) => conn.process_new_packets(),
-        }
-    }
-
-    fn is_handshaking(&self) -> bool {
-        match self {
-            TLSConnection::Server(conn) => conn.is_handshaking(),
-            TLSConnection::Client(conn) => conn.is_handshaking(),
-        }
-    }
-
-    fn reader(&mut self) -> rustls::Reader {
-        match self {
-            TLSConnection::Server(conn) => conn.reader(),
-            TLSConnection::Client(conn) => conn.reader(),
-        }
-    }
-
-    fn writer(&mut self) -> rustls::Writer {
-        match self {
-            TLSConnection::Server(conn) => conn.writer(),
-            TLSConnection::Client(conn) => conn.writer(),
-        }
-    }
-
-    fn write_tls(&mut self, wr: &mut dyn std::io::Write) -> Result<usize, std::io::Error> {
-        match self {
-            TLSConnection::Server(conn) => conn.write_tls(wr),
-            TLSConnection::Client(conn) => conn.write_tls(wr),
-        }
-    }
-
-    fn send_close_notify(&mut self) {
-        match self {
-            TLSConnection::Server(conn) => conn.send_close_notify(),
-            TLSConnection::Client(conn) => conn.send_close_notify(),
-        }
-    }
-}
 
 struct TCPTransportState {
     stream: TcpStream,
@@ -375,8 +322,8 @@ impl TCPTransport {
         state.handshake_complete = false;
 
         // Check if the client needs to send initial handshake data
-        if let Some(TLSConnection::Client(ref conn)) = state.tls_conn {
-            if conn.wants_write() {
+        if let Some(ref tls_conn) = state.tls_conn {
+            if tls_conn.wants_write() {
                 self.pyloop.get().tcp_stream_add(self.fd, Interest::WRITABLE);
             }
         }
@@ -896,11 +843,7 @@ impl TCPReadHandle {
                 {
                     let state = transport.state.borrow();
                     if let Some(ref tls_conn) = state.tls_conn {
-                        let wants_write = match tls_conn {
-                            TLSConnection::Server(conn) => conn.wants_write(),
-                            TLSConnection::Client(conn) => conn.wants_write(),
-                        };
-                        if wants_write {
+                        if tls_conn.wants_write() {
                             log::debug!("SSL read: server wants to write (handshake data), adding writable interest");
                             transport.pyloop.get().tcp_stream_add(transport.fd, Interest::WRITABLE);
                         }
@@ -1210,10 +1153,7 @@ impl TCPWriteHandle {
     #[inline]
     fn has_pending_tls_data(&self, transport: &TCPTransport) -> bool {
         if let Some(ref tls_conn) = transport.state.borrow().tls_conn {
-            match tls_conn {
-                TLSConnection::Server(conn) => conn.wants_write(),
-                TLSConnection::Client(conn) => conn.wants_write(),
-            }
+            tls_conn.wants_write()
         } else {
             false
         }
