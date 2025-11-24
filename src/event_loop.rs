@@ -344,8 +344,7 @@ impl EventLoop {
                         let guard_poll = self.io.lock().unwrap();
                         _ = guard_poll.registry().reregister(&mut source, token, interests);
                     }
-                    // Wake the event loop since interest changed
-                    self.wake();
+                    self.wake();  // interest changed
                     return IOHandle::TCPStream(interests);
                 }
                 unreachable!()
@@ -357,8 +356,7 @@ impl EventLoop {
                     let guard_poll = self.io.lock().unwrap();
                     _ = guard_poll.registry().register(&mut source, token, interest);
                 }
-                // Wake the event loop since new interest registered
-                self.wake();
+                self.wake();  // interest registered
                 IOHandle::TCPStream(interest)
             },
         );
@@ -1177,32 +1175,18 @@ impl EventLoop {
         py: Python,
         sock: (i32, i32),
         protocol_factory: Py<PyAny>,
-    ) -> PyResult<(Py<TCPTransport>, Py<PyAny>)> {
-        let rself = pyself.get();
-        let transport = TCPTransport::from_py(py, &pyself, sock, protocol_factory);
-        let fd = transport.fd;
-        let pytransport = Py::new(py, transport)?;
-        let proto = TCPTransport::attach(&pytransport, py)?;
-        rself.tcp_transports.pin().insert(fd, pytransport.clone_ref(py));
-        rself.tcp_stream_add(fd, Interest::READABLE);
-        Ok((pytransport, proto))
-    }
-
-    fn _tcp_conn_ssl(
-        pyself: Py<Self>,
-        py: Python,
-        sock: (i32, i32),
-        protocol_factory: Py<PyAny>,
-        ssl_context: Py<PyAny>,
-        server_hostname: String,
+        ssl_context: Option<Py<PyAny>>,
+        server_hostname: Option<String>,
     ) -> PyResult<(Py<TCPTransport>, Py<PyAny>)> {
         let rself = pyself.get();
         let transport = TCPTransport::from_py(py, &pyself, sock, protocol_factory);
         let fd = transport.fd;
 
-        // Initialize TLS client connection
-        let ssl_config = crate::ssl::create_ssl_client_config_from_context(&ssl_context.bind(py))?;
-        transport.initialize_tls_client(ssl_config, server_hostname);
+        if let (Some(ssl_context), Some(server_hostname)) = (ssl_context, server_hostname) {
+            // Initialize TLS client connection
+            let ssl_config = crate::ssl::create_ssl_client_config_from_context(&ssl_context.bind(py))?;
+            transport.initialize_tls_client(ssl_config, server_hostname);
+        }
 
         let pytransport = Py::new(py, transport)?;
         let proto = TCPTransport::attach(&pytransport, py)?;

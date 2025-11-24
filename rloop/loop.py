@@ -421,12 +421,8 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
         rsock = (sock.fileno(), sock.family)
         sock.detach()
 
-        if ssl:
-            logger.debug('Creating SSL connection')
-            transport, protocol = self._tcp_conn_ssl(rsock, protocol_factory, ssl, server_hostname)
-        else:
-            logger.debug('Creating TCP connection')
-            transport, protocol = self._tcp_conn(rsock, protocol_factory)
+        logger.debug('Creating %s connection', 'SSL' if ssl else 'TCP')
+        transport, protocol = self._tcp_conn(rsock, protocol_factory, ssl, server_hostname if ssl else None)
 
         return transport, protocol
 

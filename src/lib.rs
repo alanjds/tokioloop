@@ -25,7 +25,7 @@ pub(crate) fn get_lib_version() -> &'static str {
 
 #[pymodule(gil_used = false)]
 fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
-    // Initialize logging
+    // Configure logs via RUST_LOG= (default to INFO)
     env_logger::init();
 
     module.add("__version__", get_lib_version())?;
