@@ -397,7 +397,7 @@ impl EventLoop {
     #[inline(always)]
     pub(crate) fn tcp_stream_close(&self, py: Python, fd: usize) {
         if let Some(transport) = self.tcp_transports.pin().remove(&fd) {
-            // For TLS connections, ensure TCPTransport::close() is called to send TLS close alerts
+            // ensure TCPTransport::close() called, as it sends TLS close
             if transport.borrow(py).is_tls() {
                 transport.borrow(py).close(py);
             }

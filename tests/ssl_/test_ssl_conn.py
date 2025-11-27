@@ -59,12 +59,11 @@ def start_ssl_http_server(
     loop, server_ssl_context, host='localhost', port=None, lifetime=10, protocol=SSLHTTPServerProtocol
 ) -> tuple[Thread, Event, tuple[str, int]]:
     """Helper function to start SSL HTTP server for testing."""
-    if port is None:
-        port = random.randint(10000, 20000)
+    port = port or random.randint(10000, 20000)
 
     server_ready = threading.Event()
     server_stop = threading.Event()
-    server_addr = None
+    server_addr = (host, port)
 
     async def run_server():
         nonlocal server_addr
@@ -101,8 +100,10 @@ def start_ssl_http_server(
 
 
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context):
+@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
+def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context, tls_version, monkeypatch):
     """Test basic connection with echo server."""
+    monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
     loop = evloop()
 
     server_proto = SSLEchoServerProtocol()
@@ -129,8 +130,10 @@ def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context):
 
 
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_ssl_server_echo(evloop, ssl_context, server_ssl_context):
+@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
+def test_ssl_server_echo(evloop, ssl_context, server_ssl_context, tls_version, monkeypatch):
     """Test server functionality."""
+    monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
     loop = evloop()
 
     server_proto = SSLEchoServerProtocol()
@@ -182,9 +185,11 @@ def test_ssl_connection_without_ssl(evloop):
 
 
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_ssl_server(evloop, ssl_context, server_ssl_context):
+@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
+def test_ssl_server(evloop, ssl_context, server_ssl_context, tls_version, monkeypatch):
     """Test SSL server functionality."""
 
+    monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
     loop = evloop()
 
     host = '127.0.0.1'
@@ -226,10 +231,14 @@ def test_ssl_server(evloop, ssl_context, server_ssl_context):
 @pytest.mark.timeout(20)
 @pytest.mark.parametrize('evloop_server', EVENT_LOOPS, ids=lambda x: type(x()))
 @pytest.mark.parametrize('evloop_client', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_cross_implementation_server_client(evloop_server, evloop_client, ssl_context, server_ssl_context):
+@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
+def test_cross_implementation_server_client(
+    evloop_server, evloop_client, ssl_context, server_ssl_context, tls_version, monkeypatch
+):
     """Test RLoop SSL client against asyncio SSL server."""
     import threading
 
+    monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
     # Use asyncio for server, RLoop for client
     server_loop = evloop_server()
     client_loop = evloop_client()
@@ -274,11 +283,13 @@ def test_cross_implementation_server_client(evloop_server, evloop_client, ssl_co
 
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_ssl_server_with_requests_client(evloop, server_ssl_context):
+@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
+def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version, monkeypatch):
     """Test EventLoop SSL server with external requests client."""
 
     import requests
 
+    monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
     # Use EventLoop for server, raw SSL socket for client
     server_loop = evloop()
 
@@ -301,9 +312,11 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context):
 
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context):
+@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
+def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version, monkeypatch):
     """Test EventLoop SSL server with raw SSL socket client."""
 
+    monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
     # Use EventLoop for server, raw SSL socket for client
     server_loop = evloop()
 
@@ -321,6 +334,7 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context):
 
     # Create raw SSL connection
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    success = False
     try:
         # Connect socket
         sock.connect((host, port))
@@ -378,11 +392,13 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context):
 
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-def test_ssl_server_with_openssl_client(evloop, server_ssl_context):
+@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
+def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version, monkeypatch):
     """Test EventLoop SSL server with openssl s_client command-line tool."""
 
     import subprocess
 
+    monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
     # Use EventLoop for server, openssl s_client for client
     server_loop = evloop()
 

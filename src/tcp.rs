@@ -814,7 +814,6 @@ impl TCPReadHandle {
                 {
                     let mut state = transport.state.borrow_mut();
                     let tls_conn = state.tls_conn.as_ref().unwrap();
-                    let was_handshaking = state.handshake_complete;
                     if !state.handshake_complete && !tls_conn.is_handshaking() {
                         state.handshake_complete = true;
                         log::debug!("SSL read: handshake completed");
