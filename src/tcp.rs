@@ -251,18 +251,20 @@ impl TCPTransport {
         let wh = 1024 * 64;
         let wl = wh / 4;
 
-        let mut proto_buffered = false;
-        let protom_buf_get: Py<PyAny>;
-        let protom_recv_data: Py<PyAny>;
-        if pyproto.is_instance(asyncio_proto_buf(py).unwrap()).unwrap() {
-            proto_buffered = true;
+        let proto_buffered = pyproto.is_instance(asyncio_proto_buf(py).unwrap()).unwrap();
+        let protom_conn_lost = pyproto.getattr(pyo3::intern!(py, "connection_lost")).unwrap().unbind();
+
+        let protom_buf_get;
+        let protom_recv_data;
+
+        if proto_buffered {
             protom_buf_get = pyproto.getattr(pyo3::intern!(py, "get_buffer")).unwrap().unbind();
             protom_recv_data = pyproto.getattr(pyo3::intern!(py, "buffer_updated")).unwrap().unbind();
         } else {
             protom_buf_get = py.None();
             protom_recv_data = pyproto.getattr(pyo3::intern!(py, "data_received")).unwrap().unbind();
         }
-        let protom_conn_lost = pyproto.getattr(pyo3::intern!(py, "connection_lost")).unwrap().unbind();
+
         let proto = pyproto.unbind();
 
         Self {
@@ -484,7 +486,7 @@ impl TCPTransport {
                         log::debug!("TCP write (try_write): error on fd {}, setting closing and removing READ interest", rself.fd);
                         rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::READABLE);
                     }
-                    rself.call_conn_lost(py, Some(pyo3::exceptions::PyRuntimeError::new_err(err.to_string())));
+                    rself.call_conn_lost(py, Some(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string())));
                     // Connection closed
                     0
                 }
@@ -857,6 +859,7 @@ impl TCPReadHandle {
                     if !state.handshake_complete && !tls_conn.is_handshaking() {
                         state.handshake_complete = true;
                         log::debug!("SSL read: handshake completed");
+                        log::trace!("RLOOP_TLS_DBG_HANDSHAKE_CMPL: fd={}, connection_made_called={}", self.fd, state.connection_made_called);
 
                         // For SSL connections, call connection_made after handshake completes
                         if !state.connection_made_called {
