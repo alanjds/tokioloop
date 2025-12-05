@@ -296,7 +296,9 @@ impl EventLoop {
 
     #[inline(always)]
     fn wake(&self) {
-        _ = self.waker.wake();
+        if self.idle.load(atomic::Ordering::Acquire) {
+            _ = self.waker.wake();
+        }
     }
 
     pub(crate) fn tcp_listener_add(&self, listener: TcpListener, server: TCPServerRef) {
