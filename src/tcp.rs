@@ -254,8 +254,8 @@ impl TCPTransport {
         let proto_buffered = pyproto.is_instance(asyncio_proto_buf(py).unwrap()).unwrap();
         let protom_conn_lost = pyproto.getattr(pyo3::intern!(py, "connection_lost")).unwrap().unbind();
 
-        let protom_buf_get;
-        let protom_recv_data;
+        let protom_buf_get: Py<PyAny>;
+        let protom_recv_data: Py<PyAny>;
 
         if proto_buffered {
             protom_buf_get = pyproto.getattr(pyo3::intern!(py, "get_buffer")).unwrap().unbind();
