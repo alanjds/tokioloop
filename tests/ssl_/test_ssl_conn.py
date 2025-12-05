@@ -56,7 +56,7 @@ EVENT_LOOPS = [
 ]
 
 SSL_BACKENDS = ['direct']  # , 'futures']
-TLS_VERSIONS = ['TLS1.2', 'TLS1.3']
+TLS_VERSIONS = ['1.2', '1.3']
 
 
 def start_ssl_http_server(

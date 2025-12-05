@@ -19,8 +19,8 @@ static TLS_DEFAULT: [&'static rustls::SupportedProtocolVersion; 2] = [&rustls::v
 /// Get TLS version from environment variable
 fn get_tls_version_from_env() -> Option<TLSVersion> {
     match std::env::var("RLOOP_TLS_VERSION").as_deref() {
-        Ok("TLS1.2") | Ok("1.2") | Ok("12") => Some(TLSVersion::TLS12),
-        Ok("TLS1.3") | Ok("1.3") | Ok("13") => Some(TLSVersion::TLS13),
+        Ok("1.2") => Some(TLSVersion::TLS12),
+        Ok("1.3") => Some(TLSVersion::TLS13),
         Ok(_) => None, // Invalid value, use default
         Err(_) => None, // Not set, use default
     }
