@@ -1,11 +1,12 @@
 import asyncio
 import logging
+import multiprocessing
 import os
 import random
 import socket
 import ssl
 import threading
-from threading import Event, Thread
+from multiprocessing import Event, Process
 
 import pytest
 
@@ -54,15 +55,18 @@ EVENT_LOOPS = [
     rloop.new_event_loop,
 ]
 
+SSL_BACKENDS = ['direct']  # , 'futures']
+TLS_VERSIONS = ['TLS1.2', 'TLS1.3']
+
 
 def start_ssl_http_server(
     loop, server_ssl_context, host='localhost', port=None, lifetime=10, protocol=SSLHTTPServerProtocol
-) -> tuple[Thread, Event, tuple[str, int]]:
+) -> tuple[Process, Event, tuple[str, int]]:
     """Helper function to start SSL HTTP server for testing."""
     port = port or random.randint(10000, 20000)
 
-    server_ready = threading.Event()
-    server_stop = threading.Event()
+    server_ready = multiprocessing.Event()
+    server_stop = multiprocessing.Event()
     server_addr = (host, port)
 
     async def run_server():
@@ -91,19 +95,21 @@ def start_ssl_http_server(
             logger.debug(f'[server] {loopclass} server closed')
 
     coro = run_server()
-    server_thread = threading.Thread(target=lambda: loop.run_until_complete(coro))
-    server_thread.start()
+    server_process = multiprocessing.Process(target=lambda: loop.run_until_complete(coro))
+    server_process.start()
     logger.debug('Waiting for server_ready event')
     server_ready.wait()
     logger.debug(f'Server ready event received, server_addr = {server_addr}')
-    return server_thread, server_stop, server_addr
+    return server_process, server_stop, server_addr
 
 
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
-def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context, tls_version, monkeypatch):
+@pytest.mark.parametrize('tls_version', TLS_VERSIONS)
+@pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
+def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context, tls_version, ssl_backend, monkeypatch):
     """Test basic connection with echo server."""
     monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
+    monkeypatch.setenv('RLOOP_TLS_BACKEND', ssl_backend)
     loop = evloop()
 
     server_proto = SSLEchoServerProtocol()
@@ -130,10 +136,12 @@ def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context, tls_versio
 
 
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
-def test_ssl_server_echo(evloop, ssl_context, server_ssl_context, tls_version, monkeypatch):
+@pytest.mark.parametrize('tls_version', TLS_VERSIONS)
+@pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
+def test_ssl_server_echo(evloop, ssl_context, server_ssl_context, tls_version, ssl_backend, monkeypatch):
     """Test server functionality."""
     monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
+    monkeypatch.setenv('RLOOP_TLS_BACKEND', ssl_backend)
     loop = evloop()
 
     server_proto = SSLEchoServerProtocol()
@@ -185,11 +193,13 @@ def test_ssl_connection_without_ssl(evloop):
 
 
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
-def test_ssl_server(evloop, ssl_context, server_ssl_context, tls_version, monkeypatch):
+@pytest.mark.parametrize('tls_version', TLS_VERSIONS)
+@pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
+def test_ssl_server(evloop, ssl_context, server_ssl_context, tls_version, ssl_backend, monkeypatch):
     """Test SSL server functionality."""
 
     monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
+    monkeypatch.setenv('RLOOP_TLS_BACKEND', ssl_backend)
     loop = evloop()
 
     host = '127.0.0.1'
@@ -229,16 +239,17 @@ def test_ssl_server(evloop, ssl_context, server_ssl_context, tls_version, monkey
 
 
 @pytest.mark.timeout(20)
-@pytest.mark.parametrize('evloop_server', EVENT_LOOPS, ids=lambda x: type(x()))
-@pytest.mark.parametrize('evloop_client', EVENT_LOOPS, ids=lambda x: type(x()))
-@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
+@pytest.mark.parametrize('evloop_client', EVENT_LOOPS, ids=lambda x: f'{type(x()).__name__}[cli]')
+@pytest.mark.parametrize('evloop_server', EVENT_LOOPS, ids=lambda x: f'{type(x()).__name__}[srv]')
+@pytest.mark.parametrize('tls_version', TLS_VERSIONS)
+@pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
 def test_cross_implementation_server_client(
-    evloop_server, evloop_client, ssl_context, server_ssl_context, tls_version, monkeypatch
+    evloop_server, evloop_client, ssl_context, server_ssl_context, tls_version, ssl_backend, monkeypatch
 ):
     """Test RLoop SSL client against asyncio SSL server."""
-    import threading
 
     monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
+    monkeypatch.setenv('RLOOP_TLS_BACKEND', ssl_backend)
     # Use asyncio for server, RLoop for client
     server_loop = evloop_server()
     client_loop = evloop_client()
@@ -260,7 +271,7 @@ def test_cross_implementation_server_client(
             except Exception as e:
                 logger.debug(f'[client [{i}]] {client_loop_name} client failed: {e}')
 
-    server_thread, server_stop, (host, port) = start_ssl_http_server(
+    server_process, server_stop, (host, port) = start_ssl_http_server(
         server_loop, server_ssl_context, protocol=SSLEchoServerProtocol
     )
 
@@ -271,7 +282,7 @@ def test_cross_implementation_server_client(
     # Signal and wait server to stop
     logger.debug('[test] Signaling the server to stop')
     server_stop.set()
-    server_thread.join(timeout=3)
+    server_process.join(timeout=3)
 
     # Check results
     logger.debug(f'[test] Client state: {client_proto.state}')
@@ -283,17 +294,19 @@ def test_cross_implementation_server_client(
 
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
-def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version, monkeypatch):
+@pytest.mark.parametrize('tls_version', TLS_VERSIONS)
+@pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
+def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version, ssl_backend, monkeypatch):
     """Test EventLoop SSL server with external requests client."""
 
     import requests
 
     monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
+    monkeypatch.setenv('RLOOP_TLS_BACKEND', ssl_backend)
     # Use EventLoop for server, raw SSL socket for client
     server_loop = evloop()
 
-    server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
+    server_process, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
 
     url = f'https://{host}:{port}'
     # Create raw SSL client
@@ -307,20 +320,22 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
     server_stop.set()
-    server_thread.join(timeout=3)
+    server_process.join(timeout=3)
 
 
 @pytest.mark.timeout(10)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
-def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version, monkeypatch):
+@pytest.mark.parametrize('tls_version', TLS_VERSIONS)
+@pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
+def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version, ssl_backend, monkeypatch):
     """Test EventLoop SSL server with raw SSL socket client."""
 
     monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
+    monkeypatch.setenv('RLOOP_TLS_BACKEND', ssl_backend)
     # Use EventLoop for server, raw SSL socket for client
     server_loop = evloop()
 
-    server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
+    server_process, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
 
     # Create raw SSL client
     logger.debug(f'[client] Connecting to {host}:{port} via raw SSL socket')
@@ -385,25 +400,27 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version,
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
     server_stop.set()
-    server_thread.join(timeout=3)
+    server_process.join(timeout=3)
 
     assert success, 'Raw SSL client test failed'
 
 
 @pytest.mark.timeout(60)
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-@pytest.mark.parametrize('tls_version', ['TLS1.2', 'TLS1.3'], ids=['TLS1.2', 'TLS1.3'])
-def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version, monkeypatch):
+@pytest.mark.parametrize('tls_version', TLS_VERSIONS)
+@pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
+def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version, ssl_backend, monkeypatch):
     """Test EventLoop SSL server with openssl s_client command-line tool."""
 
     import subprocess
 
     monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
+    monkeypatch.setenv('RLOOP_TLS_BACKEND', ssl_backend)
     # Use EventLoop for server, openssl s_client for client
     server_loop = evloop()
 
     logger.debug('Starting SSL HTTP server')
-    server_thread, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
+    server_process, server_stop, (host, port) = start_ssl_http_server(server_loop, server_ssl_context)
     logger.debug(f'Server started on {host}:{port}')
 
     # Create openssl s_client command with handshake debugging
@@ -477,6 +494,6 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version,
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
     server_stop.set()
-    server_thread.join(timeout=5)
+    server_process.join(timeout=5)
 
     assert success, 'openssl s_client test failed'
