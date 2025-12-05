@@ -12,7 +12,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     io::Read,
-    sync::atomic,
+    sync::{self, atomic, Arc},
 };
 
 use crate::{
@@ -312,7 +312,7 @@ impl TCPTransport {
 
     pub(crate) fn initialize_tls_server(&self, ssl_config: rustls::ServerConfig) {
         let mut state = self.state.borrow_mut();
-        state.tls_conn = Some(TLSConnection::Server(rustls::ServerConnection::new(std::sync::Arc::new(ssl_config)).unwrap()));
+        state.tls_conn = Some(TLSConnection::Server(rustls::ServerConnection::new(Arc::new(ssl_config)).unwrap()));
         state.handshake_complete = false;
     }
 
@@ -320,7 +320,7 @@ impl TCPTransport {
         log::debug!("SSL client: Initializing TLS for fd {} with server '{}'", self.fd, server_name);
         let mut state = self.state.borrow_mut();
         let server_name = rustls::pki_types::ServerName::try_from(server_name).unwrap();
-        let conn = rustls::ClientConnection::new(std::sync::Arc::new(ssl_config), server_name).unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(ssl_config), server_name).unwrap();
         state.tls_conn = Some(TLSConnection::Client(conn));
         state.handshake_complete = false;
 
