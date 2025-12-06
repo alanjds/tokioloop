@@ -130,38 +130,9 @@ def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context, tls_versio
     loop.run_until_complete(main())
     assert client_proto.state == 'CLOSED'
     assert server_proto.state == 'CLOSED'
-    # For now, we'll just check that the connection completed
-    # assert server_proto.data == b'hello SSL world'
-    # assert client_proto.data.startswith(b'echo: hello SSL world')
 
-
-@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
-@pytest.mark.parametrize('tls_version', TLS_VERSIONS)
-@pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
-def test_ssl_server_echo(evloop, ssl_context, server_ssl_context, tls_version, ssl_backend, monkeypatch):
-    """Test server functionality."""
-    monkeypatch.setenv('RLOOP_TLS_VERSION', tls_version)
-    monkeypatch.setenv('RLOOP_TLS_BACKEND', ssl_backend)
-    loop = evloop()
-
-    server_proto = SSLEchoServerProtocol()
-    client_proto = SSLEchoClientProtocol(loop.create_future)
-
-    async def main():
-        sock = socket.socket()
-        sock.setblocking(False)
-
-        with sock:
-            sock.bind(('127.0.0.1', 0))
-            addr = sock.getsockname()
-            server = await loop.create_server(lambda: server_proto, sock=sock)
-            transport, protocol = await loop.create_connection(lambda: client_proto, *addr)
-            await client_proto._done
-            server.close()
-
-    loop.run_until_complete(main())
-    assert client_proto.state == 'CLOSED'
-    assert server_proto.state == 'CLOSED'
+    assert server_proto.data == b'hello SSL world'
+    assert client_proto.data.startswith(b'echo: hello SSL world')
 
 
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
