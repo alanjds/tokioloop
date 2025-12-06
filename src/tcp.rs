@@ -733,7 +733,7 @@ impl TCPTransport {
         log::debug!("TCPTransport::writelines (PyO3) called for fd {:?}", pyself.borrow(py).fd);
         let pybytes = PyBytes::new(py, &[0; 0]);
         let pybytesj = pybytes.call_method1(pyo3::intern!(py, "join"), (data,))?;
-        let bytes: Cow<[u8]> = pybytesj.extract().unwrap(); // Assume extraction succeeds
+        let bytes: Cow<[u8]> = pybytesj.extract()?;
         log::debug!("TCPTransport::writelines (PyO3) for fd {:?} joined to {} bytes", pyself.borrow(py).fd, bytes.len());
         Self::try_write(&pyself, py, &bytes)
     }
