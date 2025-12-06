@@ -364,7 +364,6 @@ impl TCPTransport {
             return true; // Handled by TLS specific close path
         }
 
-
         if !self.state.borrow_mut().write_buf.is_empty() { // Need mutable borrow for check
              log::debug!("TCP close_from_read_handle: fd {} has pending write data, not closing yet", self.fd);
             return false;
@@ -375,7 +374,6 @@ impl TCPTransport {
         _ = self.protom_conn_lost.call1(py, (py.None(),));
         true
     }
-
 
     #[inline]
     fn close_from_write_handle(&self, py: Python, errored: bool) -> Option<bool> {
@@ -396,14 +394,12 @@ impl TCPTransport {
         }
         let weof = self.weof.load(atomic::Ordering::Relaxed); // Store to avoid multiple loads
         if weof {
-             log::debug!("TCP close_from_write_handle: fd {} WEOF true. Errored: {}", self.fd, errored);
+            log::debug!("TCP close_from_write_handle: fd {} WEOF true. Errored: {}", self.fd, errored);
         } else {
             log::debug!("TCP close_from_write_handle: fd {} WEOF false. Errored: {}. Closing due to write EOF.", self.fd, errored);
-
         }
         weof.then_some(false) // if weof is true, return Some(false), else None
     }
-
 
     #[inline(always)]
     fn call_conn_lost(&self, py: Python, err: Option<PyErr>) {
