@@ -616,13 +616,9 @@ impl TCPTransport {
                 event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
                 // Keep readable interest to detect peer's close
 
-                // Schedule a timeout to force close the connection
+                // Notify the connection closing
                 let pytransport = event_loop.get_tcp_transport(self.fd, py).unwrap();
-                let _ = event_loop.schedule_later0(
-                    std::time::Duration::from_millis(self.state.borrow().ssl_close_timeout.into()),
-                    pytransport.getattr(py, pyo3::intern!(py, "call_connection_lost")).unwrap(),
-                    None,
-                );
+                pytransport.getattr(py, pyo3::intern!(py, "call_connection_lost")).unwrap();
 
                 return;
             }
