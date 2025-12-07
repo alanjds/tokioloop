@@ -9,17 +9,20 @@ use rustls_pemfile::Item;
 #[derive(Clone, Copy)]
 pub enum TLSVersion {
     TLS12,
+    TLS12_PLUS,
     TLS13,
 }
 
 static TLS12_ONLY: [&'static rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS12];
+static TLS12_PLUS: [&'static rustls::SupportedProtocolVersion; 2] = [&rustls::version::TLS12, &rustls::version::TLS13];
 static TLS13_ONLY: [&'static rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
-static TLS_DEFAULT: [&'static rustls::SupportedProtocolVersion; 2] = [&rustls::version::TLS12, &rustls::version::TLS13];
+static TLS_DEFAULT: [&'static rustls::SupportedProtocolVersion; 1] = TLS12_ONLY;
 
 /// Get TLS version from environment variable
 fn get_tls_version_from_env() -> Option<TLSVersion> {
     match std::env::var("RLOOP_TLS_VERSION").as_deref() {
         Ok("1.2") => Some(TLSVersion::TLS12),
+        Ok("1.2+") => Some(TLSVersion::TLS12_PLUS),
         Ok("1.3") => Some(TLSVersion::TLS13),
         Ok(_) => None, // Invalid value, use default
         Err(_) => None, // Not set, use default
@@ -35,6 +38,7 @@ pub(crate) fn create_ssl_config_with_version(tls_version: Option<TLSVersion>) ->
 
     let versions = match tls_version {
         Some(TLSVersion::TLS12) => &TLS12_ONLY[..],
+        Some(TLSVersion::TLS12_PLUS) => &TLS12_PLUS[..],
         Some(TLSVersion::TLS13) => &TLS13_ONLY[..],
         None => &TLS_DEFAULT[..],
     };
@@ -106,6 +110,7 @@ pub(crate) fn create_ssl_config_from_context_with_version(ssl_context: &Bound<Py
 
         let versions = match tls_version {
             Some(TLSVersion::TLS12) => &TLS12_ONLY[..],
+            Some(TLSVersion::TLS12_PLUS) => &TLS12_PLUS[..],
             Some(TLSVersion::TLS13) => &TLS13_ONLY[..],
             None => &TLS_DEFAULT[..],
         };
@@ -131,6 +136,7 @@ pub(crate) fn create_ssl_client_config_from_context_with_version(_ssl_context: &
     // For testing, create a client config that accepts any certificate
     let versions = match tls_version {
         Some(TLSVersion::TLS12) => &TLS12_ONLY[..],
+        Some(TLSVersion::TLS12_PLUS) => &TLS12_PLUS[..],
         Some(TLSVersion::TLS13) => &TLS13_ONLY[..],
         None => &TLS_DEFAULT[..],
     };
