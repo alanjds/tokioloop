@@ -4,7 +4,6 @@ use rustls::{ServerConfig, pki_types::{CertificateDer, PrivateKeyDer}};
 use std::fs;
 use rustls_pemfile::Item;
 
-/// TLS version selection enum
 #[pyclass]
 #[derive(Clone, Copy)]
 pub enum TLSVersion {
@@ -18,7 +17,6 @@ static TLS12_PLUS: [&'static rustls::SupportedProtocolVersion; 2] = [&rustls::ve
 static TLS13_ONLY: [&'static rustls::SupportedProtocolVersion; 1] = [&rustls::version::TLS13];
 static TLS_DEFAULT: [&'static rustls::SupportedProtocolVersion; 1] = TLS12_ONLY;
 
-/// Get TLS version from environment variable
 fn get_tls_version_from_env() -> Option<TLSVersion> {
     match std::env::var("RLOOP_TLS_VERSION").as_deref() {
         Ok("1.2") => Some(TLSVersion::TLS12),
@@ -133,7 +131,6 @@ pub(crate) fn create_ssl_config_from_context(ssl_context: &Bound<PyAny>) -> Resu
 
 /// Create SSL client configuration from an SSL context with TLS version
 pub(crate) fn create_ssl_client_config_from_context_with_version(_ssl_context: &Bound<PyAny>, tls_version: Option<TLSVersion>) -> Result<rustls::ClientConfig> {
-    // For testing, create a client config that accepts any certificate
     let versions = match tls_version {
         Some(TLSVersion::TLS12) => &TLS12_ONLY[..],
         Some(TLSVersion::TLS12_PLUS) => &TLS12_PLUS[..],

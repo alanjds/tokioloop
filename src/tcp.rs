@@ -12,7 +12,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     io::Read,
-    sync::{self, atomic, Arc},
+    sync::{atomic, Arc},
 };
 
 use crate::{
@@ -181,9 +181,6 @@ impl TCPServerRef {
 
     #[inline]
     fn get_ssl_config(&self, py: Python) -> Option<rustls::ServerConfig> {
-        // We need to get the SSL config from the server that created this reference
-        // For now, we'll check if there's an SSL server associated with this listener
-        // This is a simplified approach - in a real implementation we'd store the config in the ref
         None // TODO: Pass SSL config through the server reference
     }
 }
@@ -609,8 +606,6 @@ impl TCPTransport {
                     let _ = syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len()));
                 }
 
-                // For TLS connections, don't call connection_lost immediately
-                // Wait for peer's close alert or TCP close, but set a timeout
                 log::debug!("SSL close: sent close alert, waiting for peer response");
                 let event_loop = self.pyloop.get();
                 event_loop.tcp_stream_rem(self.fd, Interest::WRITABLE);
