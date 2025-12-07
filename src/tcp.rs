@@ -199,6 +199,7 @@ struct TCPTransportState {
     tls_close_received: bool,
     tls_close_sent_time: Option<std::time::Instant>,
     tls_pending_close: bool,
+    ssl_close_timeout: u16,
 }
 
 #[pyclass(frozen, unsendable, module = "rloop._rloop")]
@@ -235,6 +236,12 @@ impl TCPTransport {
         lfd: Option<usize>,
     ) -> Self {
         let fd = stream.as_raw_fd() as usize;
+
+        let ssl_close_timeout = std::env::var("RLOOP_SSL_CLOSE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
+
         let state = TCPTransportState {
             stream,
             tls_conn: None,
@@ -246,6 +253,7 @@ impl TCPTransport {
             tls_close_received: false,
             tls_close_sent_time: None,
             tls_pending_close: false,
+            ssl_close_timeout,
         };
 
         let wh = 1024 * 64;
@@ -611,7 +619,7 @@ impl TCPTransport {
                 // Schedule a timeout to force close the connection
                 let pytransport = event_loop.get_tcp_transport(self.fd, py).unwrap();
                 let _ = event_loop.schedule_later0(
-                    std::time::Duration::from_millis(1000),
+                    std::time::Duration::from_millis(self.state.borrow().ssl_close_timeout.into()),
                     pytransport.getattr(py, pyo3::intern!(py, "call_connection_lost")).unwrap(),
                     None,
                 );
@@ -1214,7 +1222,7 @@ impl Handle for TCPWriteHandle {
                 log::debug!("SSL close: already sent. Waiting a response with TCP open.");
                 if let Some(sent_time) = state.tls_close_sent_time {
                     let elapsed = sent_time.elapsed();
-                    if elapsed > std::time::Duration::from_millis(3000) {
+                    if elapsed > std::time::Duration::from_millis(transport.state.borrow().ssl_close_timeout.into()) {
                         log::debug!("SSL close: timeout waiting for peer's close alert ({}ms), closing connection", elapsed.as_millis());
                         // Force close the connection
                         drop(state);
