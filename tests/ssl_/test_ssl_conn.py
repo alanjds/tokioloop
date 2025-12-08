@@ -410,7 +410,9 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version,
 @pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
 @pytest.mark.parametrize('tls_version', TLS_VERSIONS)
 @pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
-def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version, ssl_backend, monkeypatch):
+@pytest.mark.parametrize('hacks', [False, True], ids=lambda x: 'hacks' if x else 'nohacks')
+@pytest.mark.parametrize('zip', [False, True], ids=lambda x: 'zip' if x else 'nozip')
+def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version, ssl_backend, hacks, zip, monkeypatch):
     """Test EventLoop SSL server with openssl s_client command-line tool."""
 
     import subprocess
@@ -448,6 +450,14 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version,
         '-state',  # Show SSL state
         '-tlsextdebug',  # Show TLS extensions
     ]
+    if hacks:
+        ## From docs:
+        # There are several known bugs in SSL and TLS implementations.
+        # Adding this option enables various workarounds.
+        cmd.append('-bugs')
+    if zip:
+        # From docs: Enables support for SSL/TLS compression
+        cmd.append('-comp')
 
     logger.debug(f'[client] Running: {" ".join(cmd)}')
 
