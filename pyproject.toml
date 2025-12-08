@@ -119,6 +119,7 @@ addopts = [
     "--continue-on-collection-errors",
     "--ignore-glob=*_BACKUP_*",
     "-v",
+    "-rxX",
     "--doctest-modules",
     "--doctest-ignore-import-errors",
 ]
