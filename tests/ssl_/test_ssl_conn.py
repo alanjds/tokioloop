@@ -18,6 +18,7 @@ from . import SSLEchoClientProtocol, SSLEchoServerProtocol, SSLHTTPServerProtoco
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+multiprocessing.set_start_method('fork')
 
 pytestmark = [pytest.mark.timeout(5)]
 
