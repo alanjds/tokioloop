@@ -243,7 +243,7 @@ def test_cross_implementation_server_client(
         pytest.skip('Duplicated test')
 
     if tls_version in ['1.2+', '1.3'] and server_loop_name == 'RLoop':
-        pytest.xfail("Flaky w/ TLS 1.3")
+        pytest.xfail('Flaky w/ TLS 1.3')
 
     client_proto = SSLEchoClientProtocol(client_loop.create_future)
 
@@ -505,7 +505,7 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version,
         proc.kill()
         logger.debug('TimeoutExpired exception caught: %r', e)
         if tls_version in ['1.2+', '1.3'] and loop_name == 'RLoop':
-            pytest.xfail("Flaky w/ TLS 1.3")
+            pytest.xfail('Flaky w/ TLS 1.3')
     except FileNotFoundError:
         logger.debug('[client] openssl command not found')
         pytest.skip('openssl command not available')
