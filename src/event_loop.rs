@@ -346,7 +346,7 @@ impl EventLoop {
                         let guard_poll = self.io.lock().unwrap();
                         _ = guard_poll.registry().reregister(&mut source, token, interests);
                     }
-                    self.wake();  // interest changed
+                    self.wake(); // interest changed
                     return IOHandle::TCPStream(interests);
                 }
                 unreachable!()
@@ -358,7 +358,7 @@ impl EventLoop {
                     let guard_poll = self.io.lock().unwrap();
                     _ = guard_poll.registry().register(&mut source, token, interest);
                 }
-                self.wake();  // interest registered
+                self.wake(); // interest registered
                 IOHandle::TCPStream(interest)
             },
         );
@@ -1225,7 +1225,13 @@ impl EventLoop {
         let ssl_config = crate::ssl::create_ssl_config_from_context(&ssl_context.bind(py))?;
         let mut servers = Vec::new();
         for (fd, family) in rsocks {
-            servers.push(TCPServer::from_fd_ssl(fd, family, backlog, protocol_factory.clone_ref(py), ssl_config.clone()));
+            servers.push(TCPServer::from_fd_ssl(
+                fd,
+                family,
+                backlog,
+                protocol_factory.clone_ref(py),
+                ssl_config.clone(),
+            ));
         }
         let server = Server::tcp(pyself.clone_ref(py), socks, servers);
         Py::new(py, server)

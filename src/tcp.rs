@@ -12,7 +12,7 @@ use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
     io::Read,
-    sync::{atomic, Arc},
+    sync::{Arc, atomic},
 };
 
 use crate::{
@@ -59,7 +59,13 @@ impl TCPServer {
         }
     }
 
-    pub(crate) fn from_fd_ssl(fd: i32, sfamily: i32, backlog: i32, protocol_factory: Py<PyAny>, ssl_config: rustls::ServerConfig) -> Self {
+    pub(crate) fn from_fd_ssl(
+        fd: i32,
+        sfamily: i32,
+        backlog: i32,
+        protocol_factory: Py<PyAny>,
+        ssl_config: rustls::ServerConfig,
+    ) -> Self {
         Self {
             fd,
             sfamily,
@@ -156,7 +162,11 @@ impl TCPServerRef {
 
         // For SSL connections, delay connection_made until handshake completes
         let is_ssl = self.ssl_config.is_some();
-        log::debug!("new_stream: is_ssl = {}, ssl_config.is_some() = {}", is_ssl, self.ssl_config.is_some());
+        log::debug!(
+            "new_stream: is_ssl = {}, ssl_config.is_some() = {}",
+            is_ssl,
+            self.ssl_config.is_some()
+        );
         let conn_handle: BoxedHandle = if is_ssl {
             // For SSL connections, wait the handshake before scheduling callbacks
             // connection_made will be called later when handshake completes
@@ -169,11 +179,13 @@ impl TCPServerRef {
                 .proto
                 .getattr(py, pyo3::intern!(py, "connection_made"))
                 .unwrap();
-            Box::new(Py::new(
-                py,
-                CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
+            Box::new(
+                Py::new(
+                    py,
+                    CBHandle::new1(conn_made, pytransport.clone_ref(py).into_any(), copy_context(py)),
+                )
+                .unwrap(),
             )
-            .unwrap())
         };
 
         (pytransport, conn_handle)
@@ -307,7 +319,7 @@ impl TCPTransport {
     pub(crate) fn attach(pyself: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
         let rself = pyself.borrow(py);
         // For SSL connections, delay connection_made until handshake completes
-        if !rself.state.borrow().tls_conn.is_some() {
+        if rself.state.borrow().tls_conn.is_none() {
             rself
                 .proto
                 .call_method1(py, pyo3::intern!(py, "connection_made"), (pyself.clone_ref(py),))?;
@@ -317,12 +329,18 @@ impl TCPTransport {
 
     pub(crate) fn initialize_tls_server(&self, ssl_config: rustls::ServerConfig) {
         let mut state = self.state.borrow_mut();
-        state.tls_conn = Some(TLSConnection::Server(rustls::ServerConnection::new(Arc::new(ssl_config)).unwrap()));
+        state.tls_conn = Some(TLSConnection::Server(
+            rustls::ServerConnection::new(Arc::new(ssl_config)).unwrap(),
+        ));
         state.handshake_complete = false;
     }
 
     pub(crate) fn initialize_tls_client(&self, ssl_config: rustls::ClientConfig, server_name: String) {
-        log::debug!("SSL client: Initializing TLS for fd {} with server '{}'", self.fd, server_name);
+        log::debug!(
+            "SSL client: Initializing TLS for fd {} with server '{}'",
+            self.fd,
+            server_name
+        );
         let mut state = self.state.borrow_mut();
         let server_name = rustls::pki_types::ServerName::try_from(server_name).unwrap();
         let conn = rustls::ClientConnection::new(Arc::new(ssl_config), server_name).unwrap();
@@ -332,10 +350,16 @@ impl TCPTransport {
         // Check if the client needs to send initial handshake data
         if let Some(ref tls_conn) = state.tls_conn {
             if tls_conn.wants_write() {
-                log::debug!("SSL client: fd {} wants to write immediately after handshake init", self.fd);
+                log::debug!(
+                    "SSL client: fd {} wants to write immediately after handshake init",
+                    self.fd
+                );
                 self.pyloop.get().tcp_stream_add(self.fd, Interest::WRITABLE);
             } else {
-                log::debug!("SSL client: fd {} does not want to write immediately after handshake init", self.fd);
+                log::debug!(
+                    "SSL client: fd {} does not want to write immediately after handshake init",
+                    self.fd
+                );
             }
         }
     }
@@ -369,8 +393,12 @@ impl TCPTransport {
             return true; // Handled by TLS specific close path
         }
 
-        if !self.state.borrow_mut().write_buf.is_empty() { // Need mutable borrow for check
-             log::debug!("TCP close_from_read_handle: fd {} has pending write data, not closing yet", self.fd);
+        if !self.state.borrow_mut().write_buf.is_empty() {
+            // Need mutable borrow for check
+            log::debug!(
+                "TCP close_from_read_handle: fd {} has pending write data, not closing yet",
+                self.fd
+            );
             return false;
         }
 
@@ -383,7 +411,11 @@ impl TCPTransport {
     #[inline]
     fn close_from_write_handle(&self, py: Python, errored: bool) -> Option<bool> {
         if self.closing.load(atomic::Ordering::Relaxed) {
-            log::debug!("TCP close_from_write_handle: fd {} already closing. Errored: {}", self.fd, errored);
+            log::debug!(
+                "TCP close_from_write_handle: fd {} already closing. Errored: {}",
+                self.fd,
+                errored
+            );
             _ = self.protom_conn_lost.call1(
                 py,
                 #[allow(clippy::obfuscated_if_else)]
@@ -399,16 +431,28 @@ impl TCPTransport {
         }
         let weof = self.weof.load(atomic::Ordering::Relaxed); // Store to avoid multiple loads
         if weof {
-            log::debug!("TCP close_from_write_handle: fd {} WEOF true. Errored: {}", self.fd, errored);
+            log::debug!(
+                "TCP close_from_write_handle: fd {} WEOF true. Errored: {}",
+                self.fd,
+                errored
+            );
         } else {
-            log::debug!("TCP close_from_write_handle: fd {} WEOF false. Errored: {}. Closing due to write EOF.", self.fd, errored);
+            log::debug!(
+                "TCP close_from_write_handle: fd {} WEOF false. Errored: {}. Closing due to write EOF.",
+                self.fd,
+                errored
+            );
         }
         weof.then_some(false) // if weof is true, return Some(false), else None
     }
 
     #[inline(always)]
     fn call_conn_lost(&self, py: Python, err: Option<PyErr>) {
-        log::debug!("TCPTransport::call_conn_lost called for fd {}. Error present: {:?}", self.fd, err.is_some());
+        log::debug!(
+            "TCPTransport::call_conn_lost called for fd {}. Error present: {:?}",
+            self.fd,
+            err.is_some()
+        );
         let err_arg = match err {
             Some(e) => e.into_py_any(py).unwrap(),
             None => py.None(),
@@ -436,69 +480,109 @@ impl TCPTransport {
 
         let is_tls = rself.state.borrow().tls_conn.is_some();
         if is_tls {
-            log::debug!("SSL write (try_write): called for fd {} with {} bytes of application data", rself.fd, data.len());
-        } else {
-            log::debug!("TCP write (try_write): called for fd {} with {} bytes of application data", rself.fd, data.len());
-        }
-
-    let mut state = rself.state.borrow_mut();
-
-    // For TLS connections, never write directly to socket - always buffer for encryption
-    let buf_added = if is_tls {
-        log::debug!("SSL write (try_write): buffering {} bytes for encryption on fd {}", data.len(), rself.fd);
-        state.write_buf.push_back(data.into());
-        data.len()
-    } else {
-        match state.write_buf_dsize {
-            #[allow(clippy::cast_possible_wrap)]
-            0 => match syscall!(write(rself.fd as i32, data.as_ptr().cast(), data.len())) {
-                Ok(written) if written as usize == data.len() => {
-                    log::debug!("TCP write (try_write): wrote all {} bytes directly on fd {}", data.len(), rself.fd);
-                    0 // All data written
-                }
-                Ok(written) => {
-                    let written = written as usize;
-                    log::debug!("TCP write (try_write): partial direct write on fd {}: {}/{}", rself.fd, written, data.len());
-                    state.write_buf.push_back((&data[written..]).into());
-                    // Amount buffered
-                    data.len() - written
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                    log::debug!("TCP write (try_write): interrupted on fd {}. Buffering all {} bytes.", rself.fd, data.len());
-                    state.write_buf.push_back(data.into()); // Buffer all
-                    data.len()
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    log::debug!("TCP write (try_write): would block on fd {}. Buffering all {} bytes.", rself.fd, data.len());
-                    state.write_buf.push_back(data.into());  // Buffer all
-                    data.len()
-                }
-                Err(err) => {
-                    log::error!("TCP write (try_write): syscall error for fd {}: {:?}", rself.fd, err);
-                    if state.write_buf_dsize > 0 {
-                        // reset buf_dsize?
-                        rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::WRITABLE);
-                    }
-                    if rself
-                        .closing
-                        .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        log::debug!("TCP write (try_write): error on fd {}, setting closing and removing READ interest", rself.fd);
-                        rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::READABLE);
-                    }
-                    rself.call_conn_lost(py, Some(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string())));
-                    // Connection closed
-                    0
-                }
-            },
-            _ => {  // Buffer already had data, append new data
-                log::debug!("SSL write (try_write): appending {} bytes to existing buffer on fd {}", data.len(), rself.fd);
-                state.write_buf.push_back(data.into());
+            log::debug!(
+                "SSL write (try_write): called for fd {} with {} bytes of application data",
+                rself.fd,
                 data.len()
-            }
+            );
+        } else {
+            log::debug!(
+                "TCP write (try_write): called for fd {} with {} bytes of application data",
+                rself.fd,
+                data.len()
+            );
         }
-    };
+
+        let mut state = rself.state.borrow_mut();
+
+        // For TLS connections, never write directly to socket - always buffer for encryption
+        let buf_added = if is_tls {
+            log::debug!(
+                "SSL write (try_write): buffering {} bytes for encryption on fd {}",
+                data.len(),
+                rself.fd
+            );
+            state.write_buf.push_back(data.into());
+            data.len()
+        } else {
+            match state.write_buf_dsize {
+                #[allow(clippy::cast_possible_wrap)]
+                0 => match syscall!(write(rself.fd as i32, data.as_ptr().cast(), data.len())) {
+                    Ok(written) if written as usize == data.len() => {
+                        log::debug!(
+                            "TCP write (try_write): wrote all {} bytes directly on fd {}",
+                            data.len(),
+                            rself.fd
+                        );
+                        0 // All data written
+                    }
+                    Ok(written) => {
+                        let written = written as usize;
+                        log::debug!(
+                            "TCP write (try_write): partial direct write on fd {}: {}/{}",
+                            rself.fd,
+                            written,
+                            data.len()
+                        );
+                        state.write_buf.push_back((&data[written..]).into());
+                        // Amount buffered
+                        data.len() - written
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                        log::debug!(
+                            "TCP write (try_write): interrupted on fd {}. Buffering all {} bytes.",
+                            rself.fd,
+                            data.len()
+                        );
+                        state.write_buf.push_back(data.into()); // Buffer all
+                        data.len()
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        log::debug!(
+                            "TCP write (try_write): would block on fd {}. Buffering all {} bytes.",
+                            rself.fd,
+                            data.len()
+                        );
+                        state.write_buf.push_back(data.into()); // Buffer all
+                        data.len()
+                    }
+                    Err(err) => {
+                        log::error!("TCP write (try_write): syscall error for fd {}: {:?}", rself.fd, err);
+                        if state.write_buf_dsize > 0 {
+                            // reset buf_dsize?
+                            rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::WRITABLE);
+                        }
+                        if rself
+                            .closing
+                            .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            log::debug!(
+                                "TCP write (try_write): error on fd {}, setting closing and removing READ interest",
+                                rself.fd
+                            );
+                            rself.pyloop.get().tcp_stream_rem(rself.fd, Interest::READABLE);
+                        }
+                        rself.call_conn_lost(
+                            py,
+                            Some(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(err.to_string())),
+                        );
+                        // Connection closed
+                        0
+                    }
+                },
+                _ => {
+                    // Buffer already had data, append new data
+                    log::debug!(
+                        "SSL write (try_write): appending {} bytes to existing buffer on fd {}",
+                        data.len(),
+                        rself.fd
+                    );
+                    state.write_buf.push_back(data.into());
+                    data.len()
+                }
+            }
+        };
         if buf_added > 0 {
             if state.write_buf_dsize == 0 {
                 rself.pyloop.get().tcp_stream_add(rself.fd, Interest::WRITABLE);
@@ -533,7 +617,7 @@ impl TCPTransport {
 
     fn proto_resume(pyself: &Py<Self>, py: Python) {
         let rself = pyself.borrow(py);
-         log::debug!("TCP/SSL proto_resume called for fd {}", rself.fd); // Use rself.fd
+        log::debug!("TCP/SSL proto_resume called for fd {}", rself.fd); // Use rself.fd
         if let Err(err) = rself.proto.call_method0(py, pyo3::intern!(py, "resume_writing")) {
             let err_ctx = LogExc::transport(
                 err,
@@ -581,7 +665,10 @@ impl TCPTransport {
         if self.state.borrow().tls_conn.is_some() {
             let has_pending_data = !self.state.borrow().write_buf.is_empty();
             if has_pending_data {
-                log::debug!("SSL close: pending data in write buffer, deferring close alert for fd {}", self.fd);
+                log::debug!(
+                    "SSL close: pending data in write buffer, deferring close alert for fd {}",
+                    self.fd
+                );
                 // Mark that we want to close after pending data is sent
                 self.state.borrow_mut().tls_pending_close = true;
                 return;
@@ -613,7 +700,9 @@ impl TCPTransport {
 
                 // Notify the connection closing
                 let pytransport = event_loop.get_tcp_transport(self.fd, py).unwrap();
-                pytransport.getattr(py, pyo3::intern!(py, "call_connection_lost")).unwrap();
+                pytransport
+                    .getattr(py, pyo3::intern!(py, "call_connection_lost"))
+                    .unwrap();
 
                 return;
             }
@@ -686,7 +775,12 @@ impl TCPTransport {
         };
 
         if wh < wl {
-            log::error!("TCPTransport::set_write_buffer_limits for fd {}: Error: high ({}) must be >= low ({}). Current values not changed.", pyself.borrow(py).fd, wh, wl);
+            log::error!(
+                "TCPTransport::set_write_buffer_limits for fd {}: Error: high ({}) must be >= low ({}). Current values not changed.",
+                pyself.borrow(py).fd,
+                wh,
+                wl
+            );
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "high must be >= low must be >= 0",
             ));
@@ -710,7 +804,11 @@ impl TCPTransport {
 
     fn get_write_buffer_size(&self) -> usize {
         let size = self.state.borrow().write_buf_dsize;
-        log::debug!("TCPTransport::get_write_buffer_size called for fd {}. Size: {}", self.fd, size);
+        log::debug!(
+            "TCPTransport::get_write_buffer_size called for fd {}. Size: {}",
+            self.fd,
+            size
+        );
         size
     }
 
@@ -719,21 +817,36 @@ impl TCPTransport {
             self.water_lo.load(atomic::Ordering::Relaxed),
             self.water_hi.load(atomic::Ordering::Relaxed),
         );
-        log::debug!("TCPTransport::get_write_buffer_limits called for fd {}. Limits: {:?}", self.fd, limits);
+        log::debug!(
+            "TCPTransport::get_write_buffer_limits called for fd {}. Limits: {:?}",
+            self.fd,
+            limits
+        );
         limits
     }
 
     fn write(pyself: Py<Self>, py: Python, data: Cow<[u8]>) -> PyResult<()> {
-        log::debug!("TCPTransport::write (PyO3) called for fd {:?} with {} bytes", pyself.borrow(py).fd, data.len());
+        log::debug!(
+            "TCPTransport::write (PyO3) called for fd {:?} with {} bytes",
+            pyself.borrow(py).fd,
+            data.len()
+        );
         Self::try_write(&pyself, py, &data)
     }
 
     fn writelines(pyself: Py<Self>, py: Python, data: &Bound<PyAny>) -> PyResult<()> {
-        log::debug!("TCPTransport::writelines (PyO3) called for fd {:?}", pyself.borrow(py).fd);
+        log::debug!(
+            "TCPTransport::writelines (PyO3) called for fd {:?}",
+            pyself.borrow(py).fd
+        );
         let pybytes = PyBytes::new(py, &[0; 0]);
         let pybytesj = pybytes.call_method1(pyo3::intern!(py, "join"), (data,))?;
         let bytes: Cow<[u8]> = pybytesj.extract()?;
-        log::debug!("TCPTransport::writelines (PyO3) for fd {:?} joined to {} bytes", pyself.borrow(py).fd, bytes.len());
+        log::debug!(
+            "TCPTransport::writelines (PyO3) for fd {:?} joined to {} bytes",
+            pyself.borrow(py).fd,
+            bytes.len()
+        );
         Self::try_write(&pyself, py, &bytes)
     }
 
@@ -759,7 +872,7 @@ impl TCPTransport {
     }
 
     fn can_write_eof(&self) -> bool {
-        let can = !self.weof.load(atomic::Ordering::Relaxed);  // Can write EOF if not already set
+        let can = !self.weof.load(atomic::Ordering::Relaxed); // Can write EOF if not already set
         log::debug!("TCPTransport::can_write_eof called for fd {}. Value: {}", self.fd, can);
         can
     }
@@ -767,7 +880,10 @@ impl TCPTransport {
     fn abort(&self, py: Python) {
         log::debug!("TCPTransport::abort called for fd {}", self.fd);
         if self.state.borrow().write_buf_dsize > 0 {
-            log::debug!("TCPTransport::abort: fd {} has write_buf_dsize > 0. Removing WRITABLE interest.", self.fd);
+            log::debug!(
+                "TCPTransport::abort: fd {} has write_buf_dsize > 0. Removing WRITABLE interest.",
+                self.fd
+            );
             self.pyloop.get().tcp_stream_rem(self.fd, Interest::WRITABLE);
         }
         if self
@@ -775,18 +891,27 @@ impl TCPTransport {
             .compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
             .is_ok()
         {
-            log::debug!("TCPTransport::abort: fd {} set closing. Removing READ interest.", self.fd);
+            log::debug!(
+                "TCPTransport::abort: fd {} set closing. Removing READ interest.",
+                self.fd
+            );
             self.pyloop.get().tcp_stream_rem(self.fd, Interest::READABLE);
         } else {
             log::debug!("TCPTransport::abort: fd {} was already closing.", self.fd);
         }
-        log::debug!("TCPTransport::abort: fd {} calling call_conn_lost due to abort.", self.fd);
+        log::debug!(
+            "TCPTransport::abort: fd {} calling call_conn_lost due to abort.",
+            self.fd
+        );
         self.call_conn_lost(py, None);
     }
 
     fn call_connection_lost(&self, py: Python) {
         self.call_conn_lost_py(py);
-        log::debug!("TCPTransport::call_connection_lost (Python API) called for fd {}", self.fd);
+        log::debug!(
+            "TCPTransport::call_connection_lost (Python API) called for fd {}",
+            self.fd
+        );
     }
 }
 
@@ -809,7 +934,7 @@ impl TCPReadHandle {
                 read
             };
 
-            log::debug!("SSL read: received {} bytes of raw data", read);
+            log::debug!("SSL read: received {read} bytes of raw data");
 
             if read > 0 {
                 // Process TLS data
@@ -820,7 +945,7 @@ impl TCPReadHandle {
                     // Feed raw bytes to TLS connection
                     let mut rd = std::io::Cursor::new(&buf[..read]);
                     if let Err(e) = tls_conn.read_tls(&mut rd) {
-                        log::debug!("SSL read: TLS read_tls error: {:?}", e);
+                        log::debug!("SSL read: TLS read_tls error: {e:?}");
                         // TLS error - close connection
                         return (None, true);
                     }
@@ -840,7 +965,7 @@ impl TCPReadHandle {
                             }
                         }
                         Err(e) => {
-                            log::debug!("SSL read: TLS process_new_packets error: {:?}", e);
+                            log::debug!("SSL read: TLS process_new_packets error: {e:?}");
                             // TLS error - close connection
                             return (None, true);
                         }
@@ -854,13 +979,20 @@ impl TCPReadHandle {
                     if !state.handshake_complete && !tls_conn.is_handshaking() {
                         state.handshake_complete = true;
                         log::debug!("SSL read: handshake completed");
-                        log::trace!("RLOOP_TLS_DBG_HANDSHAKE_CMPL: fd={}, connection_made_called={}", self.fd, state.connection_made_called);
+                        log::trace!(
+                            "RLOOP_TLS_DBG_HANDSHAKE_CMPL: fd={}, connection_made_called={}",
+                            self.fd,
+                            state.connection_made_called
+                        );
 
                         // For SSL connections, call connection_made after handshake completes
                         if !state.connection_made_called {
                             state.connection_made_called = true;
                             // Schedule connection_made callback through the event loop
-                            let transport_arg = transport.pyloop.get().get_tcp_transport(self.fd, py)
+                            let transport_arg = transport
+                                .pyloop
+                                .get()
+                                .get_tcp_transport(self.fd, py)
                                 .map(|t| t.clone_ref(py).into_any())
                                 .unwrap_or_else(|| py.None());
                             if let Ok(conn_made) = transport.proto.getattr(py, pyo3::intern!(py, "connection_made")) {
@@ -879,11 +1011,11 @@ impl TCPReadHandle {
                 // Check if there is pending TLS data to write (handshake, etc.)
                 {
                     let state = transport.state.borrow();
-                    if let Some(ref tls_conn) = state.tls_conn {
-                        if tls_conn.wants_write() {
-                            log::debug!("SSL read: server wants to write (handshake data), adding writable interest");
-                            transport.pyloop.get().tcp_stream_add(transport.fd, Interest::WRITABLE);
-                        }
+                    if let Some(ref tls_conn) = state.tls_conn
+                        && tls_conn.wants_write()
+                    {
+                        log::debug!("SSL read: server wants to write (handshake data), adding writable interest");
+                        transport.pyloop.get().tcp_stream_add(transport.fd, Interest::WRITABLE);
                     }
                 }
 
@@ -917,11 +1049,18 @@ impl TCPReadHandle {
             let closed = {
                 let mut state = transport.state.borrow_mut();
                 let (bytes_read, closed) = self.read_into(&mut state.stream, &mut []);
-                log::debug!("SSL read: connection closed check - bytes_read={}, closed={}, tls_close_sent={}", bytes_read, closed, state.tls_close_sent);
+                log::debug!(
+                    "SSL read: connection closed check - bytes_read={}, closed={}, tls_close_sent={}",
+                    bytes_read,
+                    closed,
+                    state.tls_close_sent
+                );
                 // If we read 0 bytes and we've sent our close alert, consider the connection closed
                 let peer_closed_after_our_alert = bytes_read == 0 && state.tls_close_sent;
                 if peer_closed_after_our_alert {
-                    log::debug!("SSL read: peer closed TCP connection after receiving our close alert - completing handshake");
+                    log::debug!(
+                        "SSL read: peer closed TCP connection after receiving our close alert - completing handshake"
+                    );
                     // Peer closed TCP after receiving our close alert - this completes the handshake
                     return (None, true);
                 }
@@ -1000,11 +1139,11 @@ impl TCPReadHandle {
 
 impl Handle for TCPReadHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, state: &mut EventLoopRunState) {
-        let pytransport = match event_loop.get_tcp_transport(self.fd, py) {
-            Some(t) => t,
-            None => return,  // Transport was closed
-
+        // if None: transport was closed
+        let Some(pytransport) = event_loop.get_tcp_transport(self.fd, py) else {
+            return;
         };
+
         let transport = pytransport.borrow(py);
 
         // NOTE: we need to consume all the data coming from the socket even when it exceeds the buffer,
@@ -1060,13 +1199,15 @@ impl TCPWriteHandle {
 
                 // First, handle any pending TLS writes (handshake or encrypted data)
                 if let Err(e) = tls_conn.write_tls(&mut tls_buf) {
-                    log::debug!("SSL write: TLS write_tls error: {:?}", e);
+                    log::debug!("SSL write: TLS write_tls error: {e:?}");
                     // TLS error
                     return None;
                 }
             }
 
-            if !tls_buf.is_empty() {
+            if tls_buf.is_empty() {
+                log::debug!("SSL write: no TLS data to send");
+            } else {
                 log::trace!("SSL write: TLS buffer: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
                 log::debug!("SSL write: sending {} bytes of TLS data", tls_buf.len());
                 match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
@@ -1089,10 +1230,7 @@ impl TCPWriteHandle {
                         return None;
                     }
                 }
-            } else {
-                log::debug!("SSL write: no TLS data to send");
             }
-
             // Check if handshake is complete
             let handshake_complete = transport.state.borrow().handshake_complete;
 
@@ -1110,7 +1248,7 @@ impl TCPWriteHandle {
                             let mut state = transport.state.borrow_mut();
                             let tls_conn = state.tls_conn.as_mut().unwrap();
 
-                            if let Err(_) = std::io::Write::write_all(&mut tls_conn.writer(), &data) {
+                            if std::io::Write::write_all(&mut tls_conn.writer(), &data).is_err() {
                                 // TLS write error - put data back
                                 return None;
                             }
@@ -1133,13 +1271,16 @@ impl TCPWriteHandle {
                 {
                     let mut state = transport.state.borrow_mut();
                     let tls_conn = state.tls_conn.as_mut().unwrap();
-                    if let Err(_) = tls_conn.write_tls(&mut tls_buf) {
+                    if tls_conn.write_tls(&mut tls_buf).is_err() {
                         return None;
                     }
                 }
 
                 if !tls_buf.is_empty() {
-                    log::trace!("SSL write: Application data TLS buffer: {:02x?}", &tls_buf[..tls_buf.len().min(64)]);
+                    log::trace!(
+                        "SSL write: Application data TLS buffer: {:02x?}",
+                        &tls_buf[..tls_buf.len().min(64)]
+                    );
                     match syscall!(write(fd, tls_buf.as_ptr().cast(), tls_buf.len())) {
                         Ok(written) if written as usize == tls_buf.len() => {}
                         Ok(_) => return None, // Partial write
@@ -1186,22 +1327,12 @@ impl TCPWriteHandle {
         state.write_buf_dsize -= ret;
         Some(ret)
     }
-
-    #[inline]
-    fn has_pending_tls_data(&self, transport: &TCPTransport) -> bool {
-        if let Some(ref tls_conn) = transport.state.borrow().tls_conn {
-            tls_conn.wants_write()
-        } else {
-            false
-        }
-    }
 }
 
 impl Handle for TCPWriteHandle {
     fn run(&self, py: Python, event_loop: &EventLoop, _state: &mut EventLoopRunState) {
-        let pytransport = match event_loop.get_tcp_transport(self.fd, py) {
-            Some(t) => t,
-            None => return,  // Transport was closed
+        let Some(pytransport) = event_loop.get_tcp_transport(self.fd, py) else {
+            return;
         };
         let transport = pytransport.borrow(py);
         let stream_close;
@@ -1214,7 +1345,10 @@ impl Handle for TCPWriteHandle {
                 if let Some(sent_time) = state.tls_close_sent_time {
                     let elapsed = sent_time.elapsed();
                     if elapsed > std::time::Duration::from_millis(transport.state.borrow().ssl_close_timeout.into()) {
-                        log::debug!("SSL close: timeout waiting for peer's close alert ({}ms), closing connection", elapsed.as_millis());
+                        log::debug!(
+                            "SSL close: timeout waiting for peer's close alert ({}ms), closing connection",
+                            elapsed.as_millis()
+                        );
                         // Force close the connection
                         drop(state);
                         event_loop.tcp_stream_rem(self.fd, Interest::READABLE);
@@ -1237,7 +1371,10 @@ impl Handle for TCPWriteHandle {
             stream_close = match write_buf_empty {
                 true => {
                     if pending_ssl_close {
-                        log::debug!("SSL write: write buffer empty, sending pending close alert for fd {}", self.fd);
+                        log::debug!(
+                            "SSL write: write buffer empty, sending pending close alert for fd {}",
+                            self.fd
+                        );
                         // Send the close alert now that buffer is empty
                         let mut tls_buf = Vec::new();
                         {

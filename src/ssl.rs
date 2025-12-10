@@ -1,8 +1,11 @@
 use anyhow::Result;
 use pyo3::prelude::*;
-use rustls::{ServerConfig, pki_types::{CertificateDer, PrivateKeyDer}};
-use std::fs;
+use rustls::{
+    ServerConfig,
+    pki_types::{CertificateDer, PrivateKeyDer},
+};
 use rustls_pemfile::Item;
+use std::fs;
 
 #[pyclass]
 #[derive(Clone, Copy)]
@@ -22,7 +25,7 @@ fn get_tls_version_from_env() -> Option<TLSVersion> {
         Ok("1.2") => Some(TLSVersion::TLS12),
         Ok("1.2+") => Some(TLSVersion::TLS12_PLUS),
         Ok("1.3") => Some(TLSVersion::TLS13),
-        Ok(_) => None, // Invalid value, use default
+        Ok(_) => None,  // Invalid value, use default
         Err(_) => None, // Not set, use default
     }
 }
@@ -58,9 +61,7 @@ pub(crate) fn create_ssl_config() -> Result<ServerConfig> {
 pub fn list_rustls_cipher_suites() -> PyResult<Vec<String>> {
     // List the default cipher suites that rustls supports
     let default_suites = rustls::crypto::aws_lc_rs::DEFAULT_CIPHER_SUITES;
-    let cipher_suites = default_suites.iter()
-        .map(|cs| format!("{:?}", cs))
-        .collect::<Vec<_>>();
+    let cipher_suites = default_suites.iter().map(|cs| format!("{:?}", cs)).collect::<Vec<_>>();
 
     Ok(cipher_suites)
 }
@@ -70,21 +71,19 @@ pub fn list_rustls_cipher_suites() -> PyResult<Vec<String>> {
 pub fn list_all_rustls_cipher_suites() -> PyResult<Vec<String>> {
     // List all cipher suites that rustls supports
     let all_suites = rustls::crypto::aws_lc_rs::ALL_CIPHER_SUITES;
-    let cipher_suites = all_suites.iter()
-        .map(|cs| format!("{:?}", cs))
-        .collect::<Vec<_>>();
+    let cipher_suites = all_suites.iter().map(|cs| format!("{cs:?}")).collect::<Vec<_>>();
 
     Ok(cipher_suites)
 }
 
 /// Create SSL server configuration from an SSL context with TLS version
-pub(crate) fn create_ssl_config_from_context_with_version(ssl_context: &Bound<PyAny>, tls_version: Option<TLSVersion>) -> Result<ServerConfig> {
+pub(crate) fn create_ssl_config_from_context_with_version(
+    ssl_context: &Bound<PyAny>,
+    tls_version: Option<TLSVersion>,
+) -> Result<ServerConfig> {
     // Try to extract certificate and key file paths from the SSL context
     // These are test-specific attributes
-    if let (Ok(certfile_attr), Ok(keyfile_attr)) = (
-        ssl_context.getattr("_certfile"),
-        ssl_context.getattr("_keyfile")
-    ) {
+    if let (Ok(certfile_attr), Ok(keyfile_attr)) = (ssl_context.getattr("_certfile"), ssl_context.getattr("_keyfile")) {
         let certfile: String = certfile_attr.extract()?;
         let keyfile: String = keyfile_attr.extract()?;
 
@@ -92,7 +91,7 @@ pub(crate) fn create_ssl_config_from_context_with_version(ssl_context: &Bound<Py
         let cert_data = fs::read(&certfile)?;
         let mut cert_reader = std::io::Cursor::new(&cert_data);
         let cert_der = match rustls_pemfile::read_one(&mut cert_reader)? {
-            Some(Item::X509Certificate(cert)) => CertificateDer::from(cert),
+            Some(Item::X509Certificate(cert)) => cert,
             _ => return Err(anyhow::anyhow!("failed to parse certificate")),
         };
 
@@ -130,7 +129,10 @@ pub(crate) fn create_ssl_config_from_context(ssl_context: &Bound<PyAny>) -> Resu
 }
 
 /// Create SSL client configuration from an SSL context with TLS version
-pub(crate) fn create_ssl_client_config_from_context_with_version(_ssl_context: &Bound<PyAny>, tls_version: Option<TLSVersion>) -> Result<rustls::ClientConfig> {
+pub(crate) fn create_ssl_client_config_from_context_with_version(
+    _ssl_context: &Bound<PyAny>,
+    tls_version: Option<TLSVersion>,
+) -> Result<rustls::ClientConfig> {
     let versions = match tls_version {
         Some(TLSVersion::TLS12) => &TLS12_ONLY[..],
         Some(TLSVersion::TLS12_PLUS) => &TLS12_PLUS[..],
