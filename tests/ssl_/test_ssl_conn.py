@@ -319,7 +319,6 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version
         # TLS versions are only useful with RLoop reactor.
         pytest.skip('Duplicated test')
 
-
     server_process, server_stop, (host, port) = start_ssl_http_server(loop, server_ssl_context)
 
     url = f'https://{host}:{port}'
@@ -360,7 +359,6 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version,
         # Standard Asyncio reactor should be tested only w/ tls_version unset.
         # TLS versions are only useful with RLoop reactor.
         pytest.skip('Duplicated test')
-
 
     server_process, server_stop, (host, port) = start_ssl_http_server(loop, server_ssl_context)
 
@@ -453,8 +451,6 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version,
         # Standard Asyncio reactor should be tested only w/ tls_version unset.
         # TLS versions are only useful with RLoop reactor.
         pytest.skip('Duplicated test')
-
-
 
     logger.debug('Starting SSL HTTP server')
     server_process, server_stop, (host, port) = start_ssl_http_server(loop, server_ssl_context, lifetime=30)
