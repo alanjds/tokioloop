@@ -64,6 +64,25 @@ def start_ssl_http_server(
     """Helper function to start SSL HTTP server for testing."""
     port = port or random.randint(10000, 20000)  # noqa: S311
 
+    # Be sure that the port is available
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    while True:
+        try:
+            sock.bind((host, port))
+            # Port is available
+            sock.close()
+            break
+        except OSError as e:
+            if e.errno == 98:  # Address already in use
+                sock.close()
+                # Try another port
+                port += 1
+                continue
+            else:  # Re-raise other errors
+                sock.close()
+                raise
+
     server_ready = multiprocessing.Event()
     server_stop = multiprocessing.Event()
     server_addr = (host, port)
