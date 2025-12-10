@@ -62,7 +62,7 @@ def start_ssl_http_server(
     loop, server_ssl_context, host='localhost', port=None, lifetime=10, protocol=SSLHTTPServerProtocol
 ) -> tuple[Process, Event, tuple[str, int]]:
     """Helper function to start SSL HTTP server for testing."""
-    port = port or random.randint(10000, 20000)
+    port = port or random.randint(10000, 20000)  # noqa: S311
 
     server_ready = multiprocessing.Event()
     server_stop = multiprocessing.Event()
@@ -84,7 +84,7 @@ def start_ssl_http_server(
             server_ready.set()
 
             i = 0
-            for i in range(lifetime):
+            for i in range(lifetime):  # noqa: B007
                 await asyncio.sleep(1)
                 if server_stop.is_set():
                     break
@@ -146,7 +146,7 @@ def test_ssl_protocol_without_ssl(evloop):
     loop = evloop()
 
     host = '127.0.0.1'
-    port = random.randint(10000, 20000)
+    port = random.randint(10000, 20000)  # noqa: S311
 
     server_proto = SSLEchoServerProtocol()
     client_proto = SSLEchoClientProtocol(loop.create_future)
@@ -184,7 +184,7 @@ def test_ssl_server(evloop, ssl_context, server_ssl_context, tls_version, ssl_ba
         pytest.skip('Duplicated test')
 
     host = '127.0.0.1'
-    port = random.randint(10000, 20000)
+    port = random.randint(10000, 20000)  # noqa: S311
 
     server_proto = SSLEchoServerProtocol()
     client_proto = SSLEchoClientProtocol(loop.create_future)
@@ -472,7 +472,7 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version,
     try:
         logger.debug('Starting subprocess.Popen: %s', cmd)
         # Start openssl s_client process
-        proc = subprocess.Popen(
+        proc = subprocess.Popen(  # noqa: S603
             ' '.join(cmd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
