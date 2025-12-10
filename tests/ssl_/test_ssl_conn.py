@@ -18,8 +18,6 @@ from . import SSLEchoClientProtocol, SSLEchoServerProtocol, SSLHTTPServerProtoco
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-multiprocessing.set_start_method('fork')
-
 pytestmark = [pytest.mark.timeout(5)]
 
 
@@ -96,7 +94,8 @@ def start_ssl_http_server(
             logger.debug(f'[server] {loopclass} server closed')
 
     coro = run_server()
-    server_process = multiprocessing.Process(target=lambda: loop.run_until_complete(coro))
+    mp = multiprocessing.get_context('fork')
+    server_process = mp.Process(target=lambda: loop.run_until_complete(coro))
     server_process.start()
     logger.debug('Waiting for server_ready event')
     server_ready.wait()
