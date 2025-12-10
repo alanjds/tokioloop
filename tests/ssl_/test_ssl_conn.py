@@ -472,12 +472,13 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version,
     try:
         logger.debug('Starting subprocess.Popen: %s', cmd)
         # Start openssl s_client process
-        proc = subprocess.Popen(  # noqa: S603
+        proc = subprocess.Popen(  # noqa: S602
             ' '.join(cmd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            shell=True,
         )
         logger.debug('subprocess.Popen completed')
 
