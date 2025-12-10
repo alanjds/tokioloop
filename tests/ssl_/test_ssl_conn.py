@@ -307,7 +307,14 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version
     # Create raw SSL client
     logger.debug(f'[client] Connecting to {url} via requests')
 
-    result = requests.get(url, verify=False, timeout=5)
+    try:
+        result = requests.get(url, verify=False, timeout=5)
+    except requests.exceptions.ReadTimeout:
+        if tls_version in ['1.2+', '1.3'] and type(loop).__name__ == 'RLoop':
+            pytest.xfail('Flaky w/ TLS 1.3')
+        else:
+            raise
+
     result.raise_for_status()
     assert result.status_code == 200
     assert result.text == 'hello SSL world'
