@@ -1,11 +1,5 @@
 import asyncio
 import logging
-import socket
-import ssl
-
-import pytest
-
-import rloop
 
 
 logging.basicConfig(level=logging.DEBUG)

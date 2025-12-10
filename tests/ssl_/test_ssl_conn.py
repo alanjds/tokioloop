@@ -402,8 +402,8 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version,
     finally:
         try:
             ssl_sock.close()
-        except:
-            pass
+        except Exception:
+            logger.warning('Failed to close the SSL socket %s', ssl_sock)
 
     # Signal and wait server to stop
     logger.debug('[client] Signaling the server to stop')
@@ -478,7 +478,6 @@ def test_ssl_server_with_openssl_client(evloop, server_ssl_context, tls_version,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            shell=True,
         )
         logger.debug('subprocess.Popen completed')
 
