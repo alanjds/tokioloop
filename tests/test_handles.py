@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 
 def run_loop(loop):
     async def run():
@@ -37,6 +39,9 @@ def test_call_later(loop):
 
 
 def test_call_later_negative(loop):
+    if type(loop).__module__.startswith('asyncio'):
+        pytest.skip('Asyncio std loop schedule negatives differently.')
+
     calls = []
 
     def cb(arg):
