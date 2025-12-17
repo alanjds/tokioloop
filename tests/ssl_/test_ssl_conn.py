@@ -76,8 +76,12 @@ def start_ssl_http_server(
         except OSError as e:
             if e.errno == 98:  # Address already in use
                 sock.close()
-                # Try another port
+                # Close and try another port
                 port += 1
+                continue
+            elif e.errno == 9:  # Bad file descriptor
+                # Try another port
+                port +=1
                 continue
             else:  # Re-raise other errors
                 sock.close()
