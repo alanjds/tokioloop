@@ -81,7 +81,7 @@ def start_ssl_http_server(
                 continue
             elif e.errno == 9:  # Bad file descriptor
                 # Try another port
-                port +=1
+                port += 1
                 continue
             else:  # Re-raise other errors
                 sock.close()
