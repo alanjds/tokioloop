@@ -10,6 +10,7 @@ from multiprocessing import Event, Process
 
 import pytest
 import uvloop
+from conftest import _namegetter
 
 import rloop
 
@@ -128,7 +129,7 @@ def start_ssl_http_server(
     return server_process, server_stop, server_addr
 
 
-@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
+@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: _namegetter(x()))
 @pytest.mark.parametrize('tls_version', TLS_VERSIONS)
 @pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
 def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context, tls_version, ssl_backend, monkeypatch):
@@ -165,7 +166,7 @@ def test_ssl_connection_echo(evloop, ssl_context, server_ssl_context, tls_versio
     assert client_proto.data.startswith(b'echo: hello SSL world')
 
 
-@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
+@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: _namegetter(x()))
 def test_ssl_protocol_without_ssl(evloop):
     """Test that non-SSL connection works with the tests protocol."""
     loop = evloop()
@@ -193,7 +194,7 @@ def test_ssl_protocol_without_ssl(evloop):
     assert server_proto.state == 'CLOSED'
 
 
-@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
+@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: _namegetter(x()))
 @pytest.mark.parametrize('tls_version', TLS_VERSIONS)
 @pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
 def test_ssl_server(evloop, ssl_context, server_ssl_context, tls_version, ssl_backend, monkeypatch):
@@ -307,7 +308,7 @@ def test_cross_implementation_server_client(
 
 
 @pytest.mark.timeout(10)
-@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
+@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: _namegetter(x()))
 @pytest.mark.parametrize('tls_version', TLS_VERSIONS)
 @pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
 def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version, ssl_backend, monkeypatch):
@@ -350,7 +351,7 @@ def test_ssl_server_with_requests_client(evloop, server_ssl_context, tls_version
 
 
 @pytest.mark.timeout(10)
-@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
+@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: _namegetter(x()))
 @pytest.mark.parametrize('tls_version', TLS_VERSIONS)
 @pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
 def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version, ssl_backend, monkeypatch):
@@ -437,7 +438,7 @@ def test_ssl_server_with_raw_ssl_client(evloop, server_ssl_context, tls_version,
 
 
 @pytest.mark.timeout(60)
-@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: type(x()))
+@pytest.mark.parametrize('evloop', EVENT_LOOPS, ids=lambda x: _namegetter(x()))
 @pytest.mark.parametrize('tls_version', TLS_VERSIONS)
 @pytest.mark.parametrize('ssl_backend', SSL_BACKENDS)
 @pytest.mark.parametrize('hacks', [False, True], ids=lambda x: 'hacks' if x else 'nohacks')
