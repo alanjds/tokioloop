@@ -1,12 +1,14 @@
 import asyncio
 
 import pytest
+import uvloop
 
 import rloop
 
 
 EVENT_LOOPS = [
     asyncio.new_event_loop,
+    uvloop.new_event_loop,
     rloop.new_event_loop,
 ]
 

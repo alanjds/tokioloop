@@ -9,6 +9,7 @@ import threading
 from multiprocessing import Event, Process
 
 import pytest
+import uvloop
 
 import rloop
 
@@ -51,6 +52,7 @@ def server_ssl_context():
 
 EVENT_LOOPS = [
     asyncio.new_event_loop,
+    uvloop.new_event_loop,
     rloop.new_event_loop,
 ]
 
