@@ -42,7 +42,7 @@ rustls-pemfile = "2.0"
 socket2 = { version = "=0.6", features = ["all"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.159"
+libc = "0.2.178"
 
 [build-dependencies]
 pyo3-build-config = "=0.26"
