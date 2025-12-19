@@ -1,6 +1,7 @@
 import threading
 
 import pytest
+from conftest import _namegetter
 
 
 def run_loop(loop):
@@ -63,6 +64,10 @@ def test_call_at(loop):
     t0 = loop.time()
     loop.run_forever()
     dt = loop.time() - t0
+
+    if _namegetter(loop).startswith('uvloop'):
+        # uvloop may be a bit loose on delaying
+        delay *= 0.9
 
     assert dt >= delay
 

@@ -2,6 +2,7 @@ import asyncio
 import socket
 
 import pytest
+from conftest import _namegetter
 
 
 class DatagramProto(asyncio.DatagramProtocol):
@@ -49,6 +50,9 @@ def test_create_datagram_endpoint_sock(loop):
 
 @pytest.mark.skipif(not hasattr(socket, 'AF_UNIX'), reason='no UDS')
 def test_create_datagram_endpoint_sock_unix(loop):
+    if _namegetter(loop).startswith('uvloop'):
+        pytest.skip('See uvloop issue #403')
+
     fut = loop.create_datagram_endpoint(lambda: DatagramProto(create_future=True, loop=loop), family=socket.AF_UNIX)
     transport, protocol = loop.run_until_complete(fut)
     # Check that the socket family is AF_UNIX using get_extra_info
