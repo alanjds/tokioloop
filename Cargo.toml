@@ -2,15 +2,15 @@
 name = "rloop"
 version = "0.2.0"
 description = "An asyncio event loop implemented in Rust"
-authors = ["Giovanni Barillari <g@baro.dev>"]
+authors = ["Alan Justino <alan.justino@yahoo.com.br>"]
 license = "BSD-3-Clause"
 edition = "2024"
 
 keywords = ["asyncio"]
 
 readme = "README.md"
-homepage = "https://github.com/gi0baro/rloop"
-repository = "https://github.com/gi0baro/rloop"
+homepage = "https://github.com/alanjds/tokioloop"
+repository = "https://github.com/alanjds/tokioloop"
 
 include = [
     "/Cargo.toml",
