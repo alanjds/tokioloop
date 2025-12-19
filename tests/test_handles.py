@@ -1,7 +1,7 @@
 import threading
 
-from conftest import _namegetter
 import pytest
+from conftest import _namegetter
 
 
 def run_loop(loop):
