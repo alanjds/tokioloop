@@ -1,7 +1,7 @@
 [project]
 name = 'rloop'
 authors = [
-    { name = 'Giovanni Barillari', email = 'g@baro.dev' }
+    { name = 'Alan Justino', email = 'alan.justino@yahoo.com.br' }
 ]
 classifiers = [
     'Development Status :: 3 - Alpha',
@@ -54,9 +54,9 @@ all = [
 ]
 
 [project.urls]
-Homepage = 'https://github.com/gi0baro/rloop'
-Funding = 'https://github.com/sponsors/gi0baro'
-Source = 'https://github.com/gi0baro/rloop'
+Homepage = 'https://github.com/alanjds/tokioloop'
+Funding = 'https://github.com/sponsors/alanjds'
+Source = 'https://github.com/alanjds/tokioloop'
 
 [build-system]
 requires = ['maturin>=1.8.0,<2']
