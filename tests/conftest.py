@@ -10,6 +10,7 @@ EVENT_LOOPS = [
     asyncio.new_event_loop,
     uvloop.new_event_loop,
     rloop.new_event_loop,
+    rloop.new_tokio_event_loop,
 ]
 
 
