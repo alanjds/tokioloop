@@ -40,6 +40,10 @@ rcgen = "=0.13"
 rustls = { version = "0.23", features = ["std"] }
 rustls-pemfile = "2.0"
 socket2 = { version = "=0.6", features = ["all"] }
+# Tokio dependencies for TokioLoop
+tokio = { version = "1.0", features = ["full"] }
+tokio-rustls = "0.24"
+tokio-util = { version = "0.7", features = ["codec"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.178"
