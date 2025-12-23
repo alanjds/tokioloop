@@ -318,8 +318,8 @@ impl TEventLoop {
             exception_handler: Arc::clone(&self.exception_handler),
         };
 
-        // Take the receiver from the struct
-        let scheduler_rx_mutex = self.scheduler_rx;
+        // Extract the receiver BEFORE the async block
+        let mut scheduler_rx = self.scheduler_rx.lock().unwrap().take().unwrap();
 
         // Keep the same sender - all scheduling uses the same channel
         // This ensures the receiver in _run() is connected to all tasks
@@ -329,7 +329,6 @@ impl TEventLoop {
 
         // Main tokio task using proper async pattern
         let task_handle = runtime.spawn(async move {
-            let mut scheduler_rx = scheduler_rx_mutex.lock().unwrap().as_mut().unwrap();
 
             let mut immediate_tasks: VecDeque<Box<dyn THandle>> = VecDeque::new();
             let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
