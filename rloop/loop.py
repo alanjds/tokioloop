@@ -19,7 +19,7 @@ from itertools import chain as _iterchain
 from typing import Union
 
 from ._compat import _PY_311, _PYV
-from ._rloop import CBHandle, EventLoop as __BaseLoop, TimerHandle, TokioEventLoop as __TokioBaseLoop
+from ._rloop import CBHandle, EventLoop as __BaseLoop, TEventLoop as __TokioBaseLoop, TimerHandle
 from .exc import _exception_handler
 from .futures import _SyncSockReaderFuture, _SyncSockWriterFuture
 from .server import Server
