@@ -341,17 +341,19 @@ impl TEventLoop {
                     task = scheduler_rx.recv() => {
                         match task {
                             Some(ScheduledTask::Immediate { handle }) => {
+                                log::trace!("Received: Immediate task");
                                 current_handles.push_back(handle);
                             }
                             Some(ScheduledTask::Delayed { timer }) => {
+                                log::trace!("Received: Delayed task");
                                 delayed_tasks.push(timer);
                             }
                             Some(ScheduledTask::Shutdown) => {
-                                log::debug!("Received shutdown signal");
+                                log::debug!("Received: Shutdown signal");
                                 break;
                             }
                             None => {
-                                log::debug!("Scheduler channel closed");
+                                log::debug!("Received: None. Scheduler channel closed");
                                 break;
                             }
                         }
