@@ -26,7 +26,7 @@ pub struct TokioTCPTransport {
 impl TokioTCPTransport {
     pub fn from_py(
         py: Python,
-        event_loop: &Py<crate::tokio_event_loop::TokioEventLoop>,
+        event_loop: &Py<crate::tokio_event_loop::TEventLoop>,
         sock: (i32, i32),
         protocol_factory: Py<PyAny>,
     ) -> Self {
@@ -148,7 +148,7 @@ impl TokioTCPTransport {
 pub struct TokioTCPServer {
     // TODO: Replace with tokio::net::TcpListener and optional tokio_rustls::TlsAcceptor
     servers: Vec<Arc<TokioTcpListener>>,
-    event_loop: Option<Py<crate::tokio_event_loop::TokioEventLoop>>,
+    event_loop: Option<Py<crate::tokio_event_loop::TEventLoop>>,
     #[pyo3(get)]
     socks: Py<PyAny>,
     #[pyo3(get)]

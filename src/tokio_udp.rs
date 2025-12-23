@@ -20,7 +20,7 @@ pub struct TokioUDPTransport {
 impl TokioUDPTransport {
     pub fn from_py(
         py: Python,
-        event_loop: &Py<crate::tokio_event_loop::TokioEventLoop>,
+        event_loop: &Py<crate::tokio_event_loop::TEventLoop>,
         sock: (i32, i32),
         protocol_factory: Py<PyAny>,
         remote_addr: Option<(String, u16)>,

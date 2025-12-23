@@ -6,17 +6,18 @@ use std::{
 
 use anyhow::Result;
 use pyo3::prelude::*;
+use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
 
 use crate::{
-    tokio_handles::{TokioCBHandle, TokioHandle, TokioTimerHandle, TokioBoxedHandle, THandle},
+    tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle},
     py::copy_context,
     log::{LogExc, log_exc_to_py_ctx},
 };
 
 // Timer with absolute timestamp (like RLoop)
 pub struct TokioTimer {
-    pub handle: TokioBoxedHandle,
+    pub handle: TBoxedHandle,
     when: u128,  // Absolute microseconds since epoch
 }
 
@@ -50,7 +51,7 @@ impl Ord for TokioTimer {
 }
 
 enum ScheduledTask {
-    Immediate { handle: TokioBoxedHandle },
+    Immediate { handle: TBoxedHandle },
     Delayed { timer: TokioTimer },
     Shutdown,
 }
@@ -65,36 +66,64 @@ impl std::fmt::Debug for ScheduledTask {
     }
 }
 
-pub struct TokioEventLoopRunState {
-    // Minimal state for Phase 1
+pub struct TEventLoopRunState {
+    // buf: Box<[u8]>,
+    // events: event::Events,
+    // pub read_buf: Box<[u8]>,
+    // tick_last: u128,
 }
 
-impl TokioEventLoopRunState {
-    fn new() -> Self {
-        Self {}
+
+#[derive(Clone)]
+pub struct LoopHandlers {
+    exc_handler: Arc<RwLock<Py<PyAny>>>,
+    exception_handler: Arc<RwLock<Py<PyAny>>>,
+}
+
+impl LoopHandlers {
+    pub fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<Py<PyAny>> {
+        let handler = self.exc_handler.read().unwrap();
+        handler.call1(
+            py,
+            (
+                log_exc_to_py_ctx(py, ctx),
+                self.exception_handler.read().unwrap().clone_ref(py),
+            ),
+        )
     }
 }
 
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
-pub struct TokioEventLoop {
+pub struct TEventLoop {
     runtime: Arc<Runtime>,
     scheduler_tx: mpsc::UnboundedSender<ScheduledTask>,
     scheduler_rx: Mutex<Option<mpsc::UnboundedReceiver<ScheduledTask>>>,
-    handles_ready: Mutex<VecDeque<TokioBoxedHandle>>,
+    handles_ready: Mutex<VecDeque<TBoxedHandle>>,
     counter_ready: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
     stopping: atomic::AtomicBool,
     epoch: Instant,
-    exc_handler: RwLock<Py<PyAny>>,
-    exception_handler: RwLock<Py<PyAny>>,
+    exc_handler: Arc<RwLock<Py<PyAny>>>,
+    exception_handler: Arc<RwLock<Py<PyAny>>>,
     #[pyo3(get)]
     _base_ctx: Py<PyAny>,
 }
 
-impl TokioEventLoop {
+impl TEventLoop {
+    pub(crate) fn log_exception(&self, py: Python, ctx: LogExc) -> PyResult<Py<PyAny>> {
+        let handler = self.exc_handler.read().unwrap();
+        handler.call1(
+            py,
+            (
+                log_exc_to_py_ctx(py, ctx),
+                self.exception_handler.read().unwrap().clone_ref(py),
+            ),
+        )
+    }
+
     pub fn schedule0(&self, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
         let handle = Python::attach(|py| {
-            Py::new(py, TokioCBHandle::new0(
+            Py::new(py, TCBHandle::new0(
                 callback,
                 context.unwrap_or_else(|| self._base_ctx.clone_ref(py)),
             ))
@@ -106,7 +135,7 @@ impl TokioEventLoop {
 
     pub fn schedule1(&self, callback: Py<PyAny>, arg: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
         let handle = Python::attach(|py| {
-            Py::new(py, TokioCBHandle::new1(
+            Py::new(py, TCBHandle::new1(
                 callback,
                 arg,
                 context.unwrap_or_else(|| self._base_ctx.clone_ref(py)),
@@ -119,7 +148,7 @@ impl TokioEventLoop {
 
     pub fn schedule(&self, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
         let handle = Python::attach(|py| {
-            Py::new(py, TokioCBHandle::new(
+            Py::new(py, TCBHandle::new(
                 callback,
                 args,
                 context.unwrap_or_else(|| self._base_ctx.clone_ref(py)),
@@ -132,7 +161,7 @@ impl TokioEventLoop {
 
     pub fn schedule_later0(&self, delay: Duration, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
         let handle = Python::attach(|py| {
-            Py::new(py, TokioCBHandle::new0(
+            Py::new(py, TCBHandle::new0(
                 callback,
                 context.unwrap_or_else(|| self._base_ctx.clone_ref(py)),
             ))
@@ -150,7 +179,7 @@ impl TokioEventLoop {
         context: Option<Py<PyAny>>,
     ) -> Result<()> {
         let handle = Python::attach(|py| {
-            Py::new(py, TokioCBHandle::new1(
+            Py::new(py, TCBHandle::new1(
                 callback,
                 arg,
                 context.unwrap_or_else(|| self._base_ctx.clone_ref(py)),
@@ -169,7 +198,7 @@ impl TokioEventLoop {
         context: Option<Py<PyAny>>,
     ) -> Result<()> {
         let handle = Python::attach(|py| {
-            Py::new(py, TokioCBHandle::new(
+            Py::new(py, TCBHandle::new(
                 callback,
                 args,
                 context.unwrap_or_else(|| self._base_ctx.clone_ref(py)),
@@ -210,7 +239,7 @@ impl TokioEventLoop {
 }
 
 #[pymethods]
-impl TokioEventLoop {
+impl TEventLoop {
     #[new]
     fn new(py: Python) -> PyResult<Self> {
         let runtime = Runtime::new()
@@ -227,8 +256,8 @@ impl TokioEventLoop {
             closed: atomic::AtomicBool::new(false),
             stopping: atomic::AtomicBool::new(false),
             epoch: Instant::now(),
-            exc_handler: RwLock::new(py.None()),
-            exception_handler: RwLock::new(py.None()),
+            exc_handler: Arc::new(RwLock::new(py.None())),
+            exception_handler: Arc::new(RwLock::new(py.None())),
             _base_ctx: copy_context(py),
         })
     }
@@ -365,6 +394,7 @@ impl TokioEventLoop {
                     _ = tokio::time::sleep(Duration::from_millis(1)), if delayed_tasks.is_empty() => {}
                 }
 
+                let mut state = TEventLoopRunState{};
                 // Process immediate tasks
                 while let Some(handle) = current_handles.pop_front() {
                     if !handle.cancelled() {
@@ -407,8 +437,8 @@ impl TokioEventLoop {
     }
 
     #[pyo3(signature = (callback, *args, context=None))]
-    fn call_soon(&self, py: Python, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> PyResult<Py<TokioCBHandle>> {
-        let handle = TokioCBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
+    fn call_soon(&self, py: Python, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> PyResult<Py<TCBHandle>> {
+        let handle = TCBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
         let handle_py = Py::new(py, handle)?;
 
         self.schedule_handle(handle_py.clone_ref(py), None)?;
@@ -422,8 +452,8 @@ impl TokioEventLoop {
         callback: Py<PyAny>,
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
-    ) -> PyResult<Py<TokioCBHandle>> {
-        let handle = TokioCBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
+    ) -> PyResult<Py<TCBHandle>> {
+        let handle = TCBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
         let handle_py = Py::new(py, handle)?;
 
         self.schedule_handle(handle_py.clone_ref(py), None)?;
@@ -437,9 +467,9 @@ impl TokioEventLoop {
         callback: Py<PyAny>,
         args: Py<PyAny>,
         context: Py<PyAny>,
-    ) -> crate::handles::TimerHandle {
+    ) -> TTimerHandle {
         let when = Instant::now().duration_since(self.epoch).as_micros() + u128::from(delay);
-        let handle = TokioCBHandle::new(callback, args, context);
+        let handle = TCBHandle::new(callback, args, context);
         let handle_py = Py::new(py, handle).unwrap();
 
         let timer = TokioTimer {
@@ -450,7 +480,7 @@ impl TokioEventLoop {
         let task = ScheduledTask::Delayed { timer };
         let _ = self.scheduler_tx.send(task);
 
-        crate::handles::TimerHandle::new(handle_py, when)
+        TTimerHandle::new(handle_py, when)
     }
 
     #[pyo3(signature = (fd, callback, *args, context=None))]
@@ -461,13 +491,13 @@ impl TokioEventLoop {
         callback: Py<PyAny>,
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
-    ) -> PyResult<Py<TokioCBHandle>> {
+    ) -> PyResult<Py<TCBHandle>> {
         // TODO: Implement tokio-based add_reader
         // This will use tokio::net::TcpListener/UnixListener for async I/O
         log::debug!("TokioEventLoop::add_reader called - not yet implemented");
 
         // For now, create a dummy handle
-        let handle = TokioCBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py)));
+        let handle = TCBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py)));
         Py::new(py, handle)
     }
 
@@ -485,12 +515,12 @@ impl TokioEventLoop {
         callback: Py<PyAny>,
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
-    ) -> PyResult<Py<TokioCBHandle>> {
+    ) -> PyResult<Py<TCBHandle>> {
         // TODO: Implement tokio-based add_writer
         log::debug!("TokioEventLoop::add_writer called - not yet implemented");
 
         // For now, create a dummy handle
-        let handle = TokioCBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py)));
+        let handle = TCBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py)));
         Py::new(py, handle)
     }
 
@@ -604,6 +634,6 @@ impl TokioEventLoop {
 }
 
 pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
-    module.add_class::<TokioEventLoop>()?;
+    module.add_class::<TEventLoop>()?;
     Ok(())
 }
