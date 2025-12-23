@@ -1341,42 +1341,25 @@ class TokioLoop(__TokioBaseLoop, __asyncio.AbstractEventLoop):
     def create_future(self) -> _Future:
         return _Future(loop=self)
 
-    if _PYV >= _PY_311:
+    if _PYV < _PY_311:
+        raise RuntimeError('Minimum version is Python 3.11')
 
-        def create_task(self, coro, *, name=None, context=None) -> _Task:
-            self._check_closed()
-            if self._task_factory is None:
-                task = _Task(coro, loop=self, name=name, context=context)
-                if task._source_traceback:
-                    del task._source_traceback[-1]
+    def create_task(self, coro, *, name=None, context=None) -> _Task:
+        self._check_closed()
+        if self._task_factory is None:
+            task = _Task(coro, loop=self, name=name, context=context)
+            if task._source_traceback:
+                del task._source_traceback[-1]
+        else:
+            if context is None:
+                # Use legacy API if context is not needed
+                task = self._task_factory(self, coro)
             else:
-                if context is None:
-                    # Use legacy API if context is not needed
-                    task = self._task_factory(self, coro)
-                else:
-                    task = self._task_factory(self, coro, context=context)
+                task = self._task_factory(self, coro, context=context)
 
-                task.set_name(name)
+            task.set_name(name)
 
-            return task
-    else:
-
-        def create_task(self, coro, *, name=None, context=None) -> _Task:
-            self._check_closed()
-            if self._task_factory is None:
-                task = _Task(coro, loop=self, name=name)
-                if task._source_traceback:
-                    del task._source_traceback[-1]
-            else:
-                if context is None:
-                    # Use legacy API if context is not needed
-                    task = self._task_factory(self, coro)
-                else:
-                    task = self._task_factory(self, coro, context=context)
-
-                task.set_name(name)
-
-            return task
+        return task
 
     #: threads methods
     def run_in_executor(self, executor, fn, *args):
