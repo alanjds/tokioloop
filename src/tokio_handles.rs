@@ -22,14 +22,14 @@ use crate::{
 use crate::py::run_in_ctx1;
 
 
-pub trait THandle {
+pub trait THandle: Send + Sync {
     fn run(&self, py: Python, handlers: &LoopHandlers, state: &mut TEventLoopRunState);
     fn cancelled(&self) -> bool {
         false
     }
 }
 
-pub(crate) type TBoxedHandle = Box<dyn THandle + Send>;
+pub(crate) type TBoxedHandle = Box<dyn THandle + Send + Sync>;
 
 
 
