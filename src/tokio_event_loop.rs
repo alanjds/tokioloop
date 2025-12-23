@@ -312,6 +312,12 @@ impl TEventLoop {
     fn _run(&self, py: Python) -> PyResult<()> {
         let runtime = self.runtime.clone();
 
+        // Create LoopHandlers for use in the async task
+        let loop_handlers = LoopHandlers {
+            exc_handler: Arc::clone(&self.exc_handler),
+            exception_handler: Arc::clone(&self.exception_handler),
+        };
+
         // Take the receiver from the struct
         let scheduler_rx_mutex = self.scheduler_rx;
 
@@ -398,13 +404,16 @@ impl TEventLoop {
                 // Process immediate tasks
                 while let Some(handle) = current_handles.pop_front() {
                     if !handle.cancelled() {
+                        // Clone handlers for this handle execution
+                        let handlers = loop_handlers.clone();
+
                         // Execute Python callback in GIL
                         Python::attach(|py| {
                             // if let Err(e) = std::panic::catch_unwind(|| {
                             //     log::debug!("Executing handle in tokio context");
                             //
                             //     // Execute the handle with proper context
-                                   let _ = handle.run(py, self, &self._base_ctx);
+                                   let _ = handle.run(py, &handlers, &mut state);
                             //     log::debug!("Handle execution completed");
                             // }) {
                             //   log::error!("Panic during handle execution: {:?}", e);
