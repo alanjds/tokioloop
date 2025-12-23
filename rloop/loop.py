@@ -19,8 +19,7 @@ from itertools import chain as _iterchain
 from typing import Union
 
 from ._compat import _PY_311, _PYV
-from ._rloop import CBHandle, EventLoop as __BaseLoop, TokioEventLoop as __TokioBaseLoop, TimerHandle
-
+from ._rloop import CBHandle, EventLoop as __BaseLoop, TimerHandle, TokioEventLoop as __TokioBaseLoop
 from .exc import _exception_handler
 from .futures import _SyncSockReaderFuture, _SyncSockWriterFuture
 from .server import Server
@@ -1126,6 +1125,18 @@ class TokioLoop(__TokioBaseLoop, __asyncio.AbstractEventLoop):
         self._watcher_child = _PidfdChildWatcher(self) if _can_use_pidfd() else _ThreadedChildWatcher(self)
         # Initialize thread ID for is_running() method
         self._thread_id = 0
+        # Initialize missing attributes that RLoop has
+        self._task_factory = None
+        self._default_executor = None
+        self._executor_shutdown_called = False
+        self._asyncgens = set()
+        self._asyncgens_shutdown_called = False
+        self._exception_handler = None
+        # Signal handling attributes
+        self._ssock_r = None
+        self._ssock_w = None
+        self._sig_listening = False
+        self._sig_wfd = None
 
     #: running methods
     def run_forever(self):
@@ -1313,6 +1324,16 @@ class TokioLoop(__TokioBaseLoop, __asyncio.AbstractEventLoop):
         if delay <= 0:
             return self.call_soon(callback, *args, context=context or _copy_context())
         return self._call_later(delay, callback, args, context or _copy_context())
+
+    def call_soon(self, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
+        # TODO: Implement tokio-based call_soon
+        # For now, delegate to the Rust implementation
+        return super().call_soon(callback, args, context or _copy_context())
+
+    def call_soon_threadsafe(self, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
+        # TODO: Implement tokio-based call_soon_threadsafe
+        # For now, delegate to the Rust implementation
+        return super().call_soon_threadsafe(callback, args, context or _copy_context())
 
     def time(self) -> float:
         return self._clock / 1_000_000
