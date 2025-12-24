@@ -113,12 +113,14 @@ impl THandle for Py<TCBHandle> {
     tcbhandle_cancelled_impl!();
 
     fn run(&self, py: Python, handlers: &LoopHandlers, _state: &mut TEventLoopRunState) {
+        log::trace!("TCBHandle.run: starting");
         let rself = self.get();
         let ctx = rself.context.as_ptr();
         let cb = rself.callback.as_ptr();
         let args = rself.args.as_ptr();
 
         if let Err(err) = run_in_ctx!(py, ctx, cb, args) {
+            log::trace!("TCBHandle.run: failed");
             let err_ctx = LogExc::cb_handle(
                 err,
                 format!("Exception in callback {:?}", rself.callback.bind(py)),
@@ -126,6 +128,7 @@ impl THandle for Py<TCBHandle> {
             );
             _ = handlers.log_exception(py, err_ctx);
         }
+        log::trace!("TCBHandle.run: finished");
     }
 }
 
@@ -133,11 +136,13 @@ impl THandle for Py<TCBHandleNoArgs> {
     tcbhandle_cancelled_impl!();
 
     fn run(&self, py: Python, handlers: &LoopHandlers, _state: &mut TEventLoopRunState) {
+        log::trace!("TCBHandleNoArgs.run: starting");
         let rself = self.get();
         let ctx = rself.context.as_ptr();
         let cb = rself.callback.as_ptr();
 
         if let Err(err) = run_in_ctx0!(py, ctx, cb) {
+            log::trace!("TCBHandleNoArgs.run: failed");
             let err_ctx = LogExc::cb_handle(
                 err,
                 format!("Exception in callback {:?}", rself.callback.bind(py)),
@@ -145,18 +150,21 @@ impl THandle for Py<TCBHandleNoArgs> {
             );
             _ = handlers.log_exception(py, err_ctx);
         }
+        log::trace!("TCBHandleNoArgs.run: finished");
     }
 }
 
 impl THandle for Py<TCBHandleOneArg> {
     #[cfg(not(PyPy))]
     fn run(&self, py: Python, handlers: &LoopHandlers, _state: &mut TEventLoopRunState) {
+        log::trace!("TCBHandleOneArg.run: starting");
         let rself = self.get();
         let ctx = rself.context.as_ptr();
         let cb = rself.callback.as_ptr();
         let arg = rself.arg.as_ptr();
 
         if let Err(err) = run_in_ctx1!(py, ctx, cb, arg) {
+            log::trace!("TCBHandleOneArg.run: failed");
             let err_ctx = LogExc::cb_handle(
                 err,
                 format!("Exception in callback {:?}", rself.callback.bind(py)),
@@ -164,16 +172,19 @@ impl THandle for Py<TCBHandleOneArg> {
             );
             _ = handlers.log_exception(py, err_ctx);
         }
+        log::trace!("TCBHandleOneArg.run: finished");
     }
 
     #[cfg(PyPy)]
     fn run(&self, py: Python, handlers: &LoopHandlers, _state: &mut TEventLoopRunState) {
+        log::trace!("TCBHandleOneArg.run: starting");
         let rself = self.get();
         let ctx = rself.context.as_ptr();
         let cb = rself.callback.as_ptr();
         let args = (rself.arg.clone_ref(py),).into_py_any(py).unwrap().into_ptr();
 
         if let Err(err) = run_in_ctx!(py, ctx, cb, args) {
+            log::trace!("TCBHandleOneArg.run: failed");
             let err_ctx = LogExc::cb_handle(
                 err,
                 format!("Exception in callback {:?}", rself.callback.bind(py)),
@@ -181,6 +192,7 @@ impl THandle for Py<TCBHandleOneArg> {
             );
             _ = handlers.log_exception(py, err_ctx);
         }
+        log::trace!("TCBHandleOneArg.run: finished");
     }
 }
 

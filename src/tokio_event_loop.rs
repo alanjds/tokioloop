@@ -329,8 +329,6 @@ impl TEventLoop {
 
         // Main tokio task using proper async pattern
         let task_handle = runtime.spawn(async move {
-
-            let mut immediate_tasks: VecDeque<Box<dyn THandle>> = VecDeque::new();
             let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
             let mut current_handles = VecDeque::new();
 
@@ -387,9 +385,11 @@ impl TEventLoop {
                             .as_micros() as u128;
                         while let Some(timer) = delayed_tasks.peek() {
                             if timer.when <= current_time {
+                                log::trace!("Delayed task: selected to run");
                                 let timer = delayed_tasks.pop().unwrap();
                                 if !timer.handle.cancelled() {
                                     current_handles.push_back(timer.handle);
+                                    log::trace!("Delayed task: pushed to run");
                                 }
                             } else {
                                 break;
@@ -404,18 +404,20 @@ impl TEventLoop {
                 let mut state = TEventLoopRunState{};
                 // Process immediate tasks
                 while let Some(handle) = current_handles.pop_front() {
+                    log::trace!("Task selected to run");
                     if !handle.cancelled() {
                         // Clone handlers for this handle execution
                         let handlers = loop_handlers.clone();
 
                         // Execute Python callback in GIL
+                        log::trace!("PyO3: attaching Python to run the task");
                         Python::attach(|py| {
                             // if let Err(e) = std::panic::catch_unwind(|| {
-                            //     log::debug!("Executing handle in tokio context");
+                                log::debug!("Executing handle in tokio context");
                             //
                             //     // Execute the handle with proper context
                                    let _ = handle.run(py, &handlers, &mut state);
-                            //     log::debug!("Handle execution completed");
+                                log::debug!("Handle execution completed");
                             // }) {
                             //   log::error!("Panic during handle execution: {:?}", e);
                             // }
@@ -448,7 +450,16 @@ impl TEventLoop {
 
     #[pyo3(signature = (callback, *args, context=None))]
     fn call_soon(&self, py: Python, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> PyResult<Py<TCBHandle>> {
-        let handle = TCBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
+        // The *args in PyO3 signature should already be a tuple, but let's ensure it's properly handled
+        // The issue is that args might not be a tuple when passed directly from Python
+        let args_tuple = if args.bind(py).is_instance_of::<pyo3::types::PyTuple>() {
+            args
+        } else {
+            // If it's not already a tuple, convert it to one
+            pyo3::types::PyTuple::new(py, &[args])?.into_py(py)
+        };
+
+        let handle = TCBHandle::new(callback, args_tuple, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
         let handle_py = Py::new(py, handle)?;
 
         self.schedule_handle(handle_py.clone_ref(py), None)?;
@@ -463,7 +474,14 @@ impl TEventLoop {
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
     ) -> PyResult<Py<TCBHandle>> {
-        let handle = TCBHandle::new(callback, args, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
+        // Apply the same fix for threadsafe version
+        let args_tuple = if args.bind(py).is_instance_of::<pyo3::types::PyTuple>() {
+            args
+        } else {
+            pyo3::types::PyTuple::new(py, &[args])?.into_py(py)
+        };
+
+        let handle = TCBHandle::new(callback, args_tuple, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
         let handle_py = Py::new(py, handle)?;
 
         self.schedule_handle(handle_py.clone_ref(py), None)?;
