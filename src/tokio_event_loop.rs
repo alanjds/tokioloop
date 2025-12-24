@@ -327,124 +327,128 @@ impl TEventLoop {
         let stopping = Arc::new(atomic::AtomicBool::new(false));
         let stopping_clone = stopping.clone();
 
-        // Main tokio task using proper async pattern
-        let task_handle = runtime.spawn(async move {
-            let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
-            let mut current_handles = VecDeque::new();
+        // Release GIL to allow tokio tasks to acquire it
+        py.detach(move || {
+            // Main tokio task using proper async pattern
+            let task_handle = runtime.spawn(async move {
+                let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
+                let mut current_handles = VecDeque::new();
 
-            loop {
-                // Use tokio::select! to handle multiple async sources concurrently
-                tokio::select! {
-                    // Handle incoming scheduled tasks
-                    task = scheduler_rx.recv() => {
-                        match task {
-                            Some(ScheduledTask::Immediate { handle }) => {
-                                log::trace!("Received: Immediate task");
-                                current_handles.push_back(handle);
-                            }
-                            Some(ScheduledTask::Delayed { timer }) => {
-                                log::trace!("Received: Delayed task");
-                                delayed_tasks.push(timer);
-                            }
-                            Some(ScheduledTask::Shutdown) => {
-                                log::debug!("Received: Shutdown signal");
-                                break;
-                            }
-                            None => {
-                                log::debug!("Received: None. Scheduler channel closed");
-                                break;
+                loop {
+                    py.check_signals()?;
+                    // Use tokio::select! to handle multiple async sources concurrently
+                    tokio::select! {
+                        // Handle incoming scheduled tasks
+                        task = scheduler_rx.recv() => {
+                            match task {
+                                Some(ScheduledTask::Immediate { handle }) => {
+                                    log::trace!("Received: Immediate task");
+                                    current_handles.push_back(handle);
+                                }
+                                Some(ScheduledTask::Delayed { timer }) => {
+                                    log::trace!("Received: Delayed task");
+                                    delayed_tasks.push(timer);
+                                }
+                                Some(ScheduledTask::Shutdown) => {
+                                    log::debug!("Received: Shutdown signal");
+                                    break;
+                                }
+                                None => {
+                                    log::debug!("Received: None. Scheduler channel closed");
+                                    break;
+                                }
                             }
                         }
-                    }
 
-                    // Handle timer expiration
-                    _ = async {
-                        if let Some(next_timer) = delayed_tasks.peek() {
-                            let next_time = next_timer.when;
-                            let current = std::time::SystemTime::now()
+                        // Handle timer expiration
+                        _ = async {
+                            if let Some(next_timer) = delayed_tasks.peek() {
+                                let next_time = next_timer.when;
+                                let current = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_micros() as u128;
+                                if next_time > current {
+                                    let micros_to_wait = next_time - current;
+                                    let sleep_duration = if micros_to_wait > 1000u128 { 1000u64 } else { micros_to_wait as u64 };
+                                    tokio::time::sleep(Duration::from_micros(sleep_duration)).await;
+                                } else {
+                                    tokio::time::sleep(Duration::from_micros(100)).await;
+                                }
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                        },
+
+                        if !delayed_tasks.is_empty() => {
+                            // Timer sleep completed, check for expired timers
+                            let current_time = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_micros() as u128;
-                            if next_time > current {
-                                let micros_to_wait = next_time - current;
-                                let sleep_duration = if micros_to_wait > 1000u128 { 1000u64 } else { micros_to_wait as u64 };
-                                tokio::time::sleep(Duration::from_micros(sleep_duration)).await;
-                            } else {
-                                tokio::time::sleep(Duration::from_micros(100)).await;
-                            }
-                        } else {
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                    },
-
-                    if !delayed_tasks.is_empty() => {
-                        // Timer sleep completed, check for expired timers
-                        let current_time = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_micros() as u128;
-                        while let Some(timer) = delayed_tasks.peek() {
-                            if timer.when <= current_time {
-                                log::trace!("Delayed task: selected to run");
-                                let timer = delayed_tasks.pop().unwrap();
-                                if !timer.handle.cancelled() {
-                                    current_handles.push_back(timer.handle);
-                                    log::trace!("Delayed task: pushed to run");
+                            while let Some(timer) = delayed_tasks.peek() {
+                                if timer.when <= current_time {
+                                    log::trace!("Delayed task: selected to run");
+                                    let timer = delayed_tasks.pop().unwrap();
+                                    if !timer.handle.cancelled() {
+                                        current_handles.push_back(timer.handle);
+                                        log::trace!("Delayed task: pushed to run");
+                                    }
+                                } else {
+                                    break;
                                 }
-                            } else {
-                                break;
                             }
                         }
+
+                        // Default case when no timers
+                        _ = tokio::time::sleep(Duration::from_millis(1)), if delayed_tasks.is_empty() => {}
                     }
 
-                    // Default case when no timers
-                    _ = tokio::time::sleep(Duration::from_millis(1)), if delayed_tasks.is_empty() => {}
-                }
+                    let mut state = TEventLoopRunState{};
+                    // Process immediate tasks
+                    while let Some(handle) = current_handles.pop_front() {
+                        log::trace!("Task selected to run");
+                        if !handle.cancelled() {
+                            // Clone handlers for this handle execution
+                            let handlers = loop_handlers.clone();
 
-                let mut state = TEventLoopRunState{};
-                // Process immediate tasks
-                while let Some(handle) = current_handles.pop_front() {
-                    log::trace!("Task selected to run");
-                    if !handle.cancelled() {
-                        // Clone handlers for this handle execution
-                        let handlers = loop_handlers.clone();
+                            // Execute Python callback in GIL
+                            log::trace!("PyO3: attaching Python to run the task");
+                            Python::attach(|py| {
+                                // if let Err(e) = std::panic::catch_unwind(|| {
+                                    log::debug!("Executing handle in tokio context");
+                                //
+                                //     // Execute the handle with proper context
+                                    let _ = handle.run(py, &handlers, &mut state);
+                                    log::debug!("Handle execution completed");
+                                // }) {
+                                //   log::error!("Panic during handle execution: {:?}", e);
+                                // }
+                            });
+                        }
+                    };
 
-                        // Execute Python callback in GIL
-                        log::trace!("PyO3: attaching Python to run the task");
-                        Python::attach(|py| {
-                            // if let Err(e) = std::panic::catch_unwind(|| {
-                                log::debug!("Executing handle in tokio context");
-                            //
-                            //     // Execute the handle with proper context
-                                   let _ = handle.run(py, &handlers, &mut state);
-                                log::debug!("Handle execution completed");
-                            // }) {
-                            //   log::error!("Panic during handle execution: {:?}", e);
-                            // }
-                        });
+                    // Check stop condition
+                    if stopping_clone.load(atomic::Ordering::Acquire) {
+                        break;
                     }
                 };
+            });
 
-                // Check stop condition
-                if stopping_clone.load(atomic::Ordering::Acquire) {
-                    break;
+            // Block until completion
+            match runtime.block_on(task_handle) {
+                Ok(_) => {
+                    log::debug!("Tokio event loop completed successfully");
+                }
+                Err(e) => {
+                    log::error!("Tokio event loop task failed: {:?}", e);
+                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        format!("Tokio event loop failed: {:?}", e)
+                    ));
                 }
             };
+            Ok(())
         });
-
-        // Block until completion
-        match runtime.block_on(task_handle) {
-            Ok(_) => {
-                log::debug!("Tokio event loop completed successfully");
-            }
-            Err(e) => {
-                log::error!("Tokio event loop task failed: {:?}", e);
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("Tokio event loop failed: {:?}", e)
-                ));
-            }
-        }
-
         Ok(())
     }
 
@@ -456,7 +460,7 @@ impl TEventLoop {
             args
         } else {
             // If it's not already a tuple, convert it to one
-            pyo3::types::PyTuple::new(py, &[args])?.into_py(py)
+            pyo3::types::PyTuple::new(py, &[args])?.into()
         };
 
         let handle = TCBHandle::new(callback, args_tuple, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
@@ -478,7 +482,7 @@ impl TEventLoop {
         let args_tuple = if args.bind(py).is_instance_of::<pyo3::types::PyTuple>() {
             args
         } else {
-            pyo3::types::PyTuple::new(py, &[args])?.into_py(py)
+            pyo3::types::PyTuple::new(py, &[args])?.into()
         };
 
         let handle = TCBHandle::new(callback, args_tuple, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));

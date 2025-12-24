@@ -35,7 +35,7 @@ env_logger = "0.11"
 log = "0.4"
 mio = { version = "=1.0", features = ["net", "os-ext", "os-poll"] }
 papaya = "=0.2"
-pyo3 = { version = "=0.26", features = ["anyhow", "extension-module", "generate-import-lib"] }
+pyo3 = { version = "=0.27", features = ["anyhow", "extension-module", "generate-import-lib"] }
 rcgen = "=0.13"
 rustls = { version = "0.23", features = ["std"] }
 rustls-pemfile = "2.0"
@@ -49,7 +49,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 libc = "0.2.178"
 
 [build-dependencies]
-pyo3-build-config = "=0.26"
+pyo3-build-config = "=0.27"
 
 [profile.release]
 codegen-units = 1
