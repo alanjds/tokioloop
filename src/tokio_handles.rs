@@ -23,7 +23,7 @@ use crate::py::run_in_ctx1;
 
 
 pub trait THandle: Send + Sync {
-    fn run(&self, py: Python, handlers: &LoopHandlers, state: &mut TEventLoopRunState);
+    fn run(&self, py: Python, handlers: &LoopHandlers, state: &TEventLoopRunState);
     fn cancelled(&self) -> bool {
         false
     }
@@ -112,7 +112,7 @@ tcbhandle_cancel_impl!(TCBHandleOneArg);
 impl THandle for Py<TCBHandle> {
     tcbhandle_cancelled_impl!();
 
-    fn run(&self, py: Python, handlers: &LoopHandlers, _state: &mut TEventLoopRunState) {
+    fn run(&self, py: Python, handlers: &LoopHandlers, _state: &TEventLoopRunState) {
         log::trace!("TCBHandle.run: starting");
         let rself = self.get();
         let ctx = rself.context.as_ptr();
@@ -135,7 +135,7 @@ impl THandle for Py<TCBHandle> {
 impl THandle for Py<TCBHandleNoArgs> {
     tcbhandle_cancelled_impl!();
 
-    fn run(&self, py: Python, handlers: &LoopHandlers, _state: &mut TEventLoopRunState) {
+    fn run(&self, py: Python, handlers: &LoopHandlers, _state: &TEventLoopRunState) {
         log::trace!("TCBHandleNoArgs.run: starting");
         let rself = self.get();
         let ctx = rself.context.as_ptr();
@@ -156,7 +156,7 @@ impl THandle for Py<TCBHandleNoArgs> {
 
 impl THandle for Py<TCBHandleOneArg> {
     #[cfg(not(PyPy))]
-    fn run(&self, py: Python, handlers: &LoopHandlers, _state: &mut TEventLoopRunState) {
+    fn run(&self, py: Python, handlers: &LoopHandlers, _state: &TEventLoopRunState) {
         log::trace!("TCBHandleOneArg.run: starting");
         let rself = self.get();
         let ctx = rself.context.as_ptr();
@@ -176,7 +176,7 @@ impl THandle for Py<TCBHandleOneArg> {
     }
 
     #[cfg(PyPy)]
-    fn run(&self, py: Python, handlers: &LoopHandlers, _state: &mut TEventLoopRunState) {
+    fn run(&self, py: Python, handlers: &LoopHandlers, _state: &TEventLoopRunState) {
         log::trace!("TCBHandleOneArg.run: starting");
         let rself = self.get();
         let ctx = rself.context.as_ptr();

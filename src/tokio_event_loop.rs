@@ -328,7 +328,7 @@ impl TEventLoop {
         let stopping_clone = stopping.clone();
 
         // Release GIL to allow tokio tasks to acquire it
-        py.allow_threads(|| {
+        py.detach(|| {
             // Main tokio task using proper async pattern
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
@@ -422,7 +422,7 @@ impl TEventLoop {
                                     log::debug!("Executing handle in tokio context");
                                 //
                                 //     // Execute the handle with proper context
-                                    let _ = handle.run(py, &handlers, &mut state);
+                                    let _ = handle.run(py, &handlers, &state);
                                     log::debug!("Handle execution completed");
                                 // }) {
                                 //   log::error!("Panic during handle execution: {:?}", e);
