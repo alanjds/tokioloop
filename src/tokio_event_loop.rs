@@ -328,14 +328,17 @@ impl TEventLoop {
         let stopping_clone = stopping.clone();
 
         // Release GIL to allow tokio tasks to acquire it
-        py.detach(move || {
+        py.allow_threads(|| {
             // Main tokio task using proper async pattern
-            let task_handle = runtime.spawn(async move {
+            let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
                 let mut current_handles = VecDeque::new();
 
                 loop {
-                    py.check_signals()?;
+                    Python::attach(|py| {
+                        // TODO: handle Err of check_signals()
+                        py.check_signals();
+                    });
                     // Use tokio::select! to handle multiple async sources concurrently
                     tokio::select! {
                         // Handle incoming scheduled tasks
@@ -433,23 +436,28 @@ impl TEventLoop {
                         break;
                     }
                 };
+
+                Ok(())
             });
 
             // Block until completion
             match runtime.block_on(task_handle) {
-                Ok(_) => {
+                Ok(Ok(())) => {
                     log::debug!("Tokio event loop completed successfully");
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    log::error!("Tokio event loop task failed with PyErr: {:?}", e);
+                    return Err(e);
                 }
                 Err(e) => {
-                    log::error!("Tokio event loop task failed: {:?}", e);
+                    log::error!("Tokio event loop task failed with JoinError: {:?}", e);
                     return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                         format!("Tokio event loop failed: {:?}", e)
                     ));
                 }
             };
-            Ok(())
-        });
-        Ok(())
+        })
     }
 
     #[pyo3(signature = (callback, *args, context=None))]
