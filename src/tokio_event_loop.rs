@@ -553,7 +553,33 @@ impl TEventLoop {
         context: Py<PyAny>,
     ) -> TTimerHandle {
         let when = Instant::now().duration_since(self.epoch).as_micros() + u128::from(delay);
-        let handle = TCBHandle::new(callback, args, context);
+
+        /* Apply the same fix as call_soon for argument handling */
+        let args_tuple = if args.bind(py).is_instance_of::<pyo3::types::PyTuple>() {
+            args
+        } else {
+            pyo3::types::PyTuple::new(py, &[args])?.into()
+        };
+
+        let args_len = args_tuple.bind(py).len()?;
+        log::debug!("_call_later: callback={:?}, args_len={}", callback.bind(py), args_len);
+
+        /* Handle each case separately to avoid type inference issues */
+        let handle = if args_len == 0 {
+            /* No arguments - use TCBHandleNoArgs */
+            log::debug!("_call_later: Creating TCBHandleNoArgs");
+            TCBHandle::new0(callback, context)
+        } else if args_len == 1 {
+            /* One argument - use TCBHandleOneArg */
+            log::debug!("_call_later: Creating TCBHandleOneArg");
+            let arg = args_tuple.bind(py).get_item(0)?;
+            TCBHandle::new1(callback, arg.unbind(), context)
+        } else {
+            /* Multiple arguments - use TCBHandle */
+            log::debug!("_call_later: Creating TCBHandle (multiple args)");
+            TCBHandle::new(callback, args_tuple, context)
+        };
+
         let handle_py = Py::new(py, handle).unwrap();
 
         let timer = TokioTimer {
