@@ -14,6 +14,7 @@ use crate::{
     py::copy_context,
     log::{LogExc, log_exc_to_py_ctx},
 };
+use pyo3::IntoPyObjectExt;
 
 // Timer with absolute timestamp (like RLoop)
 pub struct TokioTimer {
@@ -461,9 +462,8 @@ impl TEventLoop {
     }
 
     #[pyo3(signature = (callback, *args, context=None))]
-    fn call_soon(&self, py: Python, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> PyResult<Py<TCBHandle>> {
-        // The *args in PyO3 signature should already be a tuple, but let's ensure it's properly handled
-        // The issue is that args might not be a tuple when passed directly from Python
+    fn call_soon(&self, py: Python, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        // Determine the number of arguments and create the appropriate handle type
         let args_tuple = if args.bind(py).is_instance_of::<pyo3::types::PyTuple>() {
             args
         } else {
@@ -471,11 +471,33 @@ impl TEventLoop {
             pyo3::types::PyTuple::new(py, &[args])?.into()
         };
 
-        let handle = TCBHandle::new(callback, args_tuple, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
-        let handle_py = Py::new(py, handle)?;
+        let context = context.unwrap_or_else(|| self._base_ctx.clone_ref(py));
+        let args_len = args_tuple.bind(py).len()?;
 
-        self.schedule_handle(handle_py.clone_ref(py), None)?;
-        Ok(handle_py)
+        // Handle each case separately to avoid type inference issues
+        if args_len == 0 {
+            // No arguments - use TCBHandleNoArgs
+            let handle = TCBHandle::new0(callback, context);
+            let handle_obj = Py::new(py, handle)?;
+            let handle_any = handle_obj.clone_ref(py).into_py_any(py)?;
+            self.schedule_handle(handle_obj, None)?;
+            Ok(handle_any)
+        } else if args_len == 1 {
+            // One argument - use TCBHandleOneArg
+            let arg = args_tuple.bind(py).get_item(0)?;
+            let handle = TCBHandle::new1(callback, arg.unbind(), context);
+            let handle_obj = Py::new(py, handle)?;
+            let handle_any = handle_obj.clone_ref(py).into_py_any(py)?;
+            self.schedule_handle(handle_obj, None)?;
+            Ok(handle_any)
+        } else {
+            // Multiple arguments - use TCBHandle
+            let handle = TCBHandle::new(callback, args_tuple, context);
+            let handle_obj = Py::new(py, handle)?;
+            let handle_any = handle_obj.clone_ref(py).into_py_any(py)?;
+            self.schedule_handle(handle_obj, None)?;
+            Ok(handle_any)
+        }
     }
 
     #[pyo3(signature = (callback, *args, context=None))]
@@ -485,7 +507,7 @@ impl TEventLoop {
         callback: Py<PyAny>,
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
-    ) -> PyResult<Py<TCBHandle>> {
+    ) -> PyResult<Py<PyAny>> {
         // Apply the same fix for threadsafe version
         let args_tuple = if args.bind(py).is_instance_of::<pyo3::types::PyTuple>() {
             args
@@ -493,11 +515,33 @@ impl TEventLoop {
             pyo3::types::PyTuple::new(py, &[args])?.into()
         };
 
-        let handle = TCBHandle::new(callback, args_tuple, context.unwrap_or_else(|| self._base_ctx.clone_ref(py)));
-        let handle_py = Py::new(py, handle)?;
+        let context = context.unwrap_or_else(|| self._base_ctx.clone_ref(py));
+        let args_len = args_tuple.bind(py).len()?;
 
-        self.schedule_handle(handle_py.clone_ref(py), None)?;
-        Ok(handle_py)
+        // Handle each case separately to avoid type inference issues
+        if args_len == 0 {
+            // No arguments - use TCBHandleNoArgs
+            let handle = TCBHandle::new0(callback, context);
+            let handle_obj = Py::new(py, handle)?;
+            let handle_any = handle_obj.clone_ref(py).into_py_any(py)?;
+            self.schedule_handle(handle_obj, None)?;
+            Ok(handle_any)
+        } else if args_len == 1 {
+            // One argument - use TCBHandleOneArg
+            let arg = args_tuple.bind(py).get_item(0)?;
+            let handle = TCBHandle::new1(callback, arg.unbind(), context);
+            let handle_obj = Py::new(py, handle)?;
+            let handle_any = handle_obj.clone_ref(py).into_py_any(py)?;
+            self.schedule_handle(handle_obj, None)?;
+            Ok(handle_any)
+        } else {
+            // Multiple arguments - use TCBHandle
+            let handle = TCBHandle::new(callback, args_tuple, context);
+            let handle_obj = Py::new(py, handle)?;
+            let handle_any = handle_obj.clone_ref(py).into_py_any(py)?;
+            self.schedule_handle(handle_obj, None)?;
+            Ok(handle_any)
+        }
     }
 
     fn _call_later(
