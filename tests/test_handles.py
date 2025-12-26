@@ -1,11 +1,16 @@
 import threading
+from logging import getLogger
 
 import pytest
 from conftest import _namegetter
 
 
+logger = getLogger(__name__)
+
+
 def run_loop(loop):
     async def run():
+        logger.debug('Calling loop.stop()')
         loop.stop()
 
     loop.run_until_complete(run())
