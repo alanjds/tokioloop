@@ -115,11 +115,13 @@ impl THandle for Py<TCBHandle> {
     fn run(&self, py: Python, handlers: &LoopHandlers, _state: &TEventLoopRunState) {
         log::trace!("TCBHandle.run: starting");
         let rself = self.get();
-        let ctx = rself.context.as_ptr();
         let cb = rself.callback.as_ptr();
         let args = rself.args.as_ptr();
 
-        if let Err(err) = run_in_ctx!(py, ctx, cb, args) {
+        if let Err(err) = unsafe {
+            let ptr = pyo3::ffi::PyObject_CallObject(cb, args);
+            Bound::from_owned_ptr_or_err(py, ptr)
+        } {
             log::trace!("TCBHandle.run: failed");
             let err_ctx = LogExc::cb_handle(
                 err,

@@ -1330,12 +1330,12 @@ class TokioLoop(__TokioBaseLoop, __asyncio.AbstractEventLoop):
     def call_soon(self, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
         # TODO: Implement tokio-based call_soon
         # For now, delegate to the Rust implementation
-        return super().call_soon(callback, args, context or _copy_context())
+        return super().call_soon(callback, *args)
 
     def call_soon_threadsafe(self, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
         # TODO: Implement tokio-based call_soon_threadsafe
         # For now, delegate to the Rust implementation
-        return super().call_soon_threadsafe(callback, args, context or _copy_context())
+        return super().call_soon_threadsafe(callback, *args)
 
     def time(self) -> float:
         return self._clock / 1_000_000
