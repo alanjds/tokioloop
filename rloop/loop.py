@@ -1214,6 +1214,8 @@ class TokioLoop(__TokioBaseLoop, __asyncio.AbstractEventLoop):
 
     def stop(self):
         self._stopping = True
+        super()._stop()
+        logger.debug('Stopping is set')
 
     def _check_running(self):
         if self.is_running():

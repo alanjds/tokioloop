@@ -593,6 +593,11 @@ impl TEventLoop {
         TTimerHandle::new(handle_py, when)
     }
 
+    fn _stop(&self) -> PyResult<()> {
+        let _ = self.scheduler_tx.send(ScheduledTask::Shutdown);
+        Ok(())
+    }
+
     #[pyo3(signature = (fd, callback, *args, context=None))]
     fn add_reader(
         &self,
