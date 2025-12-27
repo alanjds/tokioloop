@@ -327,6 +327,7 @@ impl TEventLoop {
 
         let stopping = Arc::new(atomic::AtomicBool::new(false));
         let stopping_clone = stopping.clone();
+        let epoch = self.epoch;
 
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
@@ -368,10 +369,7 @@ impl TEventLoop {
                         _ = async {
                             if let Some(next_timer) = delayed_tasks.peek() {
                                 let next_time = next_timer.when;
-                                let current = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_micros() as u128;
+                                let current = Instant::now().duration_since(epoch).as_micros();
                                 if next_time > current {
                                     let micros_to_wait = next_time - current;
                                     let sleep_duration = if micros_to_wait > 1000u128 { 1000u64 } else { micros_to_wait as u64 };
@@ -386,10 +384,7 @@ impl TEventLoop {
 
                         if !delayed_tasks.is_empty() => {
                             // Timer sleep completed, check for expired timers
-                            let current_time = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_micros() as u128;
+                            let current_time = Instant::now().duration_since(epoch).as_micros();
                             while let Some(timer) = delayed_tasks.peek() {
                                 if timer.when <= current_time {
                                     log::trace!("Delayed task: selected to run");

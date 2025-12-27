@@ -31,8 +31,6 @@ pub trait THandle: Send + Sync {
 
 pub(crate) type TBoxedHandle = Box<dyn THandle + Send + Sync>;
 
-
-
 #[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct TCBHandle {
     callback: Py<PyAny>,
@@ -225,7 +223,6 @@ impl TTimerHandle {
         self.handle.cancelled()
     }
 }
-
 
 pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
     // module.add_class::<THandle>()?;
