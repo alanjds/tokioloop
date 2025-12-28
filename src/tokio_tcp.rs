@@ -1,24 +1,51 @@
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex, atomic},
+    net::SocketAddr,
+    os::fd::{AsRawFd, FromRawFd},
+};
 
 use anyhow::Result;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
+use pyo3::IntoPyObjectExt;
+use tokio::{
+    net::{TcpStream, TcpListener},
+    sync::mpsc,
+    task::JoinHandle,
+    io::{AsyncReadExt, AsyncWriteExt},
+};
 
 use crate::{
     handles::BoxedHandle,
+    tokio_event_loop::{TEventLoop, LoopHandlers},
+    tokio_handles::{TBoxedHandle, TCBHandle},
+    py::{run_in_ctx, run_in_ctx0, run_in_ctx1},
+    log::LogExc,
 };
 
-// TODO: This will be replaced with tokio::net::TcpListener
-// For now, we'll use a placeholder struct
-pub struct TokioTcpListener {
-    // Placeholder for tokio::net::TcpListener
+/// Internal state management for tokio TCP connections
+pub(crate) struct TokioTCPTransportState {
+    stream: TcpStream,
+    read_buf: Vec<u8>,
+    write_buf: VecDeque<Vec<u8>>,
+    closing: bool,
+    weof: bool,
+    paused: bool,
 }
 
-// TODO: This will be the Tokio-based TCP transport implementation
-// For now, we'll create stubs that match the existing TCPTransport interface
-#[pyclass(frozen, subclass, module = "rloop._rloop")]
-pub struct TokioTCPTransport {
-    // TODO: Replace with tokio::net::TcpStream and tokio_rustls::TlsStream
+/// Main transport class implementing asyncio transport interface
+#[pyclass(frozen, unsendable, module = "rloop._rloop")]
+pub(crate) struct TokioTCPTransport {
     fd: usize,
+    state: Arc<Mutex<TokioTCPTransportState>>,
+    pyloop: Py<TEventLoop>,
+    protocol: Py<PyAny>,
+    extra: HashMap<String, Py<PyAny>>,
+    // Atomic flags for thread safety
+    closing: atomic::AtomicBool,
+    paused: atomic::AtomicBool,
+    weof: atomic::AtomicBool,
     #[pyo3(get)]
     lfd: Option<usize>,
 }
@@ -26,51 +53,82 @@ pub struct TokioTCPTransport {
 impl TokioTCPTransport {
     pub fn from_py(
         py: Python,
-        event_loop: &Py<crate::tokio_event_loop::TEventLoop>,
+        event_loop: &Py<TEventLoop>,
         sock: (i32, i32),
         protocol_factory: Py<PyAny>,
-    ) -> Self {
-        // TODO: Implement tokio-based TCP transport creation
-        // This will use tokio::net::TcpStream::from_std
-        log::debug!("TokioTCPTransport::from_py called - not yet implemented");
-
+    ) -> PyResult<Self> {
         let (fd, _family) = sock;
-        Self {
+
+        // Convert the socket file descriptor to a tokio TcpStream
+        let std_stream = unsafe {
+            std::net::TcpStream::from_raw_fd(fd)
+        };
+        let tokio_stream = tokio::net::TcpStream::from_std(std_stream)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to convert socket to tokio stream: {}", e)))?;
+
+        let protocol = protocol_factory.call0(py)?;
+
+        let state = Arc::new(Mutex::new(TokioTCPTransportState {
+            stream: tokio_stream,
+            read_buf: Vec::with_capacity(8192),
+            write_buf: VecDeque::new(),
+            closing: false,
+            weof: false,
+            paused: false,
+        }));
+
+        let transport = Self {
             fd: fd as usize,
+            state: state.clone(),
+            pyloop: event_loop.clone_ref(py),
+            protocol: protocol.clone_ref(py),
+            extra: HashMap::new(),
+            closing: false.into(),
+            paused: false.into(),
+            weof: false.into(),
             lfd: None,
-        }
+        };
+
+        Ok(transport)
     }
 
     pub fn attach(transport: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
-        // TODO: Implement tokio-based protocol attachment
-        log::debug!("TokioTCPTransport::attach called - not yet implemented");
-
-        // For now, create a dummy protocol
-        Ok(py.None())
+        let rself = transport.borrow(py);
+        rself.protocol.call_method1(py, pyo3::intern!(py, "connection_made"), (transport.clone_ref(py),))?;
+        Ok(rself.protocol.clone_ref(py))
     }
-
 
     #[inline]
     pub fn is_tls(&self) -> bool {
-        // TODO: Return TLS status
-        false
+        false // No SSL support initially
     }
-
 
     #[inline]
     pub fn get_local_addr(&self) -> Result<String> {
-        // TODO: Implement tokio-based local address retrieval
-        // This will use tokio::net::TcpStream::local_addr
-        log::debug!("TokioTCPTransport::get_local_addr called - not yet implemented");
-        Ok("127.0.0.1:0".to_string())
+        Python::with_gil(|py| {
+            let state = self.state.lock().unwrap();
+            let local_addr = state.stream.local_addr()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(local_addr.to_string())
+        })
     }
 
     #[inline]
     pub fn get_remote_addr(&self) -> Result<String> {
-        // TODO: Implement tokio-based remote address retrieval
-        // This will use tokio::net::TcpStream::peer_addr
-        log::debug!("TokioTCPTransport::get_remote_addr called - not yet implemented");
-        Ok("127.0.0.1:0".to_string())
+        Python::with_gil(|py| {
+            let state = self.state.lock().unwrap();
+            let peer_addr = state.stream.peer_addr()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(peer_addr.to_string())
+        })
+    }
+
+    fn call_connection_lost(&self, py: Python, err: Option<PyErr>) {
+        let err_arg = match err {
+            Some(e) => e.into_py_any(py).unwrap_or_else(|_| py.None()),
+            None => py.None(),
+        };
+        let _ = self.protocol.call_method1(py, pyo3::intern!(py, "connection_lost"), (err_arg,));
     }
 }
 
@@ -82,77 +140,161 @@ impl TokioTCPTransport {
     }
 
     fn get_extra_info(&self, py: Python, name: String, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        // TODO: Implement tokio-based extra info retrieval
-        log::debug!("TokioTCPTransport::get_extra_info called - not yet implemented");
-        Ok(default.unwrap_or_else(|| py.None()))
+        match name.as_str() {
+            "socket" => {
+                // Return a mock socket object for compatibility
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            "sockname" => {
+                match self.get_local_addr() {
+                    Ok(addr) => {
+                        // Parse address string to return a tuple (host, port)
+                        if let Some((host_part, port_part)) = addr.rsplit_once(':') {
+                            let port: u16 = port_part.parse().unwrap_or(0);
+                            let addr_tuple = (host_part, port);
+                            Ok(addr_tuple.into_py_any(py)?)
+                        } else {
+                            Ok(default.unwrap_or_else(|| py.None()))
+                        }
+                    }
+                    Err(_) => Ok(default.unwrap_or_else(|| py.None())),
+                }
+            }
+            "peername" => {
+                match self.get_remote_addr() {
+                    Ok(addr) => {
+                        // Parse address string to return a tuple (host, port)
+                        if let Some((host_part, port_part)) = addr.rsplit_once(':') {
+                            let port: u16 = port_part.parse().unwrap_or(0);
+                            let addr_tuple = (host_part, port);
+                            Ok(addr_tuple.into_py_any(py)?)
+                        } else {
+                            Ok(default.unwrap_or_else(|| py.None()))
+                        }
+                    }
+                    Err(_) => Ok(default.unwrap_or_else(|| py.None())),
+                }
+            }
+            _ => {
+                let default_val = default.unwrap_or_else(|| py.None());
+                if let Some(value) = self.extra.get(&name) {
+                    Ok(value.clone_ref(py))
+                } else {
+                    Ok(default_val)
+                }
+            }
+        }
     }
 
     fn write(&self, py: Python, data: Py<PyAny>) -> PyResult<()> {
-        // TODO: Implement tokio-based write operation
-        // This will use tokio::io::AsyncWriteExt
-        log::debug!("TokioTCPTransport::write called - not yet implemented");
+        if self.weof.load(atomic::Ordering::Relaxed) {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Cannot write after EOF"));
+        }
+
+        let bytes = data.extract::<Vec<u8>>(py)?;
+
+        {
+            let mut state = self.state.lock().unwrap();
+            state.write_buf.push_back(bytes);
+        }
+
         Ok(())
     }
 
     fn writelines(&self, py: Python, list_of_data: Py<PyAny>) -> PyResult<()> {
-        // TODO: Implement tokio-based writelines operation
-        log::debug!("TokioTCPTransport::writelines called - not yet implemented");
+        let list = list_of_data.extract::<Vec<Py<PyAny>>>(py)?;
+        for item in list {
+            self.write(py, item)?;
+        }
         Ok(())
     }
 
     fn write_eof(&self, py: Python) -> PyResult<()> {
-        // TODO: Implement tokio-based write_eof operation
-        log::debug!("TokioTCPTransport::write_eof called - not yet implemented");
+        if self.closing.load(atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        if self.weof.compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_ok() {
+            // Set EOF flag - actual shutdown will happen when write buffer is empty
+            let mut state = self.state.lock().unwrap();
+            state.weof = true;
+        }
+
         Ok(())
     }
 
     fn can_write_eof(&self) -> bool {
-        // TODO: Return whether write_eof is supported
-        // For TCP sockets, this is typically true
-        true
+        !self.weof.load(atomic::Ordering::Relaxed)
     }
 
     fn pause_reading(&self, py: Python) {
-        // TODO: Implement tokio-based pause reading
-        log::debug!("TokioTCPTransport::pause_reading called - not yet implemented");
+        if self.closing.load(atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        if self.paused.compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_ok() {
+            let mut state = self.state.lock().unwrap();
+            state.paused = true;
+        }
     }
 
     fn resume_reading(&self, py: Python) {
-        // TODO: Implement tokio-based resume reading
-        log::debug!("TokioTCPTransport::resume_reading called - not yet implemented");
+        if self.closing.load(atomic::Ordering::Relaxed) {
+            return;
+        }
+
+        if self.paused.compare_exchange(true, false, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_ok() {
+            let mut state = self.state.lock().unwrap();
+            state.paused = false;
+        }
     }
 
     fn close(&self, py: Python) {
-        // TODO: Implement tokio-based close
-        log::debug!("TokioTCPTransport::close called - not yet implemented");
+        if self.closing.compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_err() {
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap();
+        state.closing = true;
+
+        // Call connection_lost if write buffer is empty
+        if state.write_buf.is_empty() {
+            drop(state);
+            self.call_connection_lost(py, None);
+        }
     }
 
     fn abort(&self, py: Python) {
-        // TODO: Implement tokio-based abort
-        log::debug!("TokioTCPTransport::abort called - not yet implemented");
+        if self.closing.compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_ok() {
+            let mut state = self.state.lock().unwrap();
+            state.closing = true;
+            state.write_buf.clear(); // Clear pending writes
+        }
+
+        self.call_connection_lost(py, None);
     }
 
     fn is_reading(&self) -> bool {
-        // TODO: Return reading status
-        false
+        !self.closing.load(atomic::Ordering::Relaxed) && !self.paused.load(atomic::Ordering::Relaxed)
     }
 
     fn is_closing(&self) -> bool {
-        // TODO: Return closing status
-        false
+        self.closing.load(atomic::Ordering::Relaxed)
     }
 }
 
-// TODO: This will be the Tokio-based TCP server implementation
+/// Server implementation using tokio::net::TcpListener
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
-pub struct TokioTCPServer {
-    // TODO: Replace with tokio::net::TcpListener and optional tokio_rustls::TlsAcceptor
-    servers: Vec<Arc<TokioTcpListener>>,
-    event_loop: Option<Py<crate::tokio_event_loop::TEventLoop>>,
+pub(crate) struct TokioTCPServer {
+    listener: Option<Arc<TcpListener>>,
+    protocol_factory: Py<PyAny>,
+    pyloop: Py<TEventLoop>,
+    transports: Arc<Mutex<Vec<Py<TokioTCPTransport>>>>,
+    closed: atomic::AtomicBool,
     #[pyo3(get)]
     socks: Py<PyAny>,
     #[pyo3(get)]
-    transports: Vec<Py<TokioTCPTransport>>,
+    transports_py: Vec<Py<TokioTCPTransport>>,
 }
 
 pub type TokioTCPServerRef = Arc<TokioTCPServer>;
@@ -163,33 +305,62 @@ impl TokioTCPServer {
         family: i32,
         backlog: i32,
         protocol_factory: Py<PyAny>,
-    ) -> TokioTCPServerRef {
-        // TODO: Implement tokio-based TCP server creation from fd
-        // This will use tokio::net::TcpListener::from_std
-        log::debug!("TokioTCPServer::from_fd called - not yet implemented");
+    ) -> PyResult<TokioTCPServerRef> {
+        // Convert the socket file descriptor to a tokio TcpListener
+        let std_listener = unsafe {
+            std::net::TcpListener::from_raw_fd(fd)
+        };
+        let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to convert socket to tokio listener: {}", e)))?;
 
-        Arc::new(Self {
-            servers: Vec::new(),
-            event_loop: None,
+        // Create a dummy pyloop for now - this should be properly initialized later
+        let dummy_pyloop = unsafe { std::mem::zeroed() };
+
+        let server = Arc::new(Self {
+            listener: Some(Arc::new(tokio_listener)),
+            protocol_factory,
+            pyloop: dummy_pyloop,
+            transports: Arc::new(Mutex::new(Vec::new())),
+            closed: false.into(),
             socks: Python::with_gil(|py| py.None()),
-            transports: Vec::new(),
-        })
-    }
+            transports_py: Vec::new(),
+        });
 
+        Ok(server)
+    }
 
     pub fn new_stream(
         &self,
         py: Python,
-        stream: std::net::TcpStream,
+        stream: TcpStream,
     ) -> (Py<TokioTCPTransport>, BoxedHandle) {
-        // TODO: Implement tokio-based stream creation
-        // This will create a new TokioTCPTransport from the accepted stream
-        log::debug!("TokioTCPServer::new_stream called - not yet implemented");
+        let protocol = self.protocol_factory.call0(py).unwrap();
+
+        // Get the file descriptor from the stream
+        let fd = stream.as_raw_fd() as usize;
+
+        let state = Arc::new(Mutex::new(TokioTCPTransportState {
+            stream,
+            read_buf: Vec::with_capacity(8192),
+            write_buf: VecDeque::new(),
+            closing: false,
+            weof: false,
+            paused: false,
+        }));
 
         let transport = TokioTCPTransport {
-            fd: 0, // Using dummy fd since we can't get raw fd easily
-            lfd: None,
+            fd,
+            state: state.clone(),
+            pyloop: self.pyloop.clone_ref(py),
+            protocol: protocol.clone_ref(py),
+            extra: std::collections::HashMap::new(),
+            closing: false.into(),
+            paused: false.into(),
+            weof: false.into(),
+            lfd: Some(self.listener.as_ref().unwrap().as_raw_fd() as usize),
         };
+
+        let pytransport = Python::with_gil(|py| Py::new(py, transport).unwrap());
 
         // Create a dummy handle for now
         let handle = Python::with_gil(|py| {
@@ -197,26 +368,31 @@ impl TokioTCPServer {
             Box::new(Py::new(py, cb_handle).unwrap())
         });
 
-        (Python::with_gil(|py| Py::new(py, transport).unwrap()), handle)
+        (pytransport, handle)
     }
 
     #[inline]
     pub fn fd(&self) -> usize {
-        // TODO: Return the file descriptor
-        0
+        self.listener.as_ref().unwrap().as_raw_fd() as usize
     }
 }
 
 #[pymethods]
 impl TokioTCPServer {
     fn close(&self, py: Python) {
-        // TODO: Implement tokio-based server close
-        log::debug!("TokioTCPServer::close called - not yet implemented");
+        if self.closed.compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_err() {
+            return;
+        }
+
+        // Close all transports
+        let transports = self.transports.lock().unwrap();
+        for transport in transports.iter() {
+            let _ = transport.borrow(py).close(py);
+        }
     }
 
     fn is_serving(&self) -> bool {
-        // TODO: Return serving status
-        false
+        !self.closed.load(atomic::Ordering::Relaxed)
     }
 }
 

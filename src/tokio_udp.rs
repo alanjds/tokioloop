@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::Result;
 use pyo3::prelude::*;
+use pyo3::IntoPyObjectExt;
 use tokio::net::UdpSocket as TokioUdpSocket;
 
 // TODO: This will be the Tokio-based UDP transport implementation
