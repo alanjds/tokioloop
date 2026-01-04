@@ -331,6 +331,9 @@ impl TEventLoop {
         let stopping_clone = stopping.clone();
         let epoch = self.epoch;
 
+        // Get a copy of the scheduler sender for signal handling
+        let scheduler_tx = self.scheduler_tx.clone();
+
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
             // Main tokio task using proper async pattern
@@ -339,11 +342,17 @@ impl TEventLoop {
                 let mut current_handles = VecDeque::new();
 
                 loop {
+                    // Check signals immediately at the start of each iteration
                     Python::attach(|py| {
-                        // TODO: handle Err of check_signals()
-                        py.check_signals();
+                        let _ = py.check_signals();
                     });
+
                     // Use tokio::select! to handle multiple async sources concurrently
+                    // Check signals before entering tokio::select!
+                    Python::attach(|py| {
+                        let _ = py.check_signals();
+                    });
+
                     tokio::select! {
                         // Handle incoming scheduled tasks
                         task = scheduler_rx.recv() => {
@@ -402,7 +411,9 @@ impl TEventLoop {
                         }
 
                         // Default case when no timers
-                        _ = tokio::time::sleep(Duration::from_millis(1)), if delayed_tasks.is_empty() => {}
+                        _ = async {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }, if delayed_tasks.is_empty() => {}
                     }
 
                     let mut state = TEventLoopRunState{};
