@@ -36,7 +36,7 @@ from .utils import _can_use_pidfd, _HAS_IPv6, _interleave_addrinfos, _ipaddr_inf
 logger = logging.getLogger(__name__)
 
 
-class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
+class _BaseRustLoop:
     def __init__(self):
         super().__init__()
         self._exc_handler = _exception_handler
@@ -1115,14 +1115,22 @@ class RLoop(__BaseLoop, __asyncio.AbstractEventLoop):
     def set_debug(self, enabled: bool):
         return
 
+class RLoop(_BaseRustLoop, __BaseLoop, __asyncio.AbstractEventLoop):
+    """Rust EventLoop based on `mio`"""
 
-class TokioLoop(__TokioBaseLoop, __asyncio.AbstractEventLoop):
+    pass
+
+
+class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
+    """Rust EventLoop based on `tokio`"""
+
     def __init__(self):
         super().__init__()
         self._exc_handler = _exception_handler
         # TODO: Initialize tokio-specific components
         # For now, we'll use the same child watcher as RLoop
-        self._watcher_child = _PidfdChildWatcher(self) if _can_use_pidfd() else _ThreadedChildWatcher(self)
+
+        ### Tokio-specific init:
         # Initialize thread ID for is_running() method
         self._thread_id = 0
         # Initialize missing attributes that RLoop has
@@ -1139,193 +1147,14 @@ class TokioLoop(__TokioBaseLoop, __asyncio.AbstractEventLoop):
         self._sig_wfd = None
 
     #: running methods
-    def run_forever(self):
-        try:
-            _old_agen_hooks = self._run_forever_pre()
-            self._run()
-        finally:
-            self._run_forever_post(_old_agen_hooks)
-
-    def _run_forever_pre(self):
-        self._check_closed()
-        self._check_running()
-        # self._set_coroutine_origin_tracking(self._debug)
-
-        _old_agen_hooks = sys.get_asyncgen_hooks()
-        sys.set_asyncgen_hooks(firstiter=self._asyncgen_firstiter_hook, finalizer=self._asyncgen_finalizer_hook)
-
-        self._thread_id = threading.get_ident()
-        # TODO: Implement tokio-specific signal and socket setup
-        # For now, we'll use the same setup as RLoop
-        self._ssock_start()
-        self._signals_resume()
-        _set_running_loop(self)
-
-        return _old_agen_hooks
-
-    def _run_forever_post(self, _old_agen_hooks):
-        _set_running_loop(None)
-        self._signals_pause()
-        self._ssock_stop()
-        self._thread_id = 0
-        self._stopping = False
-        # self._set_coroutine_origin_tracking(False)
-        # Restore any pre-existing async generator hooks.
-        if _old_agen_hooks is not None:
-            sys.set_asyncgen_hooks(*_old_agen_hooks)
-            self._old_agen_hooks = None
-
-    def run_until_complete(self, future):
-        self._check_closed()
-        self._check_running()
-
-        new_task = not _isfuture(future)
-        future = _ensure_future(future, loop=self)
-        if new_task:
-            # An exception is raised if the future didn't complete, so there
-            # is no need to log the "destroy pending task" message
-            future._log_destroy_pending = False
-
-        future.add_done_callback(self._run_until_complete_cb)
-        try:
-            self.run_forever()
-        except:
-            if new_task and future.done() and not future.cancelled():
-                # The coroutine raised a BaseException. Consume the exception
-                # to not log a warning, the caller doesn't have access to the
-                # local task.
-                future.exception()
-            raise
-        finally:
-            future.remove_done_callback(self._run_until_complete_cb)
-        if not future.done():
-            raise RuntimeError('Event loop stopped before Future completed.')
-
-        return future.result()
-
-    def _run_until_complete_cb(self, fut):
-        if not fut.cancelled():
-            exc = fut.exception()
-            if isinstance(exc, (SystemExit, KeyboardInterrupt)):
-                # Issue #336: run_forever() already finished,
-                # no need to stop it.
-                return
-        self.stop()
 
     def stop(self):
-        self._stopping = True
         super()._stop()
         logger.debug('Stopping is set')
-
-    def _check_running(self):
-        if self.is_running():
-            raise RuntimeError('This event loop is already running')
-        if _get_running_loop() is not None:
-            raise RuntimeError('Cannot run the event loop while another loop is running')
-
-    def is_running(self) -> bool:
-        return bool(self._thread_id)
 
     def _check_closed(self):
         if self._closed:
             raise RuntimeError('Event loop is closed')
-
-    def is_closed(self) -> bool:
-        return self._closed
-
-    def close(self):
-        if self.is_running():
-            raise RuntimeError('Cannot close a running event loop')
-        if self._closed:
-            return
-        # if self._debug:
-        #     logger.debug("Close %r", self)
-        self._closed = True
-
-        self._signals_clear()
-
-        self._executor_shutdown_called = True
-        executor = self._default_executor
-        if executor is not None:
-            self._default_executor = None
-            executor.shutdown(wait=False)
-
-    async def shutdown_asyncgens(self):
-        self._asyncgens_shutdown_called = True
-
-        if not len(self._asyncgens):
-            return
-
-        closing_agens = list(self._asyncgens)
-        self._asyncgens.clear()
-
-        results = await _gather(*[ag.aclose() for ag in closing_agens], return_exceptions=True)
-
-        for result, agen in zip(results, closing_agens):
-            if isinstance(result, Exception):
-                self.call_exception_handler(
-                    {
-                        'message': f'an error occurred during closing of asynchronous generator {agen!r}',
-                        'exception': result,
-                        'asyncgen': agen,
-                    }
-                )
-
-    def _asyncgen_finalizer_hook(self, agen):
-        self._asyncgens.discard(agen)
-        if not self.is_closed():
-            self.call_soon_threadsafe(self.create_task, agen.aclose())
-
-    def _asyncgen_firstiter_hook(self, agen):
-        if self._asyncgens_shutdown_called:
-            warnings.warn(  # noqa: B028
-                f'asynchronous generator {agen!r} was scheduled after loop.shutdown_asyncgens() call',
-                ResourceWarning,
-                source=self,
-            )
-
-        self._asyncgens.add(agen)
-
-    async def shutdown_default_executor(self, timeout=None):
-        self._executor_shutdown_called = True
-        if self._default_executor is None:
-            return
-
-        future = self.create_future()
-        thread = threading.Thread(target=self._executor_shutdown, args=(future,))
-        thread.start()
-        try:
-            await future
-        finally:
-            thread.join(timeout)
-
-        if thread.is_alive():
-            warnings.warn(
-                f'The executor did not finish joining its threads within {timeout} seconds.',
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            self._default_executor.shutdown(wait=False)
-
-    def _executor_shutdown(self, future):
-        try:
-            self._default_executor.shutdown(wait=True)
-            self.call_soon_threadsafe(future.set_result, None)
-        except Exception as ex:
-            self.call_soon_threadsafe(future.set_exception, ex)
-
-    #: callback scheduling methods
-    def call_later(self, delay, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
-        if delay <= 0:
-            return self.call_soon(callback, *args, context=context or _copy_context())
-        delay = round(delay * 1_000_000)
-        return self._call_later(delay, callback, args, context or _copy_context())
-
-    def call_at(self, when, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
-        delay = round((when - self.time()) * 1_000_000)
-        if delay <= 0:
-            return self.call_soon(callback, *args, context=context or _copy_context())
-        return self._call_later(delay, callback, args, context or _copy_context())
 
     def call_soon(self, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
         # TODO: Implement tokio-based call_soon
@@ -1337,175 +1166,9 @@ class TokioLoop(__TokioBaseLoop, __asyncio.AbstractEventLoop):
         # For now, delegate to the Rust implementation
         return super().call_soon_threadsafe(callback, *args)
 
-    def time(self) -> float:
-        return self._clock / 1_000_000
-
-    def create_future(self) -> _Future:
-        return _Future(loop=self)
-
     if _PYV < _PY_311:
         raise RuntimeError('Minimum version is Python 3.11')
-
-    def create_task(self, coro, *, name=None, context=None) -> _Task:
-        self._check_closed()
-        if self._task_factory is None:
-            task = _Task(coro, loop=self, name=name, context=context)
-            if task._source_traceback:
-                del task._source_traceback[-1]
-        else:
-            if context is None:
-                # Use legacy API if context is not needed
-                task = self._task_factory(self, coro)
-            else:
-                task = self._task_factory(self, coro, context=context)
-
-            task.set_name(name)
-
-        return task
-
-    #: threads methods
-    def run_in_executor(self, executor, fn, *args):
-        if _iscoroutine(fn) or _iscoroutinefunction(fn):
-            raise TypeError('Coroutines cannot be used with executors')
-
-        self._check_closed()
-
-        if executor is None:
-            executor = self._default_executor
-            if self._executor_shutdown_called:
-                raise RuntimeError('Executor shutdown has been called')
-
-            if executor is None:
-                executor = ThreadPoolExecutor()
-                self._default_executor = executor
-
-        return _wrap_future(executor.submit(fn, *args), loop=self)
-
-    def set_default_executor(self, executor):
-        self._default_executor = executor
 
     #: network I/O methods - TODO: Implement tokio-specific versions
     # For now, these will use the same implementations as RLoop
     # but they should eventually use tokio's async I/O primitives
-
-    #: task factory
-    def set_task_factory(self, factory):
-        self._task_factory = factory
-
-    def get_task_factory(self):
-        return self._task_factory
-
-    #: error handlers
-    def get_exception_handler(self):
-        return self._exception_handler
-
-    def set_exception_handler(self, handler):
-        self._exception_handler = handler
-
-    def call_exception_handler(self, context):
-        return self._exc_handler(context, self._exception_handler)
-
-    #: debug management
-    def get_debug(self) -> bool:
-        return False
-
-    # TODO
-    def set_debug(self, enabled: bool):
-        return
-
-    # TODO: Add tokio-specific socket and signal methods
-    # These will be implemented to use tokio's async primitives
-    def _ssock_start(self):
-        # TODO: Implement tokio-based self-socket setup
-        # For now, use the same implementation as RLoop
-        if self._ssock_w is not None:
-            raise RuntimeError('self-socket has been already setup')
-
-        self._ssock_r, self._ssock_w = socket.socketpair()
-        try:
-            self._ssock_r.setblocking(False)
-            self._ssock_w.setblocking(False)
-            self._ssock_set(self._ssock_r.fileno(), self._ssock_w.fileno())
-        except Exception:
-            self._ssock_del(self._ssock_r.fileno())
-            self._ssock_w = None
-            self._ssock_r = None
-            raise
-
-    def _ssock_stop(self):
-        # TODO: Implement tokio-based self-socket cleanup
-        # For now, use the same implementation as RLoop
-        if not self._ssock_w:
-            raise RuntimeError('self-socket has not been setup')
-
-        self._ssock_del(self._ssock_r.fileno())
-        self._ssock_w = None
-        self._ssock_r = None
-
-    def _signals_resume(self):
-        # TODO: Implement tokio-based signal handling
-        # For now, use the same implementation as RLoop
-        if not self.__is_main_thread():
-            return
-
-        if self._sig_listening:
-            raise RuntimeError('Signals handling has been already setup')
-
-        try:
-            fd = self._ssock_w.fileno()
-            self._sig_wfd = self.__set_sig_wfd(fd)
-        except Exception:
-            raise
-
-        self._sig_listening = True
-
-    def _signals_pause(self):
-        # TODO: Implement tokio-based signal handling
-        # For now, use the same implementation as RLoop
-        if not self.__is_main_thread():
-            if self._sig_listening:
-                raise RuntimeError('Cannot pause signals handling outside of the main thread')
-            return
-
-        if not self._sig_listening:
-            raise RuntimeError('Signals handling has not been setup')
-
-        self._sig_listening = False
-        self.__set_sig_wfd(self._sig_wfd)
-
-    def _signals_clear(self):
-        # TODO: Implement tokio-based signal handling
-        # For now, use the same implementation as RLoop
-        if not self.__is_main_thread():
-            return
-
-        if self._sig_listening:
-            raise RuntimeError('Cannot clear signals handling while listening')
-
-        if self._ssock_r:
-            raise RuntimeError('Signals handling was not cleaned up')
-
-        self._sig_clear()
-
-    def __is_main_thread(self):
-        return threading.main_thread().ident == threading.current_thread().ident
-
-    def __set_sig_wfd(self, fd):
-        if fd >= 0:
-            return signal.set_wakeup_fd(fd, warn_on_full_buffer=False)
-        return signal.set_wakeup_fd(fd)
-
-    def _asyncgen_finalizer_hook(self, agen):
-        self._asyncgens.discard(agen)
-        if not self.is_closed():
-            self.call_soon_threadsafe(self.create_task, agen.aclose())
-
-    def _asyncgen_firstiter_hook(self, agen):
-        if self._asyncgens_shutdown_called:
-            warnings.warn(  # noqa: B028
-                f'asynchronous generator {agen!r} was scheduled after loop.shutdown_asyncgens() call',
-                ResourceWarning,
-                source=self,
-            )
-
-        self._asyncgens.add(agen)
