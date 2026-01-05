@@ -1,13 +1,15 @@
 use std::{
     collections::{BinaryHeap, VecDeque},
     sync::{atomic, Arc, Mutex, RwLock},
+    os::fd::{FromRawFd, IntoRawFd},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use pyo3::prelude::*;
 use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
-use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle};
+use std::sync::atomic::AtomicBool;
+use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle, net::UnixStream};
 
 use crate::{
     tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle},
@@ -17,6 +19,7 @@ use crate::{
     tokio_tcp::TokioTCPServer,
 };
 use pyo3::IntoPyObjectExt;
+use socket2::Socket;
 
 // Timer with absolute timestamp (like RLoop)
 pub struct TokioTimer {
@@ -110,6 +113,11 @@ pub struct TEventLoop {
     exception_handler: Arc<RwLock<Py<PyAny>>>,
     #[pyo3(get)]
     _base_ctx: Py<PyAny>,
+    // Signal handling fields for Phase 3 implementation
+    signal_socket_rx: Arc<Mutex<Option<UnixStream>>>,
+    signal_socket_tx: Arc<Mutex<Option<UnixStream>>>,
+    sig_listening: Arc<AtomicBool>,
+    sig_handlers: Arc<papaya::HashMap<u8, Py<PyAny>>>,
 }
 
 impl TEventLoop {
@@ -262,6 +270,11 @@ impl TEventLoop {
             exc_handler: Arc::new(RwLock::new(py.None())),
             exception_handler: Arc::new(RwLock::new(py.None())),
             _base_ctx: copy_context(py),
+            // Initialize signal handling fields
+            signal_socket_rx: Arc::new(Mutex::new(None)),
+            signal_socket_tx: Arc::new(Mutex::new(None)),
+            sig_listening: Arc::new(atomic::AtomicBool::new(false)),
+            sig_handlers: Arc::new(papaya::HashMap::new()),
         })
     }
 
@@ -328,11 +341,15 @@ impl TEventLoop {
         // This ensures the receiver in _run() is connected to all tasks
 
         let stopping = Arc::new(atomic::AtomicBool::new(false));
-        let stopping_clone = stopping.clone();
+        let stopping_clone = Arc::clone(&stopping);
         let epoch = self.epoch;
 
         // Get a copy of the scheduler sender for signal handling
         let scheduler_tx = self.scheduler_tx.clone();
+
+        // Get signal socket references for use in async task
+        let signal_socket_rx = Arc::clone(&self.signal_socket_rx);
+        let sig_listening_clone = Arc::clone(&self.sig_listening);
 
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
@@ -409,6 +426,41 @@ impl TEventLoop {
                                 }
                             }
                         }
+
+                        // Signal socket reading - NEW BRANCH FOR PHASE 3
+                        _ = async {
+                            if let Some(mut socket) = signal_socket_rx.lock().unwrap().as_mut() {
+                                let mut buf = [0; 1024];
+                                match socket.try_read(&mut buf) {
+                                    Ok(n) if n > 0 => {
+                                        log::debug!("Received {} bytes from signal socket", n);
+                                        // Process signals received from Python
+                                        Python::attach(|py| {
+                                            match py.check_signals() {
+                                                Ok(()) => {
+                                                    log::debug!("Signals processed successfully");
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("Signal processing failed: {:?}", e);
+                                                    // Check if this is a critical signal that should stop the loop
+                                                    if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) ||
+                                                       e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
+                                                        log::info!("Critical signal received, stopping event loop");
+                                                        stopping.store(true, atomic::Ordering::Release);
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Ok(_) => {
+                                        // No data available, continue
+                                    }
+                                    Err(e) => {
+                                        log::trace!("Signal socket read error: {:?}", e);
+                                    }
+                                }
+                            }
+                        }, if sig_listening_clone.load(atomic::Ordering::Acquire) => {}
 
                         // Default case when no timers
                         _ = async {
@@ -659,16 +711,85 @@ impl TEventLoop {
     }
 
     fn _ssock_set(&self, fd_r: usize, fd_w: usize) -> PyResult<()> {
-        // TODO: Implement tokio-based socket setup
-        // For now, just log to call to make interface work
-        log::debug!("TokioEventLoop::_ssock_set called with fd_r: {}, fd_w: {} - not yet implemented", fd_r, fd_w);
+        log::debug!("TokioEventLoop::_ssock_set called with fd_r: {}, fd_w: {}", fd_r, fd_w);
+
+        // Convert raw file descriptors to tokio UnixStream
+        // We need to be careful here to avoid taking ownership of the FDs
+        // since Python might still be using them
+
+        let std_socket_r = unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(fd_r as i32)
+        };
+
+        let std_socket_w = unsafe {
+            std::os::unix::net::UnixStream::from_raw_fd(fd_w as i32)
+        };
+
+        // Convert to tokio UnixStream
+        let tokio_socket_r = match UnixStream::from_std(std_socket_r) {
+            Ok(socket) => socket,
+            Err(e) => {
+                log::error!("Failed to convert signal socket RX to tokio: {}", e);
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to convert signal socket RX to tokio: {}", e)
+                ));
+            }
+        };
+
+        let tokio_socket_w = match UnixStream::from_std(std_socket_w) {
+            Ok(socket) => socket,
+            Err(e) => {
+                log::error!("Failed to convert signal socket TX to tokio: {}", e);
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to convert signal socket TX to tokio: {}", e)
+                ));
+            }
+        };
+
+        // Store the sockets in the event loop
+        {
+            let mut rx_guard = self.signal_socket_rx.lock().unwrap();
+            *rx_guard = Some(tokio_socket_r);
+        }
+
+        {
+            let mut tx_guard = self.signal_socket_tx.lock().unwrap();
+            *tx_guard = Some(tokio_socket_w);
+        }
+
+        // Mark that we're listening for signals
+        self.sig_listening.store(true, atomic::Ordering::Release);
+
+        log::debug!("Signal socket setup completed successfully");
         Ok(())
     }
 
     fn _ssock_del(&self, fd_r: usize) -> PyResult<()> {
-        // TODO: Implement tokio-based socket cleanup
-        // For now, just log to call to make interface work
-        log::debug!("TokioEventLoop::_ssock_del called with fd_r: {} - not yet implemented", fd_r);
+        log::debug!("TokioEventLoop::_ssock_del called with fd_r: {}", fd_r);
+
+        // Remove and close signal sockets
+        {
+            let mut rx_guard = self.signal_socket_rx.lock().unwrap();
+            if let Some(socket) = rx_guard.take() {
+                // Drop the socket to close it
+                drop(socket);
+                log::debug!("Signal socket RX closed");
+            }
+        }
+
+        {
+            let mut tx_guard = self.signal_socket_tx.lock().unwrap();
+            if let Some(socket) = tx_guard.take() {
+                // Drop the socket to close it
+                drop(socket);
+                log::debug!("Signal socket TX closed");
+            }
+        }
+
+        // Mark that we're no longer listening for signals
+        self.sig_listening.store(false, atomic::Ordering::Release);
+
+        log::debug!("Signal socket cleanup completed successfully");
         Ok(())
     }
 
