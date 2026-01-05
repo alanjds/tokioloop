@@ -502,6 +502,32 @@ impl TEventLoop {
                                                 }
                                             }
                                         });
+                                        // Trace individual signals from the buffer
+                                        for i in 0..n {
+                                            let signal_num = buf[i];
+                                            let signal_name = match signal_num {
+                                                1 => "SIGHUP",
+                                                2 => "SIGINT",
+                                                3 => "SIGQUIT",
+                                                6 => "SIGABRT",
+                                                8 => "SIGFPE",
+                                                9 => "SIGKILL",
+                                                10 => "SIGUSR1",
+                                                11 => "SIGSEGV",
+                                                12 => "SIGUSR2",
+                                                13 => "SIGPIPE",
+                                                14 => "SIGALRM",
+                                                15 => "SIGTERM",
+                                                17 => "SIGCHLD",
+                                                18 => "SIGCONT",
+                                                19 => "SIGSTOP",
+                                                20 => "SIGTSTP",
+                                                21 => "SIGTTIN",
+                                                22 => "SIGTTOU",
+                                                _ => "UNKNOWN",
+                                            };
+                                            log::debug!("Signal received: {} ({})", signal_num, signal_name);
+                                        }
                                     }
                                     Ok(_) => {
                                         // No data available, continue
