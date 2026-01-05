@@ -118,6 +118,8 @@ pub struct TEventLoop {
     signal_socket_tx: Arc<Mutex<Option<UnixStream>>>,
     sig_listening: Arc<AtomicBool>,
     sig_handlers: Arc<papaya::HashMap<u8, Py<PyAny>>>,
+    // Pending signal socket setup (stored as raw FDs to be converted inside runtime)
+    pending_signal_sockets: Arc<Mutex<Option<(usize, usize)>>>,
 }
 
 impl TEventLoop {
@@ -275,6 +277,7 @@ impl TEventLoop {
             signal_socket_tx: Arc::new(Mutex::new(None)),
             sig_listening: Arc::new(atomic::AtomicBool::new(false)),
             sig_handlers: Arc::new(papaya::HashMap::new()),
+            pending_signal_sockets: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -349,7 +352,9 @@ impl TEventLoop {
 
         // Get signal socket references for use in async task
         let signal_socket_rx = Arc::clone(&self.signal_socket_rx);
+        let signal_socket_tx = Arc::clone(&self.signal_socket_tx);
         let sig_listening_clone = Arc::clone(&self.sig_listening);
+        let pending_signal_sockets = Arc::clone(&self.pending_signal_sockets);
 
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
@@ -357,6 +362,52 @@ impl TEventLoop {
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
                 let mut current_handles = VecDeque::new();
+
+                // Check for pending signal socket setup and convert to tokio streams
+                {
+                    let mut pending_guard = pending_signal_sockets.lock().unwrap();
+                    if let Some((fd_r, fd_w)) = pending_guard.take() {
+                        log::debug!("Converting pending signal sockets to tokio streams");
+
+                        // Convert raw file descriptors to tokio UnixStream inside the runtime
+                        let std_socket_r = unsafe {
+                            std::os::unix::net::UnixStream::from_raw_fd(fd_r as i32)
+                        };
+
+                        let std_socket_w = unsafe {
+                            std::os::unix::net::UnixStream::from_raw_fd(fd_w as i32)
+                        };
+
+                        // Convert to tokio UnixStream
+                        match UnixStream::from_std(std_socket_r) {
+                            Ok(tokio_socket_r) => {
+                                match UnixStream::from_std(std_socket_w) {
+                                    Ok(tokio_socket_w) => {
+                                        // Store the converted sockets
+                                        {
+                                            let mut rx_guard = signal_socket_rx.lock().unwrap();
+                                            *rx_guard = Some(tokio_socket_r);
+                                        }
+                                        {
+                                            let mut tx_guard = signal_socket_tx.lock().unwrap();
+                                            *tx_guard = Some(tokio_socket_w);
+                                        }
+
+                                        // Mark that we're listening for signals
+                                        sig_listening_clone.store(true, atomic::Ordering::Release);
+                                        log::debug!("Signal socket setup completed successfully inside runtime");
+                                    }
+                                    Err(e) => {
+                                        log::error!("Failed to convert signal socket TX to tokio: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("Failed to convert signal socket RX to tokio: {}", e);
+                            }
+                        }
+                    }
+                }
 
                 loop {
                     // Check signals immediately at the start of each iteration
@@ -438,7 +489,7 @@ impl TEventLoop {
                                         Python::attach(|py| {
                                             match py.check_signals() {
                                                 Ok(()) => {
-                                                    log::debug!("Signals processed successfully");
+                                                    log::debug!("PyO3 signals processed successfully");
                                                 }
                                                 Err(e) => {
                                                     log::warn!("Signal processing failed: {:?}", e);
@@ -713,54 +764,13 @@ impl TEventLoop {
     fn _ssock_set(&self, fd_r: usize, fd_w: usize) -> PyResult<()> {
         log::debug!("TokioEventLoop::_ssock_set called with fd_r: {}, fd_w: {}", fd_r, fd_w);
 
-        // Convert raw file descriptors to tokio UnixStream
-        // We need to be careful here to avoid taking ownership of the FDs
-        // since Python might still be using them
-
-        let std_socket_r = unsafe {
-            std::os::unix::net::UnixStream::from_raw_fd(fd_r as i32)
-        };
-
-        let std_socket_w = unsafe {
-            std::os::unix::net::UnixStream::from_raw_fd(fd_w as i32)
-        };
-
-        // Convert to tokio UnixStream
-        let tokio_socket_r = match UnixStream::from_std(std_socket_r) {
-            Ok(socket) => socket,
-            Err(e) => {
-                log::error!("Failed to convert signal socket RX to tokio: {}", e);
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("Failed to convert signal socket RX to tokio: {}", e)
-                ));
-            }
-        };
-
-        let tokio_socket_w = match UnixStream::from_std(std_socket_w) {
-            Ok(socket) => socket,
-            Err(e) => {
-                log::error!("Failed to convert signal socket TX to tokio: {}", e);
-                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("Failed to convert signal socket TX to tokio: {}", e)
-                ));
-            }
-        };
-
-        // Store the sockets in the event loop
+        // Store the raw file descriptors for later conversion inside the tokio runtime
         {
-            let mut rx_guard = self.signal_socket_rx.lock().unwrap();
-            *rx_guard = Some(tokio_socket_r);
+            let mut pending = self.pending_signal_sockets.lock().unwrap();
+            *pending = Some((fd_r, fd_w));
         }
 
-        {
-            let mut tx_guard = self.signal_socket_tx.lock().unwrap();
-            *tx_guard = Some(tokio_socket_w);
-        }
-
-        // Mark that we're listening for signals
-        self.sig_listening.store(true, atomic::Ordering::Release);
-
-        log::debug!("Signal socket setup completed successfully");
+        log::debug!("Signal socket FDs stored for later conversion");
         Ok(())
     }
 
@@ -797,6 +807,12 @@ impl TEventLoop {
         // TODO: Implement tokio-based signal clearing
         // For now, just log to call to make interface work
         log::debug!("TokioEventLoop::_signals_clear called - not yet implemented");
+    }
+
+    fn _sig_clear(&self) {
+        // TODO: Implement tokio-based signal clearing
+        // For now, just log to call to make interface work
+        log::debug!("TokioEventLoop::_sig_clear called - not yet implemented");
     }
 }
 

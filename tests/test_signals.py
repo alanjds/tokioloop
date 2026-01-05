@@ -7,11 +7,75 @@ import os
 import threading
 import logging
 
+import pytest
 from uvloop import _testbase as tb
 
 logger = logging.getLogger(__name__)
 
 DELAY = 0.1
+
+
+@pytest.mark.xfail('Not generic for Asyncio loops')
+def test_signal_socket_setup(loop):
+    """Test basic signal socket setup with mock FDs"""
+    # Test with real file descriptors using os.pipe()
+    r_fd, w_fd = os.pipe()
+    assert loop._ssock_set(r_fd, w_fd) is None
+    assert loop._sig_listening  # Should be True
+    loop._ssock_del(r_fd)  # Should cleanup properly
+    assert not loop._sig_listening  # Should be False
+    assert loop._ssock_set(r_fd, w_fd)  # Should handle re-setup
+    loop._ssock_del(r_fd)  # Should cleanup again
+
+
+def test_ctrl_c_responsiveness(loop):
+    """Test rapid Ctrl+C responsiveness"""
+    # Track signal processing
+    signals_received = []
+    stop_called = threading.Event()
+
+    def handle_signal(signum, frame):
+        signals_received.append((signum, time.time()))
+        if signum == signal.SIGINT:
+            stop_called.set()
+
+    # Register signal handler
+    old_handler = signal.signal(signal.SIGINT, handle_signal)
+
+    # Start event loop in background thread
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    loop_thread = threading.Thread(target=run_loop)
+    loop_thread.start()
+
+    # Test rapid Ctrl+C sequence
+    time.sleep(0.1)  # Let loop start
+    start_time = time.time()
+
+    for i in range(5):  # Send 5 rapid Ctrl+C
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(0.05)  # Very rapid
+
+    # Wait for stop or timeout
+    stop_called.wait(timeout=2.0)
+
+    end_time = time.time()
+
+    signal.signal(signal.SIGINT, old_handler)
+    loop_thread.join(timeout=3.0)
+
+    total_time = end_time - start_time
+    avg_latency = total_time / len(signals_received) * 1000  # ms
+
+    logger.info('Signals processed: %s', len(signals_received))
+    logger.info('Average latency: %.1f ms', avg_latency)
+    logger.info('Stop called: %s', stop_called.is_set())
+
+    assert len(signals_received) > 0
+    assert len(signals_received) == 5
+    assert avg_latency < 100, 'Signals took too long to be processed'
 
 
 class _TestSignal:
@@ -417,58 +481,3 @@ class Test_RLoop_Signals(_TestSignal, tb.AIOTestCase):
 
 class Test_TokioLoop_Signals(_TestSignal, tb.AIOTestCase):
     NEW_LOOP = 'rloop.new_tokio_event_loop()'
-
-
-
-
-def test_ctrl_c_responsiveness(loop):
-    """Test rapid Ctrl+C responsiveness"""
-    # loop = TokioEventLoop()
-
-    # Track signal processing
-    signals_received = []
-    stop_called = threading.Event()
-
-    def handle_signal(signum, frame):
-        signals_received.append((signum, time.time()))
-        if signum == signal.SIGINT:
-            stop_called.set()
-
-    # Register signal handler
-    old_handler = signal.signal(signal.SIGINT, handle_signal)
-
-    # Start event loop in background thread
-    def run_loop():
-        asyncio.set_event_loop(loop)
-        loop.run_forever()
-
-
-    loop_thread = threading.Thread(target=run_loop)
-    loop_thread.start()
-
-    # Test rapid Ctrl+C sequence
-    time.sleep(0.1)  # Let loop start
-    start_time = time.time()
-
-    for i in range(5):  # Send 5 rapid Ctrl+C
-        os.kill(os.getpid(), signal.SIGINT)
-        time.sleep(0.05)  # Very rapid
-
-    # Wait for stop or timeout
-    stop_called.wait(timeout=2.0)
-
-    end_time = time.time()
-
-    signal.signal(signal.SIGINT, old_handler)
-    loop_thread.join(timeout=3.0)
-
-    total_time = end_time - start_time
-    avg_latency = total_time / len(signals_received) * 1000  # ms
-
-    logger.info('Signals processed: %s', len(signals_received))
-    logger.info('Average latency: %.1f ms', avg_latency)
-    logger.info('Stop called: %s', stop_called.is_set())
-
-    assert len(signals_received) > 0
-    assert len(signals_received) == 5
-    assert avg_latency < 100, 'Signals took too long to be processed'
