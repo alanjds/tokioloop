@@ -223,6 +223,12 @@ impl TEventLoop {
     }
 
     pub fn schedule_handle(&self, handle: impl THandle + Send + 'static, delay: Option<Duration>) -> Result<()> {
+        // Check if loop has stopped before attempting to schedule
+        if self.stopping.load(atomic::Ordering::Acquire) || self.closed.load(atomic::Ordering::Acquire) {
+            log::debug!("Loop is stopping or closed, ignoring task scheduling");
+            return Ok(()); // Silently ignore tasks when loop is stopping
+        }
+
         let task = if let Some(delay) = delay {
             // Calculate absolute time like RLoop
             let when = (Instant::now().duration_since(self.epoch) + delay).as_micros();
@@ -243,8 +249,8 @@ impl TEventLoop {
                 log::debug!("Task sent successfully");
             }
             Err(_) => {
-                log::error!("Failed to schedule task - channel closed");
-                return Err(anyhow::anyhow!("Failed to schedule task - channel closed"));
+                log::debug!("Failed to schedule task - channel closed, ignoring");
+                return Err(anyhow::anyhow!("Failed to schedule task - loop stopping & channel closed"));
             }
         }
         Ok(())
@@ -355,11 +361,10 @@ impl TEventLoop {
         let signal_socket_tx = Arc::clone(&self.signal_socket_tx);
         let sig_listening_clone = Arc::clone(&self.sig_listening);
         let pending_signal_sockets = Arc::clone(&self.pending_signal_sockets);
-        let scheduler_tx = self.scheduler_tx.clone();
 
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
-            // Main tokio task using proper async pattern
+            // Main tokio task
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
                 let mut current_handles = VecDeque::new();
@@ -473,7 +478,7 @@ impl TEventLoop {
                             }
                         }
 
-                        // Signal socket reading - NEW BRANCH FOR PHASE 3
+                        // Signal socket reading
                         _ = async {
                             if let Some(mut socket) = signal_socket_rx.lock().unwrap().as_mut() {
                                 let mut buf = [0; 1024];
@@ -541,13 +546,12 @@ impl TEventLoop {
                                     Ok(_) => {
                                         // No data available, continue
                                     }
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        // Ignore WouldBlock for this socket
+                                        // log::trace!("Signal socket WouldBlock");
+                                    }
                                     Err(e) => {
-                                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                                            // Ignore WouldBlock for this socket
-                                            // log::trace!("Signal socket WouldBlock");
-                                        } else {
-                                            log::trace!("Signal socket read error: {:?}", e);
-                                        }
+                                        log::trace!("Signal socket read error: {:?}", e);
                                     }
                                 }
                             }
@@ -595,7 +599,7 @@ impl TEventLoop {
             // Block until completion
             match runtime.block_on(task_handle) {
                 Ok(Ok(())) => {
-                    log::debug!("Tokio event loop completed successfully");
+                    log::info!("Tokio event loop completed successfully");
                     return Ok(());
                 }
                 Ok(Err(e)) => {
@@ -667,6 +671,7 @@ impl TEventLoop {
     }
 
     fn _stop(&self) -> PyResult<()> {
+        self.stopping.store(true, atomic::Ordering::Release);
         let _ = self.scheduler_tx.send(ScheduledTask::Shutdown);
         Ok(())
     }
