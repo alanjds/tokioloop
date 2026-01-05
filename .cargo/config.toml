@@ -1,2 +1,2 @@
 [build]
-rustflags = ["--cfg", "pyo3_disable_reference_pool"]
+rustflags = ["--cfg", "tokio_unstable", "--cfg", "pyo3_disable_reference_pool"]

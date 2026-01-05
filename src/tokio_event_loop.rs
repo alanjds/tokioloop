@@ -3,6 +3,7 @@ use std::{
     sync::{atomic, Arc, Mutex, RwLock},
     os::fd::{FromRawFd, IntoRawFd},
     time::{Duration, Instant},
+    env,
 };
 
 use anyhow::Result;
@@ -120,6 +121,10 @@ pub struct TEventLoop {
     sig_handlers: Arc<papaya::HashMap<u8, Py<PyAny>>>,
     // Pending signal socket setup (stored as raw FDs to be converted inside runtime)
     pending_signal_sockets: Arc<Mutex<Option<(usize, usize)>>>,
+    // Tokio Console debugging fields
+    debug_enabled: Arc<AtomicBool>,
+    console_addr: Arc<Mutex<String>>,
+    console_initialized: Arc<AtomicBool>,
 }
 
 impl TEventLoop {
@@ -132,6 +137,50 @@ impl TEventLoop {
                 self.exception_handler.read().unwrap().clone_ref(py),
             ),
         )
+    }
+
+    // Initialize console subscriber if debug is enabled
+    fn init_console_subscriber(&self) -> Result<()> {
+        if !self.debug_enabled.load(atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+
+        if self.console_initialized.load(atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let console_addr = self.console_addr.lock().unwrap().clone();
+        log::info!("Initializing Tokio Console on {}", console_addr);
+
+        // Initialize console subscriber
+        console_subscriber::ConsoleLayer::builder()
+            .init();
+
+        self.console_initialized.store(true, atomic::Ordering::Release);
+        log::info!("Tokio Console initialized on {}", console_addr);
+        Ok(())
+    }
+
+    // Clean up console subscriber
+    fn cleanup_console(&self) -> Result<()> {
+        if self.console_initialized.load(atomic::Ordering::Acquire) {
+            log::info!("Cleaning up Tokio Console");
+            // Note: console_subscriber doesn't provide explicit cleanup,
+            // but we mark it as uninitialized
+            self.console_initialized.store(false, atomic::Ordering::Release);
+        }
+        Ok(())
+    }
+
+    // Check console environment variables
+    fn check_console_env_vars(&self) -> bool {
+        // No need for a network addr envvar. TOKIO_CONSOLE_BIND is already handled
+        let enabled = env::var("RLOOP_TOKIO_CONSOLE")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse::<i32>()
+            .unwrap_or(0) == 1;
+
+        enabled
     }
 
     pub fn schedule0(&self, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
@@ -266,6 +315,15 @@ impl TEventLoop {
 
         let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel::<ScheduledTask>();
 
+        // Check environment variables for console settings
+        let console_enabled = env::var("RLOOP_TOKIO_CONSOLE")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse::<i32>()
+            .unwrap_or(0) == 1;
+
+        let console_addr = env::var("RLOOP_TOKIO_CONSOLE_ADDR")
+            .unwrap_or_else(|_| "127.0.0.1:6669".to_string());
+
         Ok(Self {
             runtime: Arc::new(runtime),
             scheduler_tx,
@@ -281,9 +339,13 @@ impl TEventLoop {
             // Initialize signal handling fields
             signal_socket_rx: Arc::new(Mutex::new(None)),
             signal_socket_tx: Arc::new(Mutex::new(None)),
-            sig_listening: Arc::new(atomic::AtomicBool::new(false)),
+            sig_listening: Arc::new(AtomicBool::new(false)),
             sig_handlers: Arc::new(papaya::HashMap::new()),
             pending_signal_sockets: Arc::new(Mutex::new(None)),
+            // Initialize Tokio Console fields
+            debug_enabled: Arc::new(AtomicBool::new(console_enabled)),
+            console_addr: Arc::new(Mutex::new(console_addr)),
+            console_initialized: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -874,6 +936,51 @@ impl TEventLoop {
         // TODO: Implement tokio-based signal clearing
         // For now, just log to call to make interface work
         log::debug!("TokioEventLoop::_sig_clear called - not yet implemented");
+    }
+
+    /// Enable or disable Tokio Console debugging
+    #[pyo3(signature = (enabled,))]
+    fn set_debug(&self, enabled: bool) -> PyResult<()> {
+        log::info!("Setting Tokio Console debug mode to: {}", enabled);
+        self.debug_enabled.store(enabled, atomic::Ordering::Release);
+
+        if enabled {
+            // Try to initialize console subscriber if not already initialized
+            if let Err(e) = self.init_console_subscriber() {
+                log::error!("Failed to initialize Tokio Console: {}", e);
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to initialize Tokio Console: {}", e)
+                ));
+            }
+        } else {
+            // Clean up console if it was initialized
+            if let Err(e) = self.cleanup_console() {
+                log::error!("Failed to cleanup Tokio Console: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if Tokio Console debugging is enabled
+    #[pyo3(signature = ())]
+    fn get_debug(&self) -> bool {
+        self.debug_enabled.load(atomic::Ordering::Acquire)
+    }
+
+    /// Get Tokio Console URL (pseudopublic method)
+    #[pyo3(signature = ())]
+    fn _get_console_url(&self) -> PyResult<String> {
+        if !self.debug_enabled.load(atomic::Ordering::Acquire) {
+            return Ok("Tokio Console is not enabled".to_string());
+        }
+
+        if !self.console_initialized.load(atomic::Ordering::Acquire) {
+            return Ok("Tokio Console is not initialized".to_string());
+        }
+
+        let addr = self.console_addr.lock().unwrap().clone();
+        Ok(format!("http://{}", addr))
     }
 }
 

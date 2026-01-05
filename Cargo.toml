@@ -41,9 +41,13 @@ rustls = { version = "0.23", features = ["std"] }
 rustls-pemfile = "2.0"
 socket2 = { version = "=0.6", features = ["all"] }
 # Tokio dependencies for TokioLoop
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["full", "tracing"] }
 tokio-rustls = "0.24"
 tokio-util = { version = "0.7", features = ["codec"] }
+# Tokio Console dependencies
+console-subscriber = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.178"

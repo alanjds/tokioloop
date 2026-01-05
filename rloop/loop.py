@@ -19,7 +19,7 @@ from itertools import chain as _iterchain
 from typing import Union
 
 from ._compat import _PY_311, _PYV
-from ._rloop import CBHandle, EventLoop as __BaseLoop, TEventLoop as __TokioBaseLoop, TimerHandle
+from ._rloop import CBHandle, EventLoop as __BaseLoop, TEventLoop as _TokioBaseLoop, TimerHandle
 from .exc import _exception_handler
 from .futures import _SyncSockReaderFuture, _SyncSockWriterFuture
 from .server import Server
@@ -1121,7 +1121,7 @@ class RLoop(_BaseRustLoop, __BaseLoop, __asyncio.AbstractEventLoop):
     pass
 
 
-class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
+class TokioLoop(_BaseRustLoop, _TokioBaseLoop, __asyncio.AbstractEventLoop):
     """Rust EventLoop based on `tokio`"""
 
     def __init__(self):
@@ -1177,7 +1177,7 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     def set_debug(self, enabled: bool):
         """Enable/disable Tokio Console debugging"""
         try:
-            __TokioBaseLoop.set_debug(self, enabled)
+            _TokioBaseLoop.set_debug(self, enabled)
             logger.info('Tokio Console debugging %s', 'enabled' if enabled else 'disabled')
         except Exception as e:
             logger.error('Failed to set debug mode: %s', e)
@@ -1186,7 +1186,7 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     def get_debug(self) -> bool:
         """Check if Tokio Console debugging is enabled"""
         try:
-            return __TokioBaseLoop.get_debug(self)
+            return _TokioBaseLoop.get_debug(self)
         except Exception as e:
             logger.error('Failed to get debug mode: %s', e)
             return False
@@ -1194,7 +1194,7 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     def _get_console_url(self) -> str:
         """Get Tokio Console URL (internal method)"""
         try:
-            return __TokioBaseLoop._get_console_url(self)
+            return _TokioBaseLoop._get_console_url(self)
         except Exception as e:
             logger.error('Failed to get console URL: %s', e)
             return 'Console not available'
