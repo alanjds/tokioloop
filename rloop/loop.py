@@ -1172,3 +1172,29 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     #: network I/O methods - TODO: Implement tokio-specific versions
     # For now, these will use the same implementations as RLoop
     # but they should eventually use tokio's async I/O primitives
+
+    # Tokio Console debugging methods
+    def set_debug(self, enabled: bool):
+        """Enable/disable Tokio Console debugging"""
+        try:
+            __TokioBaseLoop.set_debug(self, enabled)
+            logger.info('Tokio Console debugging %s', 'enabled' if enabled else 'disabled')
+        except Exception as e:
+            logger.error('Failed to set debug mode: %s', e)
+            raise
+
+    def get_debug(self) -> bool:
+        """Check if Tokio Console debugging is enabled"""
+        try:
+            return __TokioBaseLoop.get_debug(self)
+        except Exception as e:
+            logger.error('Failed to get debug mode: %s', e)
+            return False
+
+    def _get_console_url(self) -> str:
+        """Get Tokio Console URL (internal method)"""
+        try:
+            return __TokioBaseLoop._get_console_url(self)
+        except Exception as e:
+            logger.error('Failed to get console URL: %s', e)
+            return 'Console not available'
