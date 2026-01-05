@@ -355,6 +355,7 @@ impl TEventLoop {
         let signal_socket_tx = Arc::clone(&self.signal_socket_tx);
         let sig_listening_clone = Arc::clone(&self.sig_listening);
         let pending_signal_sockets = Arc::clone(&self.pending_signal_sockets);
+        let scheduler_tx = self.scheduler_tx.clone();
 
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
@@ -410,12 +411,6 @@ impl TEventLoop {
                 }
 
                 loop {
-                    // Check signals immediately at the start of each iteration
-                    Python::attach(|py| {
-                        let _ = py.check_signals();
-                    });
-
-                    // Use tokio::select! to handle multiple async sources concurrently
                     // Check signals before entering tokio::select!
                     Python::attach(|py| {
                         let _ = py.check_signals();
@@ -498,6 +493,7 @@ impl TEventLoop {
                                                        e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
                                                         log::info!("Critical signal received, stopping event loop");
                                                         stopping.store(true, atomic::Ordering::Release);
+                                                        let _ = scheduler_tx.send(ScheduledTask::Shutdown);
                                                     }
                                                 }
                                             }
@@ -527,6 +523,19 @@ impl TEventLoop {
                                                 _ => "UNKNOWN",
                                             };
                                             log::debug!("Signal received: {} ({})", signal_num, signal_name);
+
+                                            // Auto-stop on termination signals
+                                            match signal_num {
+                                                2 | 15 => {  // SIGINT or SIGTERM
+                                                    log::info!("Termination signal {} ({}) received, stopping event loop", signal_num, signal_name);
+                                                    stopping.store(true, atomic::Ordering::Release);
+                                                    // Also send shutdown task to ensure clean termination
+                                                    let _ = scheduler_tx.send(ScheduledTask::Shutdown);
+                                                }
+                                                _ => {
+                                                    // Other signals are handled by PyO3 signal processing
+                                                }
+                                            }
                                         }
                                     }
                                     Ok(_) => {
