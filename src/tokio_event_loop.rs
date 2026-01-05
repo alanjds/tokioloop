@@ -417,9 +417,9 @@ impl TEventLoop {
 
                 loop {
                     // Check signals before entering tokio::select!
-                    Python::attach(|py| {
-                        let _ = py.check_signals();
-                    });
+                    // Python::attach(|py| {
+                    //     let _ = py.check_signals();
+                    // });
 
                     tokio::select! {
                         // Handle incoming scheduled tasks
