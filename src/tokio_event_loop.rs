@@ -480,9 +480,25 @@ impl TEventLoop {
 
                         // Signal socket reading
                         _ = async {
-                            if let Some(mut socket) = signal_socket_rx.lock().unwrap().as_mut() {
+                            // Take the socket out of the mutex to avoid holding the lock across await
+                            let socket_opt = signal_socket_rx.lock().unwrap().take();
+
+                            if let Some(socket) = socket_opt {
+                                // Wait for the socket to be readable
+                                if socket.readable().await.is_err() {
+                                    log::debug!("Signal socket not ready.");
+                                    // Put the socket back before returning
+                                    let _ = signal_socket_rx.lock().unwrap().insert(socket);
+                                    return;
+                                }
+
                                 let mut buf = [0; 1024];
-                                match socket.try_read(&mut buf) {
+                                let result = socket.try_read(&mut buf);
+
+                                // Put the socket back before processing results
+                                let _ = signal_socket_rx.lock().unwrap().insert(socket);
+
+                                match result {
                                     Ok(n) if n > 0 => {
                                         log::debug!("Received {} bytes from signal socket", n);
                                         // Process signals received from Python
