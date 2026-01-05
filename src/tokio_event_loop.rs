@@ -542,7 +542,12 @@ impl TEventLoop {
                                         // No data available, continue
                                     }
                                     Err(e) => {
-                                        log::trace!("Signal socket read error: {:?}", e);
+                                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                                            // Ignore WouldBlock for this socket
+                                            // log::trace!("Signal socket WouldBlock");
+                                        } else {
+                                            log::trace!("Signal socket read error: {:?}", e);
+                                        }
                                     }
                                 }
                             }
