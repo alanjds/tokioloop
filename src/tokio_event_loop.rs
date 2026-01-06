@@ -451,10 +451,25 @@ impl TEventLoop {
                                 let current = Instant::now().duration_since(epoch).as_micros();
                                 if next_time > current {
                                     let micros_to_wait = next_time - current;
-                                    let sleep_duration = if micros_to_wait > 1000u128 { 1000u64 } else { micros_to_wait as u64 };
+                                    let sleep_duration = if micros_to_wait > 100u128 { 100u64 } else { micros_to_wait as u64 };
                                     tokio::time::sleep(Duration::from_micros(sleep_duration)).await;
                                 } else {
-                                    tokio::time::sleep(Duration::from_micros(100)).await;
+                                    let current_time = Instant::now().duration_since(epoch).as_micros();
+                                    // Timer sleep completed, check for expired timers
+                                    while let Some(timer) = delayed_tasks.peek() {
+                                        if timer.when <= current_time {
+                                            log::trace!("Delayed task: selected to run");
+                                            let timer = delayed_tasks.pop().unwrap();
+                                            if !timer.handle.cancelled() {
+                                                current_handles.push_back(timer.handle);
+                                                log::trace!("Delayed task: pushed to run");
+                                            } else {
+                                                log::trace!("Delayed task: cancelled. Not pushed to run");
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
                                 }
                             } else {
                                 tokio::time::sleep(Duration::from_millis(1)).await;
