@@ -474,24 +474,7 @@ impl TEventLoop {
                             } else {
                                 tokio::time::sleep(Duration::from_millis(1)).await;
                             }
-                        },
-
-                        if !delayed_tasks.is_empty() => {
-                            // Timer sleep completed, check for expired timers
-                            let current_time = Instant::now().duration_since(epoch).as_micros();
-                            while let Some(timer) = delayed_tasks.peek() {
-                                if timer.when <= current_time {
-                                    log::trace!("Delayed task: selected to run");
-                                    let timer = delayed_tasks.pop().unwrap();
-                                    if !timer.handle.cancelled() {
-                                        current_handles.push_back(timer.handle);
-                                        log::trace!("Delayed task: pushed to run");
-                                    }
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
+                        }, if !delayed_tasks.is_empty() => {}
 
                         // Signal socket reading
                         _ = async {
