@@ -1,31 +1,18 @@
 import asyncio
+import logging
+import os
 import signal
 import subprocess
 import sys
-import time
-import os
 import threading
-import logging
+import time
 
-import pytest
 from uvloop import _testbase as tb
+
 
 logger = logging.getLogger(__name__)
 
 DELAY = 0.1
-
-
-@pytest.mark.xfail('Not generic for Asyncio loops')
-def test_signal_socket_setup(loop):
-    """Test basic signal socket setup with mock FDs"""
-    # Test with real file descriptors using os.pipe()
-    r_fd, w_fd = os.pipe()
-    assert loop._ssock_set(r_fd, w_fd) is None
-    assert loop._sig_listening  # Should be True
-    loop._ssock_del(r_fd)  # Should cleanup properly
-    assert not loop._sig_listening  # Should be False
-    assert loop._ssock_set(r_fd, w_fd)  # Should handle re-setup
-    loop._ssock_del(r_fd)  # Should cleanup again
 
 
 def test_ctrl_c_responsiveness(loop):
