@@ -56,7 +56,7 @@ def test_ctrl_c_responsiveness(loop):
     total_time = end_time - start_time
     avg_latency = total_time / len(signals_received) * 1000  # ms
 
-    logger.info('Signals processed: %s', len(signals_received))
+    logger.info('Signals processed: %s  %s', len(signals_received), signals_received)
     logger.info('Average latency: %.1f ms', avg_latency)
     logger.info('Stop called: %s', stop_called.is_set())
 
