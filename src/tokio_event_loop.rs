@@ -100,7 +100,7 @@ impl LoopHandlers {
 }
 
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
-pub struct TEventLoop {
+    pub struct TEventLoop {
     pub(crate) runtime: Arc<Runtime>,
     scheduler_tx: mpsc::UnboundedSender<ScheduledTask>,
     scheduler_rx: Mutex<Option<mpsc::UnboundedReceiver<ScheduledTask>>>,
@@ -120,6 +120,8 @@ pub struct TEventLoop {
     sig_handlers: Arc<papaya::HashMap<u8, Py<PyAny>>>,
     // Pending signal socket setup (stored as raw FDs to be converted inside runtime)
     pending_signal_sockets: Arc<Mutex<Option<(usize, usize)>>>,
+    // I/O handling fields for future tokio integration
+    io_callbacks: Arc<papaya::HashMap<usize, (Py<PyAny>, Py<PyAny>, Py<PyAny>)>>,
 }
 
 impl TEventLoop {
@@ -289,6 +291,8 @@ impl TEventLoop {
             sig_listening: Arc::new(atomic::AtomicBool::new(false)),
             sig_handlers: Arc::new(papaya::HashMap::new()),
             pending_signal_sockets: Arc::new(Mutex::new(None)),
+            // I/O handling fields for future tokio integration
+            io_callbacks: Arc::new(papaya::HashMap::new()),
         })
     }
 
@@ -699,51 +703,6 @@ impl TEventLoop {
         Ok(())
     }
 
-    fn add_reader(
-        &self,
-        py: Python,
-        fd: usize,
-        callback: Py<PyAny>,
-        args: Py<PyAny>,
-        context: Option<Py<PyAny>>,
-    ) -> PyResult<Py<TCBHandle>> {
-        // TODO: Implement tokio-based add_reader
-        // This will use tokio::net::TcpListener/UnixListener for async I/O
-        log::debug!("TokioEventLoop::add_reader called - not yet implemented");
-
-        // For now, create a dummy handle
-        let handle = TCBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py)));
-        Py::new(py, handle)
-    }
-
-    fn remove_reader(&self, py: Python, fd: usize) -> bool {
-        // TODO: Implement tokio-based remove_reader
-        log::debug!("TokioEventLoop::remove_reader called - not yet implemented");
-        false
-    }
-
-    #[pyo3(signature = (fd, callback, *args, context=None))]
-    fn add_writer(
-        &self,
-        py: Python,
-        fd: usize,
-        callback: Py<PyAny>,
-        args: Py<PyAny>,
-        context: Option<Py<PyAny>>,
-    ) -> PyResult<Py<TCBHandle>> {
-        // TODO: Implement tokio-based add_writer
-        log::debug!("TokioEventLoop::add_writer called - not yet implemented");
-
-        // For now, create a dummy handle
-        let handle = TCBHandle::new(callback, args, context.unwrap_or_else(|| copy_context(py)));
-        Py::new(py, handle)
-    }
-
-    fn remove_writer(&self, py: Python, fd: usize) -> bool {
-        // TODO: Implement tokio-based remove_writer
-        log::debug!("TokioEventLoop::remove_writer called - not yet implemented");
-        false
-    }
 
     fn _tcp_conn(
         pyself: Py<Self>,
