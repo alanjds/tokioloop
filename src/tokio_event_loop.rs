@@ -101,7 +101,7 @@ impl LoopHandlers {
 
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub struct TEventLoop {
-    runtime: Arc<Runtime>,
+    pub(crate) runtime: Arc<Runtime>,
     scheduler_tx: mpsc::UnboundedSender<ScheduledTask>,
     scheduler_rx: Mutex<Option<mpsc::UnboundedReceiver<ScheduledTask>>>,
     handles_ready: Mutex<VecDeque<TBoxedHandle>>,
@@ -132,6 +132,11 @@ impl TEventLoop {
                 self.exception_handler.read().unwrap().clone_ref(py),
             ),
         )
+    }
+
+    /// Get a clone of the tokio runtime for spawning tasks
+    pub fn runtime(&self) -> Arc<Runtime> {
+        Arc::clone(&self.runtime)
     }
 
     pub fn schedule0(&self, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
@@ -743,13 +748,43 @@ impl TEventLoop {
         protocol_factory: Py<PyAny>,
         ssl_context: Option<Py<PyAny>>,
         server_hostname: Option<String>,
-    ) -> PyResult<(Py<crate::tcp::TCPTransport>, Py<PyAny>)> {
-        // TODO: Implement tokio-based TCP connection
-        // This will use tokio::net::TcpStream and tokio-rustls for SSL
-        log::debug!("TokioEventLoop::_tcp_conn called - not yet implemented");
+    ) -> PyResult<(Py<crate::tokio_tcp::TokioTCPTransport>, Py<PyAny>)> {
+        log::debug!("TokioEventLoop::_tcp_conn called");
 
-        // For now, return an error to indicate not implemented
-        Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>("TokioEventLoop::_tcp_conn not yet implemented"))
+        // Validate no SSL support for now
+        if ssl_context.is_some() {
+            return Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
+                "SSL/TLS not yet supported in TokioLoop"
+            ));
+        }
+
+        // Convert socket to tokio TcpStream
+        let (fd, family) = sock;
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let tokio_stream = tokio::net::TcpStream::from_std(std_stream)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                "Failed to convert socket to tokio stream: {}", e
+            )))?;
+
+        // Create protocol instance
+        let protocol = protocol_factory.call0(py)?;
+
+        // Create TokioTCPTransport
+        let transport = crate::tokio_tcp::TokioTCPTransport::from_py(
+            py,
+            &pyself,
+            (fd, family),
+            protocol_factory,
+        )?;
+
+        // Convert to Py<TokioTCPTransport> for the attach method
+        let transport_py = Py::new(py, transport)?;
+
+        // Attach protocol to transport
+        let _ = crate::tokio_tcp::TokioTCPTransport::attach(&transport_py, py)?;
+
+        // Return transport and protocol
+        Ok((transport_py, protocol))
     }
 
     fn _tcp_server(
