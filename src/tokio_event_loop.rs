@@ -372,7 +372,7 @@ impl TEventLoop {
             // Main tokio task
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
-                let mut current_handles = VecDeque::new();
+                let (current_handles_tx, mut current_handles_rx) = tokio::sync::mpsc::unbounded_channel::<TBoxedHandle>();
 
                 // Check for pending signal socket setup and convert to tokio streams
                 {
@@ -432,7 +432,7 @@ impl TEventLoop {
                             match task {
                                 Some(ScheduledTask::Immediate { handle }) => {
                                     log::trace!("Received: Immediate task");
-                                    current_handles.push_back(handle);
+                                    let _ = current_handles_tx.send(handle);
                                 }
                                 Some(ScheduledTask::Delayed { timer }) => {
                                     log::trace!("Received: Delayed task");
@@ -466,10 +466,10 @@ impl TEventLoop {
                                             log::trace!("Delayed task: selected to run");
                                             let timer = delayed_tasks.pop().unwrap();
                                             if !timer.handle.cancelled() {
-                                                current_handles.push_back(timer.handle);
-                                                log::trace!("Delayed task: pushed to run");
+                                                let _ = current_handles_tx.send(timer.handle);
+                                                log::trace!("Delayed task: sent to run");
                                             } else {
-                                                log::trace!("Delayed task: cancelled. Not pushed to run");
+                                                log::trace!("Delayed task: cancelled. Not sent to run");
                                             }
                                         } else {
                                             break;
@@ -580,31 +580,35 @@ impl TEventLoop {
                         _ = async {
                             tokio::time::sleep(Duration::from_millis(1)).await;
                         }, if delayed_tasks.is_empty() => {}
-                    }
 
-                    let mut state = TEventLoopRunState{};
-                    // Process immediate tasks
-                    while let Some(handle) = current_handles.pop_front() {
-                        log::trace!("Task selected to run");
-                        if !handle.cancelled() {
-                            // Clone handlers for this handle execution
-                            let handlers = loop_handlers.clone();
+                        handle = current_handles_rx.recv() => {
+                            if let Some(handle) = handle {
+                                log::trace!("Task received to run");
+                                if !handle.cancelled() {
+                                    // Clone handlers for this handle execution
+                                    let handlers = loop_handlers.clone();
+                                    let mut state = TEventLoopRunState{};
 
-                            // Execute Python callback in GIL
-                            log::trace!("PyO3: attaching Python to run the task");
-                            Python::attach(|py| {
-                                // if let Err(e) = std::panic::catch_unwind(|| {
-                                    log::debug!("Executing handle in tokio context");
-                                //
-                                //     // Execute the handle with proper context
-                                    let _ = handle.run(py, &handlers, &state);
-                                    log::debug!("Handle execution completed");
-                                // }) {
-                                //   log::error!("Panic during handle execution: {:?}", e);
-                                // }
-                            });
+                                    // Execute Python callback in GIL
+                                    log::trace!("PyO3: attaching Python to run the task");
+                                    Python::attach(|py| {
+                                        // if let Err(e) = std::panic::catch_unwind(|| {
+                                            log::debug!("Executing handle in tokio context");
+                                        //
+                                        //     // Execute the handle with proper context
+                                            let _ = handle.run(py, &handlers, &state);
+                                            log::debug!("Handle execution completed");
+                                        // }) {
+                                        //   log::error!("Panic during handle execution: {:?}", e);
+                                        // }
+                                    });
+                                }
+                            } else {
+                                log::debug!("Handle channel closed, breaking from select");
+                                break;
+                            }
                         }
-                    };
+                    }
 
                     // Check stop condition
                     if stopping_clone.load(atomic::Ordering::Acquire) {
