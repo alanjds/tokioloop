@@ -1172,3 +1172,19 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     #: network I/O methods - TODO: Implement tokio-specific versions
     # For now, these will use the same implementations as RLoop
     # but they should eventually use tokio's async I/O primitives
+
+    def add_reader(self, fd, callback, *args, context=None):
+        """Add a reader callback for a file descriptor."""
+        return super().add_reader(fd, callback, *args, context=context)
+
+    def add_writer(self, fd, callback, *args, context=None):
+        """Add a writer callback for a file descriptor."""
+        return super().add_writer(fd, callback, *args, context=context)
+
+    def remove_reader(self, fd):
+        """Remove a reader callback for a file descriptor."""
+        return super().remove_reader(fd)
+
+    def remove_writer(self, fd):
+        """Remove a writer callback for a file descriptor."""
+        return super().remove_writer(fd)

@@ -703,6 +703,92 @@ impl TEventLoop {
         Ok(())
     }
 
+    // I/O methods for socket operations - these are critical for TCP functionality
+    #[pyo3(signature = (fd, callback, *args, context=None))]
+    fn add_reader(
+        &self,
+        py: Python,
+        fd: usize,
+        callback: Py<PyAny>,
+        args: Py<PyAny>,
+        context: Option<Py<PyAny>>,
+    ) -> PyResult<crate::tokio_handles::TCBHandle> {
+        log::debug!("TokioEventLoop::add_reader called for fd: {}", fd);
+
+        // For now, implement a simple version that schedules the callback
+        // In a full implementation, this would register the fd with tokio's interest system
+        let context = context.unwrap_or_else(|| copy_context(py));
+        let handle = TCBHandle::new(callback.clone_ref(py), args.clone_ref(py), context.clone_ref(py));
+        let handle_obj = Py::new(py, handle)?;
+
+        // Store the callback for later execution when fd becomes readable
+        {
+            let mut callbacks = self.io_callbacks.pin();
+            callbacks.insert(fd, (handle_obj.clone_ref(py).into(), py.None(), context.clone_ref(py)));
+        }
+
+        // Schedule an immediate task to check readability
+        self.schedule_handle(handle_obj.clone_ref(py), None)?;
+
+        // Return a new handle with the same parameters
+        Ok(TCBHandle::new(callback, args, context))
+    }
+
+    #[pyo3(signature = (fd, callback, *args, context=None))]
+    fn add_writer(
+        &self,
+        py: Python,
+        fd: usize,
+        callback: Py<PyAny>,
+        args: Py<PyAny>,
+        context: Option<Py<PyAny>>,
+    ) -> PyResult<crate::tokio_handles::TCBHandle> {
+        log::debug!("TokioEventLoop::add_writer called for fd: {}", fd);
+
+        // For now, implement a simple version that schedules the callback
+        // In a full implementation, this would register the fd with tokio's interest system
+        let context = context.unwrap_or_else(|| copy_context(py));
+        let handle = TCBHandle::new(callback.clone_ref(py), args.clone_ref(py), context.clone_ref(py));
+        let handle_obj = Py::new(py, handle)?;
+
+        // Store the callback for later execution when fd becomes writable
+        {
+            let mut callbacks = self.io_callbacks.pin();
+            callbacks.insert(fd, (py.None(), handle_obj.clone_ref(py).into(), context.clone_ref(py)));
+        }
+
+        // Schedule an immediate task to check writability
+        self.schedule_handle(handle_obj.clone_ref(py), None)?;
+
+        // Return a new handle with the same parameters
+        Ok(TCBHandle::new(callback, args, context))
+    }
+
+    fn remove_reader(&self, py: Python, fd: usize) -> bool {
+        log::debug!("TokioEventLoop::remove_reader called for fd: {}", fd);
+
+        // Remove the reader callback
+        let mut callbacks = self.io_callbacks.pin();
+        if let Some((reader_cb, writer_cb, ctx)) = callbacks.remove(&fd) {
+            // Only return true if there was a reader callback
+            !reader_cb.is_none(py)
+        } else {
+            false
+        }
+    }
+
+    fn remove_writer(&self, py: Python, fd: usize) -> bool {
+        log::debug!("TokioEventLoop::remove_writer called for fd: {}", fd);
+
+        // Remove the writer callback
+        let mut callbacks = self.io_callbacks.pin();
+        if let Some((reader_cb, writer_cb, ctx)) = callbacks.remove(&fd) {
+            // Only return true if there was a writer callback
+            !writer_cb.is_none(py)
+        } else {
+            false
+        }
+    }
 
     fn _tcp_conn(
         pyself: Py<Self>,
@@ -760,12 +846,30 @@ impl TEventLoop {
     ) -> PyResult<Py<crate::server::TokioServer>> {
         log::debug!("TokioEventLoop::_tcp_server called with {} sockets", rsocks.len());
 
-        // Create a simple mock server for now to make tests pass
-        // This creates a TokioServer object that doesn't actually do TCP I/O
-        // but satisfies the interface requirements
-        let mock_server = TokioServer::mock(pyself.clone_ref(py), socks.clone_ref(py));
+        // Create tokio-based TCP servers
+        let mut servers = Vec::new();
 
-        Py::new(py, mock_server)
+        for (fd, family) in rsocks {
+            let server = crate::tokio_tcp::TokioTCPServer::from_fd(
+                fd,
+                family,
+                backlog,
+                protocol_factory.clone_ref(py),
+                pyself.clone_ref(py),
+            )?;
+
+            // Start listening for connections
+            server.start_listening(py)?;
+
+            // Create a TCPServer wrapper for the TokioTCPServer
+            let tcp_server = crate::tcp::TCPServer::from_fd(fd, family, backlog, protocol_factory.clone_ref(py));
+            servers.push(tcp_server);
+        }
+
+        // Create TokioServer with the TCP servers
+        let tokio_server = crate::server::TokioServer::tcp(pyself.clone_ref(py), socks.clone_ref(py), servers);
+
+        Py::new(py, tokio_server)
     }
 
     fn _tcp_server_ssl(
