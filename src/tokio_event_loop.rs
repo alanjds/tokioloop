@@ -59,7 +59,6 @@ impl Ord for TokioTimer {
 enum ScheduledTask {
     Immediate { handle: TBoxedHandle },
     Delayed { timer: TokioTimer },
-    Shutdown,
 }
 
 impl std::fmt::Debug for ScheduledTask {
@@ -67,7 +66,6 @@ impl std::fmt::Debug for ScheduledTask {
         match self {
             ScheduledTask::Immediate { .. } => write!(f, "ScheduledTask::Immediate"),
             ScheduledTask::Delayed { timer } => write!(f, "ScheduledTask::Delayed {{ when: {} }}", timer.when),
-            ScheduledTask::Shutdown => write!(f, "ScheduledTask::Shutdown"),
         }
     }
 }
@@ -442,10 +440,6 @@ impl TEventLoop {
                                     log::trace!("Received: Delayed task");
                                     delayed_tasks.push(timer);
                                 }
-                                Some(ScheduledTask::Shutdown) => {
-                                    log::debug!("Received: Shutdown signal");
-                                    break;
-                                }
                                 None => {
                                     log::debug!("Received: None. Scheduler channel closed");
                                     break;
@@ -699,7 +693,6 @@ impl TEventLoop {
 
     fn _stop(&self) -> PyResult<()> {
         self.stopping.store(true, atomic::Ordering::Release);
-        let _ = self.scheduler_tx.send(ScheduledTask::Shutdown);
         Ok(())
     }
 
