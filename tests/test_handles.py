@@ -16,6 +16,20 @@ def run_loop(loop):
     loop.run_until_complete(run())
 
 
+def test_multiple_calls_to_run_until_complete(loop):
+    logger.info('First call to run_until_complete for loop: %r', loop)
+    run_loop(loop)
+
+    logger.info('Second call to run_until_complete for loop: %r', loop)
+    run_loop(loop)
+
+    logger.info('Third call to run_until_complete for loop: %r', loop)
+    run_loop(loop)
+
+    logger.info('Forth call to run_until_complete for loop: %r', loop)
+    run_loop(loop)
+
+
 def test_call_soon(loop):
     calls = []
 
