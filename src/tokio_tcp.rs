@@ -43,9 +43,9 @@ pub(crate) struct TokioTCPTransport {
     protocol: Py<PyAny>,
     extra: HashMap<String, Py<PyAny>>,
     // Atomic flags for thread safety
-    closing: atomic::AtomicBool,
-    paused: atomic::AtomicBool,
-    weof: atomic::AtomicBool,
+    closing: AtomicBool,
+    paused: AtomicBool,
+    weof: AtomicBool,
     #[pyo3(get)]
     lfd: Option<usize>,
 }
@@ -307,7 +307,7 @@ pub(crate) struct TokioTCPServer {
     protocol_factory: Py<PyAny>,
     pyloop: Py<TEventLoop>,
     transports: Arc<Mutex<Vec<Py<TokioTCPTransport>>>>,
-    closed: Arc<atomic::AtomicBool>,
+    closed: Arc<AtomicBool>,
     #[pyo3(get)]
     socks: Py<PyAny>,
     #[pyo3(get)]
@@ -364,7 +364,7 @@ impl TokioTCPServer {
         let protocol_factory = self.protocol_factory.clone_ref(py);
         let pyloop = self.pyloop.clone_ref(py);
         let transports = self.transports.clone();
-        let closed = Arc::new(self.closed.clone());
+        let closed = self.closed.clone();
 
         let runtime = pyloop.get().runtime.clone();
 
@@ -395,7 +395,7 @@ impl TokioTCPServer {
                                 protocol_factory: protocol_factory.clone_ref(py),
                                 pyloop: pyloop.clone_ref(py),
                                 transports: transports.clone(),
-                                closed: false.into(), // Create new AtomicBool
+                                closed: Arc::new(AtomicBool::new(false)), // Create new AtomicBool
                                 socks: py.None(),
                                 transports_py: Vec::new(),
                             };
@@ -414,6 +414,7 @@ impl TokioTCPServer {
                     }
                     Err(e) => {
                         log::error!("TokioTCPServer: Error accepting connection: {}", e);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                         // Continue listening
                     }
                 }
