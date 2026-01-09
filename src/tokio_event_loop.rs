@@ -105,7 +105,7 @@ impl LoopHandlers {
     handles_ready: Mutex<VecDeque<TBoxedHandle>>,
     counter_ready: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
-    stopping: atomic::AtomicBool,
+    stopping: Arc<atomic::AtomicBool>,
     epoch: Instant,
     exc_handler: Arc<RwLock<Py<PyAny>>>,
     exception_handler: Arc<RwLock<Py<PyAny>>>,
@@ -278,7 +278,7 @@ impl TEventLoop {
             handles_ready: Mutex::new(VecDeque::with_capacity(128)),
             counter_ready: atomic::AtomicUsize::new(0),
             closed: atomic::AtomicBool::new(false),
-            stopping: atomic::AtomicBool::new(false),
+            stopping: Arc::new(atomic::AtomicBool::new(false)),
             epoch: Instant::now(),
             exc_handler: Arc::new(RwLock::new(py.None())),
             exception_handler: Arc::new(RwLock::new(py.None())),
@@ -356,8 +356,7 @@ impl TEventLoop {
         // Keep the same sender - all scheduling uses the same channel
         // This ensures the receiver in _run() is connected to all tasks
 
-        let stopping = Arc::new(atomic::AtomicBool::new(false));
-        let stopping_clone = Arc::clone(&stopping);
+        let stopping_clone = Arc::clone(&self.stopping);
         let epoch = self.epoch;
 
         // Get a copy of the scheduler sender for signal handling
@@ -514,8 +513,7 @@ impl TEventLoop {
                                                     if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) ||
                                                        e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
                                                         log::info!("Critical signal received, stopping event loop");
-                                                        stopping.store(true, atomic::Ordering::Release);
-                                                        let _ = scheduler_tx.send(ScheduledTask::Shutdown);
+                                                        stopping_clone.store(true, atomic::Ordering::Release);
                                                     }
                                                 }
                                             }
@@ -550,9 +548,7 @@ impl TEventLoop {
                                             match signal_num {
                                                 2 | 15 => {  // SIGINT or SIGTERM
                                                     log::info!("Termination signal {} ({}) received, stopping event loop", signal_num, signal_name);
-                                                    stopping.store(true, atomic::Ordering::Release);
-                                                    // Also send shutdown task to ensure clean termination
-                                                    let _ = scheduler_tx.send(ScheduledTask::Shutdown);
+                                                    stopping_clone.store(true, atomic::Ordering::Release);
                                                 }
                                                 _ => {
                                                     // Other signals are handled by PyO3 signal processing
