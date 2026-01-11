@@ -113,12 +113,10 @@ impl LoopHandlers {
     #[pyo3(get)]
     _base_ctx: Py<PyAny>,
     // Signal handling fields for Phase 3 implementation
-    signal_socket_rx: Arc<Mutex<Option<UnixStream>>>,
-    signal_socket_tx: Arc<Mutex<Option<UnixStream>>>,
+    signal_socket_rx: async_channel::Receiver<u8>,
+    signal_socket_tx: async_channel::Sender<u8>,
     sig_listening: Arc<AtomicBool>,
     sig_handlers: Arc<papaya::HashMap<u8, Py<PyAny>>>,
-    // Pending signal socket setup (stored as raw FDs to be converted inside runtime)
-    pending_signal_sockets: Arc<Mutex<Option<(usize, usize)>>>,
     // I/O handling fields for future tokio integration
     io_callbacks: Arc<papaya::HashMap<usize, (Py<PyAny>, Py<PyAny>, Py<PyAny>)>>,
 }
@@ -289,7 +287,6 @@ impl TEventLoop {
             signal_socket_tx: Arc::new(Mutex::new(None)),
             sig_listening: Arc::new(atomic::AtomicBool::new(false)),
             sig_handlers: Arc::new(papaya::HashMap::new()),
-            pending_signal_sockets: Arc::new(Mutex::new(None)),
             // I/O handling fields for future tokio integration
             io_callbacks: Arc::new(papaya::HashMap::new()),
         })
@@ -363,11 +360,10 @@ impl TEventLoop {
         // Get a copy of the scheduler sender for signal handling
         let _scheduler_tx = self.scheduler_tx.clone();
 
-        // Get signal socket references for use in async task
+        // Get signal socket references for use in the async task
         let signal_socket_rx = Arc::clone(&self.signal_socket_rx);
         let signal_socket_tx = Arc::clone(&self.signal_socket_tx);
         let sig_listening_clone = Arc::clone(&self.sig_listening);
-        let pending_signal_sockets = Arc::clone(&self.pending_signal_sockets);
 
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
@@ -375,52 +371,6 @@ impl TEventLoop {
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
                 let (current_handles_tx, mut current_handles_rx) = tokio::sync::mpsc::unbounded_channel::<TBoxedHandle>();
-
-                // Check for pending signal socket setup and convert to tokio streams
-                {
-                    let mut pending_guard = pending_signal_sockets.lock().unwrap();
-                    if let Some((fd_r, fd_w)) = pending_guard.take() {
-                        log::debug!("Converting pending signal sockets to tokio streams");
-
-                        // Convert raw file descriptors to tokio UnixStream inside the runtime
-                        let std_socket_r = unsafe {
-                            std::os::unix::net::UnixStream::from_raw_fd(fd_r as i32)
-                        };
-
-                        let std_socket_w = unsafe {
-                            std::os::unix::net::UnixStream::from_raw_fd(fd_w as i32)
-                        };
-
-                        // Convert to tokio UnixStream
-                        match UnixStream::from_std(std_socket_r) {
-                            Ok(tokio_socket_r) => {
-                                match UnixStream::from_std(std_socket_w) {
-                                    Ok(tokio_socket_w) => {
-                                        // Store the converted sockets
-                                        {
-                                            let mut rx_guard = signal_socket_rx.lock().unwrap();
-                                            *rx_guard = Some(tokio_socket_r);
-                                        }
-                                        {
-                                            let mut tx_guard = signal_socket_tx.lock().unwrap();
-                                            *tx_guard = Some(tokio_socket_w);
-                                        }
-
-                                        // Mark that we're listening for signals
-                                        sig_listening_clone.store(true, atomic::Ordering::Release);
-                                        log::debug!("Signal socket setup completed successfully inside runtime");
-                                    }
-                                    Err(e) => {
-                                        log::error!("Failed to convert signal socket TX to tokio: {}", e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("Failed to convert signal socket RX to tokio: {}", e);
-                            }
-                        }
-                    }
-                }
 
                 loop {
                     // Check signals before entering tokio::select!
@@ -480,94 +430,30 @@ impl TEventLoop {
                         }, if !delayed_tasks.is_empty() => {}
 
                         // Signal socket reading
-                        _ = async {
-                            // Take the socket out of the mutex to avoid holding the lock across await
-                            let socket_opt = signal_socket_rx.lock().unwrap().take();
+                        sig = signal_socket_rx.recv() => {
+                            if let Ok(signal_num) = sig {
+                                log::debug!("Received signal: {}", signal_num);
 
-                            if let Some(socket) = socket_opt {
-                                // Wait for the socket to be readable
-                                if socket.readable().await.is_err() {
-                                    log::debug!("Signal socket not ready.");
-                                    // Put the socket back before returning
-                                    let _ = signal_socket_rx.lock().unwrap().insert(socket);
-                                    return;
-                                }
-
-                                let mut buf = [0; 1024];
-                                let result = socket.try_read(&mut buf);
-
-                                // Put the socket back before processing results
-                                let _ = signal_socket_rx.lock().unwrap().insert(socket);
-
-                                match result {
-                                    Ok(n) if n > 0 => {
-                                        log::debug!("Received {} bytes from signal socket", n);
-                                        // Process signals received from Python
-                                        Python::attach(|py| {
-                                            match py.check_signals() {
-                                                Ok(()) => {
-                                                    log::debug!("PyO3 signals processed successfully");
-                                                }
-                                                Err(e) => {
-                                                    log::warn!("Signal processing failed: {:?}", e);
-                                                    // Check if this is a critical signal that should stop the loop
-                                                    if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) ||
-                                                       e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
-                                                        log::info!("Critical signal received, stopping event loop");
-                                                        stopping_clone.store(true, atomic::Ordering::Release);
-                                                    }
-                                                }
-                                            }
-                                        });
-                                        // Trace individual signals from the buffer
-                                        for i in 0..n {
-                                            let signal_num = buf[i];
-                                            let signal_name = match signal_num {
-                                                1 => "SIGHUP",
-                                                2 => "SIGINT",
-                                                3 => "SIGQUIT",
-                                                6 => "SIGABRT",
-                                                8 => "SIGFPE",
-                                                9 => "SIGKILL",
-                                                10 => "SIGUSR1",
-                                                11 => "SIGSEGV",
-                                                12 => "SIGUSR2",
-                                                13 => "SIGPIPE",
-                                                14 => "SIGALRM",
-                                                15 => "SIGTERM",
-                                                17 => "SIGCHLD",
-                                                18 => "SIGCONT",
-                                                19 => "SIGSTOP",
-                                                20 => "SIGTSTP",
-                                                21 => "SIGTTIN",
-                                                22 => "SIGTTOU",
-                                                _ => "UNKNOWN",
-                                            };
-                                            log::debug!("Signal received: {} ({})", signal_num, signal_name);
-
-                                            // Auto-stop on termination signals
-                                            match signal_num {
-                                                2 | 15 => {  // SIGINT or SIGTERM
-                                                    log::info!("Termination signal {} ({}) received, stopping event loop", signal_num, signal_name);
-                                                    stopping_clone.store(true, atomic::Ordering::Release);
-                                                }
-                                                _ => {
-                                                    // Other signals are handled by PyO3 signal processing
-                                                }
+                                // Process signals received from Python
+                                Python::attach(|py| {
+                                    match py.check_signals() {
+                                        Ok(()) => {
+                                            log::debug!("PyO3 signals processed successfully");
+                                        }
+                                        Err(e) => {
+                                            log::warn!("Signal processing failed: {:?}", e);
+                                            // Check if this is a critical signal that should stop the loop
+                                            if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) ||
+                                               e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
+                                                log::info!("Critical signal received, stopping event loop");
+                                                stopping_clone.store(true, atomic::Ordering::Release);
                                             }
                                         }
                                     }
-                                    Ok(_) => {
-                                        // No data available, continue
-                                    }
-                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                        // Ignore WouldBlock for this socket
-                                        // log::trace!("Signal socket WouldBlock");
-                                    }
-                                    Err(e) => {
-                                        log::trace!("Signal socket read error: {:?}", e);
-                                    }
-                                }
+                                });
+                            } else {
+                                log::debug!("Signal channel closed");
+                                break;
                             }
                         }, if sig_listening_clone.load(atomic::Ordering::Acquire) => {}
 
@@ -910,37 +796,129 @@ impl TEventLoop {
     fn _ssock_set(&self, fd_r: usize, fd_w: usize) -> PyResult<()> {
         log::debug!("TokioEventLoop::_ssock_set called with fd_r: {}, fd_w: {}", fd_r, fd_w);
 
-        // Store the raw file descriptors for later conversion inside the tokio runtime
-        {
-            let mut pending = self.pending_signal_sockets.lock().unwrap();
-            *pending = Some((fd_r, fd_w));
-        }
+        // Spawn a background task to handle signal socket reading
+        let runtime = self.runtime.clone();
+        let signal_socket_tx = self.signal_socket_tx.clone();
+        let sig_listening = Arc::clone(&self.sig_listening);
+        let stopping_clone = Arc::clone(&self.stopping);
 
-        log::debug!("Signal socket FDs stored for later conversion");
-        Ok(())
+        runtime.spawn(async move {
+            // Convert raw file descriptors to tokio UnixStream inside the runtime
+            let std_socket_r = unsafe {
+                std::os::unix::net::UnixStream::from_raw_fd(fd_r as i32)
+            };
+            let std_socket_w = unsafe {
+                std::os::unix::net::UnixStream::from_raw_fd(fd_w as i32)
+            };
+
+            let tokio_socket_r = match UnixStream::from_std(std_socket_r) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    log::error!("Failed to convert signal socket RX to tokio: {}", e);
+                    return;
+                }
+            };
+            let tokio_socket_w = match UnixStream::from_std(std_socket_w) {
+                Ok(socket) => socket,
+                Err(e) => {
+                    log::error!("Failed to convert signal socket TX to tokio: {}", e);
+                    return;
+                }
+            };
+
+            // Mark that we're listening for signals
+            sig_listening.store(true, atomic::Ordering::Release);
+            log::debug!("Signal socket setup completed successfully inside runtime");
+
+            // Main signal reading loop
+            let mut buf = [0; 1024];
+            loop {
+                // Wait for the socket to be readable
+                if tokio_socket_r.readable().await.is_err() {
+                    log::debug!("Signal socket not ready.");
+                    continue;
+                }
+
+                // Try to read from the socket
+                let result = tokio_socket_r.try_read(&mut buf);
+
+                match result {
+                    Ok(n) if n > 0 => {
+                        // Process signals received from Python
+                        Python::attach(|py| {
+                            match py.check_signals() {
+                                Ok(()) => {
+                                    log::debug!("PyO3 signals processed successfully");
+                                }
+                                Err(e) => {
+                                    log::warn!("Signal processing failed: {:?}", e);
+                                    // Check if this is a critical signal that should stop the loop
+                                    if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) ||
+                                       e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
+                                                log::info!("Critical signal received, stopping event loop");
+                                                stopping_clone.store(true, atomic::Ordering::Release);
+                                            }
+                                        }
+                                }
+                            });
+
+                        // Trace individual signals from the buffer
+                        for i in 0..n {
+                            let signal_num = buf[i];
+                            let signal_name = match signal_num {
+                                1 => "SIGHUP",
+                                2 => "SIGINT",
+                                3 => "SIGQUIT",
+                                6 => "SIGABRT",
+                                8 => "SIGFPE",
+                                9 => "SIGKILL",
+                                10 => "SIGUSR1",
+                                11 => "SIGSEGV",
+                                12 => "SIGUSR2",
+                                13 => "SIGPIPE",
+                                14 => "SIGALRM",
+                                15 => "SIGTERM",
+                                17 => "SIGCHLD",
+                                18 => "SIGCONT",
+                                19 => "SIGSTOP",
+                                20 => "SIGTSTP",
+                                21 => "SIGTTIN",
+                                22 => "SIGTTOU",
+                                _ => "UNKNOWN",
+                            };
+                            log::debug!("Signal received: {} ({})", signal_num, signal_name);
+
+                            // Auto-stop on termination signals
+                            match signal_num {
+                                2 | 15 => {  // SIGINT or SIGTERM
+                                    log::info!("Termination signal {} ({}) received, stopping event loop", signal_num, signal_name);
+                                    stopping_clone.store(true, atomic::Ordering::Release);
+                                }
+                                _ => {
+                                    // Other signals are handled by PyO3 signal processing
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        log::debug!("Signal socket closed, stopping signal reading task");
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        log::trace!("Signal socket WouldBlock");
+                        continue;
+                    }
+                    Err(e) => {
+                        log::trace!("Signal socket read error: {:?}", e);
+                        continue;
+                    }
+                }
+            }
+        });
     }
 
     fn _ssock_del(&self, fd_r: usize) -> PyResult<()> {
         log::debug!("TokioEventLoop::_ssock_del called with fd_r: {}", fd_r);
-
-        // Remove and close signal sockets
-        {
-            let mut rx_guard = self.signal_socket_rx.lock().unwrap();
-            if let Some(socket) = rx_guard.take() {
-                // Drop the socket to close it
-                drop(socket);
-                log::debug!("Signal socket RX closed");
-            }
-        }
-
-        {
-            let mut tx_guard = self.signal_socket_tx.lock().unwrap();
-            if let Some(socket) = tx_guard.take() {
-                // Drop the socket to close it
-                drop(socket);
-                log::debug!("Signal socket TX closed");
-            }
-        }
 
         // Mark that we're no longer listening for signals
         self.sig_listening.store(false, atomic::Ordering::Release);
