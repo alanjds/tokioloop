@@ -9,7 +9,8 @@ use anyhow::Result;
 use pyo3::prelude::*;
 use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use std::sync::atomic::AtomicBool;
-use tokio::{runtime::Runtime, sync::mpsc, task::JoinHandle, net::UnixStream};
+use tokio::{runtime::Runtime, task::JoinHandle, net::UnixStream};
+use async_channel::{Sender, Receiver};
 
 use crate::{
     tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle},
@@ -100,8 +101,8 @@ impl LoopHandlers {
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
     pub struct TEventLoop {
     pub(crate) runtime: Arc<Runtime>,
-    scheduler_tx: mpsc::UnboundedSender<ScheduledTask>,
-    scheduler_rx: Mutex<Option<mpsc::UnboundedReceiver<ScheduledTask>>>,
+    scheduler_tx: Sender<ScheduledTask>,
+    scheduler_rx: Receiver<ScheduledTask>,
     handles_ready: Mutex<VecDeque<TBoxedHandle>>,
     counter_ready: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
@@ -269,12 +270,12 @@ impl TEventLoop {
         let runtime = Runtime::new()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create Tokio runtime: {}", e)))?;
 
-        let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel::<ScheduledTask>();
+        let (scheduler_tx, scheduler_rx) = async_channel::unbounded::<ScheduledTask>();
 
         Ok(Self {
             runtime: Arc::new(runtime),
             scheduler_tx,
-            scheduler_rx: Mutex::new(Some(scheduler_rx)),
+            scheduler_rx,
             handles_ready: Mutex::new(VecDeque::with_capacity(128)),
             counter_ready: atomic::AtomicUsize::new(0),
             closed: atomic::AtomicBool::new(false),
@@ -350,8 +351,8 @@ impl TEventLoop {
             exception_handler: Arc::clone(&self.exception_handler),
         };
 
-        // Extract the receiver BEFORE the async block
-        let mut scheduler_rx = self.scheduler_rx.lock().unwrap().take().unwrap();
+        // Clone receiver BEFORE the async block - this is the key fix!
+        let scheduler_rx = self.scheduler_rx.clone();
 
         // Keep the same sender - all scheduling uses the same channel
         // This ensures the receiver in _run() is connected to all tasks
@@ -360,7 +361,7 @@ impl TEventLoop {
         let epoch = self.epoch;
 
         // Get a copy of the scheduler sender for signal handling
-        let scheduler_tx = self.scheduler_tx.clone();
+        let _scheduler_tx = self.scheduler_tx.clone();
 
         // Get signal socket references for use in async task
         let signal_socket_rx = Arc::clone(&self.signal_socket_rx);
@@ -431,16 +432,16 @@ impl TEventLoop {
                         // Handle incoming scheduled tasks
                         task = scheduler_rx.recv() => {
                             match task {
-                                Some(ScheduledTask::Immediate { handle }) => {
+                                Ok(ScheduledTask::Immediate { handle }) => {
                                     log::trace!("Received: Immediate task");
                                     let _ = current_handles_tx.send(handle);
                                 }
-                                Some(ScheduledTask::Delayed { timer }) => {
+                                Ok(ScheduledTask::Delayed { timer }) => {
                                     log::trace!("Received: Delayed task");
                                     delayed_tasks.push(timer);
                                 }
-                                None => {
-                                    log::debug!("Received: None. Scheduler channel closed");
+                                Err(_) => {
+                                    log::debug!("Scheduler channel closed");
                                     break;
                                 }
                             }
