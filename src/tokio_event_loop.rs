@@ -250,7 +250,7 @@ impl TEventLoop {
         };
 
         log::debug!("Scheduling task: {:?}", task);
-        match self.scheduler_tx.send(task) {
+        match self.scheduler_tx.clone().try_send(task) {
             Ok(()) => {
                 log::debug!("Task sent successfully");
             }
