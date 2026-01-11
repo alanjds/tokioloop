@@ -674,16 +674,11 @@ impl TEventLoop {
     ) -> PyResult<TTimerHandle> {
         let when = Instant::now().duration_since(self.epoch).as_micros() + u128::from(delay);
 
-        /* For timers, always use the multi-argument TCBHandle for simplicity */
+        // Create the handle
         let handle = Py::new(py, TCBHandle::new(callback, args, context))?;
 
-        let timer = TokioTimer {
-            handle: Box::new(handle.clone_ref(py)),
-            when,
-        };
-
-        let task = ScheduledTask::Delayed { timer };
-        let _ = self.scheduler_tx.send(task);
+        // Use schedule_handle instead of manually creating ScheduledTask
+        self.schedule_handle(handle.clone_ref(py), Some(Duration::from_micros(delay)))?;
 
         Ok(TTimerHandle::new(handle, when))
     }
