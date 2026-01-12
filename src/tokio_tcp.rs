@@ -320,8 +320,13 @@ impl TokioTCPServer {
     ) -> PyResult<TokioTCPServerRef> {
         log::debug!("TokioTCPServer::from_fd called with fd: {}", fd);
 
-        // Try socket2 approach first for better socket state management
-        let tokio_listener = Self::try_socket2_conversion(fd, backlog)?;
+        // Convert via socket2 for better state management
+        let socket = _try_socket2_conversion(fd, backlog)?;
+
+        // Convert to std TcpListener then to tokio
+        let std_listener: std::net::TcpListener = socket.into();
+        let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to convert socket2 to tokio listener: {}", e)))?;
 
         log::debug!("TokioTCPServer::from_fd: Tokio listener created successfully");
         log::debug!("TokioTCPServer::from_fd: Listener local address: {:?}", tokio_listener.local_addr());
@@ -337,34 +342,6 @@ impl TokioTCPServer {
         });
 
         Ok(server)
-    }
-
-    fn try_socket2_conversion(fd: i32, backlog: i32) -> Result<tokio::net::TcpListener, PyErr> {
-        use socket2::{Socket, Domain, Type};
-
-        log::trace!("Socket conversion via socket2: fd={}", fd);
-
-        // Convert fd to socket2 Socket
-        let socket = unsafe { Socket::from_raw_fd(fd) };
-
-        // Ensure socket is in correct state
-        socket.set_nonblocking(true)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set socket nonblocking: {}", e)))?;
-
-        log::trace!("Socket conversion via socket2 successful");
-
-        // Set backlog if socket is not already listening
-        if let Err(e) = socket.listen(backlog) {
-            log::debug!("Socket conversion: listen failed (might already be listening): {}", e);
-            // Don't fail if already listening, just continue
-        }
-
-        // Convert to std TcpListener then to tokio
-        let std_listener: std::net::TcpListener = socket.into();
-        let tokio_listener = tokio::net::TcpListener::from_std(std_listener)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to convert socket2 to tokio listener: {}", e)))?;
-
-        Ok(tokio_listener)
     }
 
     pub fn start_listening(&self, py: Python) -> PyResult<()> {
@@ -499,6 +476,29 @@ impl TokioTCPServer {
     fn is_serving(&self) -> bool {
         !self.closed.load(atomic::Ordering::Relaxed)
     }
+}
+
+fn _try_socket2_conversion(fd: i32, backlog: i32) -> Result<socket2::Socket, PyErr> {
+    use socket2::{Socket, Domain, Type};
+
+    log::trace!("Socket conversion via socket2: fd={}", fd);
+
+    // Convert fd to socket2 Socket
+    let socket = unsafe { Socket::from_raw_fd(fd) };
+
+    // Ensure socket is in correct state
+    socket.set_nonblocking(true)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set socket nonblocking: {}", e)))?;
+
+    log::trace!("Socket conversion via socket2 successful");
+
+    // Set backlog if socket is not already listening
+    if let Err(e) = socket.listen(backlog) {
+        log::debug!("Socket conversion: listen failed (might already be listening): {}", e);
+        // Don't fail if already listening, just continue
+    }
+
+    Ok(socket)
 }
 
 pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
