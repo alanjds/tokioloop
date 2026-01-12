@@ -1,6 +1,6 @@
 use std::{
     collections::{BinaryHeap, VecDeque},
-    sync::{atomic, Arc, Mutex, RwLock},
+    sync::{atomic, Arc, RwLock},
     os::fd::{FromRawFd, IntoRawFd},
     time::{Duration, Instant},
 };
@@ -103,7 +103,6 @@ impl LoopHandlers {
     pub(crate) runtime: Arc<Runtime>,
     scheduler_tx: Sender<ScheduledTask>,
     scheduler_rx: Receiver<ScheduledTask>,
-    handles_ready: Mutex<VecDeque<TBoxedHandle>>,
     counter_ready: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
     stopping: Arc<atomic::AtomicBool>,
@@ -269,12 +268,12 @@ impl TEventLoop {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create Tokio runtime: {}", e)))?;
 
         let (scheduler_tx, scheduler_rx) = async_channel::unbounded::<ScheduledTask>();
+        let (signal_socket_tx, signal_socket_rx) = async_channel::unbounded::<u8>();
 
         Ok(Self {
             runtime: Arc::new(runtime),
             scheduler_tx,
             scheduler_rx,
-            handles_ready: Mutex::new(VecDeque::with_capacity(128)),
             counter_ready: atomic::AtomicUsize::new(0),
             closed: atomic::AtomicBool::new(false),
             stopping: Arc::new(atomic::AtomicBool::new(false)),
@@ -283,8 +282,8 @@ impl TEventLoop {
             exception_handler: Arc::new(RwLock::new(py.None())),
             _base_ctx: copy_context(py),
             // Initialize signal handling fields
-            signal_socket_rx: Arc::new(Mutex::new(None)),
-            signal_socket_tx: Arc::new(Mutex::new(None)),
+            signal_socket_rx: signal_socket_rx,
+            signal_socket_tx: signal_socket_tx,
             sig_listening: Arc::new(atomic::AtomicBool::new(false)),
             sig_handlers: Arc::new(papaya::HashMap::new()),
             // I/O handling fields for future tokio integration
@@ -361,8 +360,7 @@ impl TEventLoop {
         let _scheduler_tx = self.scheduler_tx.clone();
 
         // Get signal socket references for use in the async task
-        let signal_socket_rx = Arc::clone(&self.signal_socket_rx);
-        let signal_socket_tx = Arc::clone(&self.signal_socket_tx);
+        let signal_socket_rx = self.signal_socket_rx.clone();
         let sig_listening_clone = Arc::clone(&self.sig_listening);
 
         // Release GIL to allow tokio tasks to acquire it
@@ -432,30 +430,50 @@ impl TEventLoop {
                         // Signal socket reading
                         sig = signal_socket_rx.recv() => {
                             if let Ok(signal_num) = sig {
-                                log::debug!("Received signal: {}", signal_num);
+                                log::trace!("Processing signal: {}", signal_num);
 
-                                // Process signals received from Python
-                                Python::attach(|py| {
-                                    match py.check_signals() {
-                                        Ok(()) => {
-                                            log::debug!("PyO3 signals processed successfully");
-                                        }
-                                        Err(e) => {
-                                            log::warn!("Signal processing failed: {:?}", e);
-                                            // Check if this is a critical signal that should stop the loop
-                                            if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) ||
-                                               e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
-                                                log::info!("Critical signal received, stopping event loop");
-                                                stopping_clone.store(true, atomic::Ordering::Release);
-                                            }
-                                        }
+                                let signal_name = match signal_num {
+                                    1 => "SIGHUP",
+                                    2 => "SIGINT",
+                                    3 => "SIGQUIT",
+                                    6 => "SIGABRT",
+                                    8 => "SIGFPE",
+                                    9 => "SIGKILL",
+                                    10 => "SIGUSR1",
+                                    11 => "SIGSEGV",
+                                    12 => "SIGUSR2",
+                                    13 => "SIGPIPE",
+                                    14 => "SIGALRM",
+                                    15 => "SIGTERM",
+                                    17 => "SIGCHLD",
+                                    18 => "SIGCONT",
+                                    19 => "SIGSTOP",
+                                    20 => "SIGTSTP",
+                                    21 => "SIGTTIN",
+                                    22 => "SIGTTOU",
+                                    _ => "UNKNOWN",
+                                };
+                                log::debug!("Signal received: {} ({})", signal_num, signal_name);
+
+                                // Auto-stop on termination signals
+                                match signal_num {
+                                    2 | 15 => {  // SIGINT or SIGTERM
+                                        log::info!("Termination signal {} ({}) received, stopping event loop", signal_num, signal_name);
+                                        stopping_clone.store(true, atomic::Ordering::Release);
                                     }
-                                });
+                                    _ => {
+                                        // Other signals are handled by PyO3 signal processing
+                                    }
+                                }
                             } else {
                                 log::debug!("Signal channel closed");
                                 break;
                             }
-                        }, if sig_listening_clone.load(atomic::Ordering::Acquire) => {}
+                            if !sig_listening_clone.load(atomic::Ordering::Acquire) {
+                                log::debug!("Signal listening flag turned down");
+                                break;
+                            }
+                        }
 
                         // Default case when no timers
                         _ = async {
@@ -799,30 +817,49 @@ impl TEventLoop {
         // Spawn a background task to handle signal socket reading
         let runtime = self.runtime.clone();
         let signal_socket_tx = self.signal_socket_tx.clone();
-        let sig_listening = Arc::clone(&self.sig_listening);
-        let stopping_clone = Arc::clone(&self.stopping);
+        let sig_listening = self.sig_listening.clone();
+        let stopping_clone = self.stopping.clone();
 
         runtime.spawn(async move {
-            // Convert raw file descriptors to tokio UnixStream inside the runtime
+            // Duplicate file descriptors before converting to UnixStream to avoid IO safety violations
+            let fd_r_dup = unsafe { libc::dup(fd_r as i32) };
+            let fd_w_dup = unsafe { libc::dup(fd_w as i32) };
+
+            if fd_r_dup == -1 {
+                log::error!("Failed to duplicate signal socket RX file descriptor");
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to duplicate signal socket RX file descriptor: {}", std::io::Error::last_os_error())
+                ));
+            }
+
+            if fd_w_dup == -1 {
+                log::error!("Failed to duplicate signal socket TX file descriptor");
+                unsafe { libc::close(fd_r_dup); }
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to duplicate signal socket TX file descriptor: {}", std::io::Error::last_os_error())
+                ));
+            }
+
+            // Convert duplicated file descriptors to tokio UnixStream inside the runtime
             let std_socket_r = unsafe {
-                std::os::unix::net::UnixStream::from_raw_fd(fd_r as i32)
+                std::os::unix::net::UnixStream::from_raw_fd(fd_r_dup)
             };
             let std_socket_w = unsafe {
-                std::os::unix::net::UnixStream::from_raw_fd(fd_w as i32)
+                std::os::unix::net::UnixStream::from_raw_fd(fd_w_dup)
             };
 
             let tokio_socket_r = match UnixStream::from_std(std_socket_r) {
                 Ok(socket) => socket,
                 Err(e) => {
                     log::error!("Failed to convert signal socket RX to tokio: {}", e);
-                    return;
+                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to convert signal socket RX to tokio: {}", e)));
                 }
             };
             let tokio_socket_w = match UnixStream::from_std(std_socket_w) {
                 Ok(socket) => socket,
                 Err(e) => {
                     log::error!("Failed to convert signal socket TX to tokio: {}", e);
-                    return;
+                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to convert signal socket TX to tokio: {}", e)));
                 }
             };
 
@@ -836,14 +873,21 @@ impl TEventLoop {
                 // Wait for the socket to be readable
                 if tokio_socket_r.readable().await.is_err() {
                     log::debug!("Signal socket not ready.");
+                    tokio::time::sleep(Duration::from_micros(1)).await;
                     continue;
                 }
+
+                if !sig_listening.load(atomic::Ordering::Acquire) {
+                    log::debug!("Signal listening flag turned down");
+                    return Ok(());
+                };
 
                 // Try to read from the socket
                 let result = tokio_socket_r.try_read(&mut buf);
 
                 match result {
                     Ok(n) if n > 0 => {
+                        log::debug!("Received signals: {} signals", n);
                         // Process signals received from Python
                         Python::attach(|py| {
                             match py.check_signals() {
@@ -865,44 +909,18 @@ impl TEventLoop {
                         // Trace individual signals from the buffer
                         for i in 0..n {
                             let signal_num = buf[i];
-                            let signal_name = match signal_num {
-                                1 => "SIGHUP",
-                                2 => "SIGINT",
-                                3 => "SIGQUIT",
-                                6 => "SIGABRT",
-                                8 => "SIGFPE",
-                                9 => "SIGKILL",
-                                10 => "SIGUSR1",
-                                11 => "SIGSEGV",
-                                12 => "SIGUSR2",
-                                13 => "SIGPIPE",
-                                14 => "SIGALRM",
-                                15 => "SIGTERM",
-                                17 => "SIGCHLD",
-                                18 => "SIGCONT",
-                                19 => "SIGSTOP",
-                                20 => "SIGTSTP",
-                                21 => "SIGTTIN",
-                                22 => "SIGTTOU",
-                                _ => "UNKNOWN",
-                            };
-                            log::debug!("Signal received: {} ({})", signal_num, signal_name);
+                            log::trace!("Received signal: {}", signal_num);
 
-                            // Auto-stop on termination signals
-                            match signal_num {
-                                2 | 15 => {  // SIGINT or SIGTERM
-                                    log::info!("Termination signal {} ({}) received, stopping event loop", signal_num, signal_name);
-                                    stopping_clone.store(true, atomic::Ordering::Release);
-                                }
-                                _ => {
-                                    // Other signals are handled by PyO3 signal processing
-                                }
-                            }
+                            let is_sent = signal_socket_tx.send(signal_num).await;
+                            if is_sent.is_err() {
+                                log::debug!("Signal channel closed, stopping signal reading task");
+                                return Ok(());
+                            };
                         }
                     }
                     Ok(_) => {
                         log::debug!("Signal socket closed, stopping signal reading task");
-                        break;
+                        return Ok(());
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         log::trace!("Signal socket WouldBlock");
@@ -915,6 +933,7 @@ impl TEventLoop {
                 }
             }
         });
+        Ok(())
     }
 
     fn _ssock_del(&self, fd_r: usize) -> PyResult<()> {
