@@ -282,8 +282,8 @@ impl TEventLoop {
             exception_handler: Arc::new(RwLock::new(py.None())),
             _base_ctx: copy_context(py),
             // Initialize signal handling fields
-            signal_socket_rx: signal_socket_rx,
-            signal_socket_tx: signal_socket_tx,
+            signal_socket_rx,
+            signal_socket_tx,
             sig_listening: Arc::new(atomic::AtomicBool::new(false)),
             sig_handlers: Arc::new(papaya::HashMap::new()),
             // I/O handling fields for future tokio integration
