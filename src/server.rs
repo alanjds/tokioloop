@@ -5,12 +5,19 @@ use crate::{
     event_loop::EventLoop,
     tcp::TCPServer,
     tokio_event_loop::TEventLoop,
+    tokio_tcp::{TokioTCPServer, TokioTCPServerRef},
 };
 
 enum ServerType {
     TCP(TCPServer),
     // UDP,
     // Unix,
+}
+
+enum TServerType {
+    TokioTCP(TokioTCPServerRef),
+    // TokioUDP,
+    // TokioUnix,
 }
 
 #[pyclass(frozen, module = "rloop._rloop")]
@@ -33,7 +40,7 @@ pub(crate) struct TokioServer {
     _sockets: Py<PyAny>,
     closed: atomic::AtomicBool,
     serving: atomic::AtomicBool,
-    servers: Vec<ServerType>,
+    servers: Vec<TServerType>,
 }
 
 impl Server {
@@ -53,8 +60,8 @@ impl Server {
 }
 
 impl TokioServer {
-    pub(crate) fn tcp(event_loop: Py<TEventLoop>, sockets: Py<PyAny>, servers: Vec<TCPServer>) -> Self {
-        let srv: Vec<ServerType> = servers.into_iter().map(ServerType::TCP).collect();
+    pub(crate) fn tcp(event_loop: Py<TEventLoop>, sockets: Py<PyAny>, servers: Vec<TokioTCPServerRef>) -> Self {
+        let srv: Vec<TServerType> = servers.into_iter().map(TServerType::TokioTCP).collect();
 
         Self {
             _loop: event_loop,
@@ -151,10 +158,19 @@ impl Server {
 #[pymethods]
 impl TokioServer {
     fn _start_serving(&self, py: Python) -> PyResult<()> {
-        // For now, just mark as serving without actually starting listeners
-        // This is a mock implementation to make tests pass
-        log::debug!("TokioServer::_start_serving called - mock implementation");
+        log::trace!("TokioServer::_start_serving called");
+
+        for server in &self.servers {
+            match server {
+                TServerType::TokioTCP(inner) => {
+                    log::debug!("Starting TokioTCP server");
+                    inner.start_listening(py)?;
+                }
+            }
+        }
+
         self.serving.store(true, atomic::Ordering::Release);
+        log::trace!("TokioServer::_start_serving completed successfully");
         Ok(())
     }
 
@@ -168,18 +184,38 @@ impl TokioServer {
             .compare_exchange(false, true, atomic::Ordering::Release, atomic::Ordering::Relaxed)
             .is_ok()
         {
-            // Mock close - just mark as closed
-            log::debug!("TokioServer::_close called - mock implementation");
+            log::trace!("TokioServer::_close called");
+            for server in &self.servers {
+                match server {
+                    TServerType::TokioTCP(inner) => {
+                        inner.close(py);
+                    }
+                }
+            }
         }
         self.serving.store(false, atomic::Ordering::Release);
     }
 
     fn _streams_close(&self, py: Python) {
-        log::debug!("TokioServer::_streams_close called - mock implementation");
+        log::debug!("TokioServer::_streams_close called");
+        for server in &self.servers {
+            match server {
+                TServerType::TokioTCP(inner) => {
+                    inner.close(py);
+                }
+            }
+        }
     }
 
     fn _streams_abort(&self, py: Python) {
-        log::debug!("TokioServer::_streams_abort called - mock implementation");
+        log::debug!("TokioServer::_streams_abort called");
+        for server in &self.servers {
+            match server {
+                TServerType::TokioTCP(inner) => {
+                    inner.close(py);
+                }
+            }
+        }
     }
 }
 

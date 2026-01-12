@@ -129,17 +129,44 @@ impl TokioTCPTransport {
     }
 
     fn start_io_tasks(&self, py: Python, state: Arc<Mutex<TokioTCPTransportState>>) -> PyResult<()> {
-        // For now, implement a simplified version that doesn't spawn separate tasks
-        // This avoids the thread safety issues while still providing basic functionality
-        log::debug!("TokioTCPTransport::start_io_tasks called - simplified implementation");
+        log::debug!("TokioTCPTransport::start_io_tasks called - spawning mock async I/O tasks");
 
-        // Store the state and protocol for later use
-        {
-            let mut state = state.lock().unwrap();
-            // Initialize any necessary state here
-        }
+        // Mock implementation - just spawn tasks that don't do anything for now
+        let runtime = self.pyloop.get().runtime.clone();
+        let protocol = self.protocol.clone_ref(py);
+        let state_clone = state.clone();
+
+        // Spawn read task (mock)
+        let read_handle = runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        // Spawn write task (mock)
+        let state_write = state.clone();
+        let pyloop_clone = self.pyloop.clone_ref(py);
+        let write_handle = runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
 
         Ok(())
+    }
+
+    async fn read_task(
+        state: Arc<Mutex<TokioTCPTransportState>>,
+        protocol: Py<PyAny>,
+    ) {
+        log::debug!("TokioTCPTransport::read_task started (mock)");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        log::debug!("Read task ended (mock)");
+    }
+
+    async fn write_task(
+        state: Arc<Mutex<TokioTCPTransportState>>,
+        _pyloop: Py<TEventLoop>,
+    ) {
+        log::debug!("TokioTCPTransport::write_task started (mock)");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        log::debug!("Write task ended (mock)");
     }
 }
 
@@ -457,11 +484,8 @@ impl TokioTCPServer {
     pub fn fd(&self) -> usize {
         self.listener.as_ref().unwrap().as_raw_fd() as usize
     }
-}
 
-#[pymethods]
-impl TokioTCPServer {
-    fn close(&self, py: Python) {
+    pub fn close(&self, py: Python) {
         if self.closed.compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_err() {
             return;
         }

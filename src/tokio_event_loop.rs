@@ -14,10 +14,10 @@ use async_channel::{Sender, Receiver};
 
 use crate::{
     tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle},
-    py::copy_context,
+    py::{copy_context, run_in_ctx, run_in_ctx0, run_in_ctx1},
     log::{LogExc, log_exc_to_py_ctx},
     server::TokioServer,
-    tokio_tcp::TokioTCPServer,
+    tokio_tcp::{TokioTCPServer, TokioTCPServerRef},
 };
 use pyo3::IntoPyObjectExt;
 use socket2::Socket;
@@ -753,10 +753,7 @@ impl TEventLoop {
 
             // Start listening for connections
             server.start_listening(py)?;
-
-            // Create a TCPServer wrapper for the TokioTCPServer
-            let tcp_server = crate::tcp::TCPServer::from_fd(fd, family, backlog, protocol_factory.clone_ref(py));
-            servers.push(tcp_server);
+            servers.push(server);
         }
 
         // Create TokioServer with the TCP servers
@@ -813,7 +810,7 @@ impl TEventLoop {
         Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>("TokioEventLoop::_udp_conn not yet implemented"))
     }
 
-    fn _sig_add(&self, py: Python, sig: u8, callback: Py<PyAny>, args: Py<PyAny>, context: Py<PyAny>) {
+    fn _sig_add(&self, py: Python, sig: u8, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) {
         // TODO: Implement tokio-based signal handling
         // This may need special handling as tokio signal handling is different
         log::debug!("TokioEventLoop::_sig_add called with sig: {} - not yet implemented", sig);
