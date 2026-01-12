@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import logging
 import socket
 
 import pytest
@@ -9,6 +10,7 @@ from rloop.utils import _HAS_IPv6
 from . import BaseProto
 
 
+logger = logging.getLogger(__name__)
 _SIZE = 1024 * 1000
 
 
@@ -59,6 +61,7 @@ def test_tcp_server_recv_send(loop):
         with sock:
             sock.bind(('127.0.0.1', 0))
             addr = sock.getsockname()
+            logger.info('Socket opened on: %r', addr)
             srv = await loop.create_server(lambda: proto, sock=sock)
             fut = loop.run_in_executor(None, client, addr)
             await fut
