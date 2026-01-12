@@ -783,9 +783,19 @@ impl TEventLoop {
     }
 
     fn _tcp_stream_bound(&self, fd: usize) -> bool {
-        // TODO: Implement tokio-based TCP stream bound check
-        log::debug!("TokioEventLoop::_tcp_stream_bound called - not yet implemented");
-        false
+        log::debug!("TokioEventLoop::_tcp_stream_bound called for fd: {}", fd);
+
+        // Check if we have any I/O callbacks registered for this fd
+        let callbacks = self.io_callbacks.pin();
+        if let Some((reader_cb, writer_cb, _ctx)) = callbacks.get(&fd) {
+            // If we have callbacks registered, it's considered "bound"
+            // to the event loop system - use Python::attach to get a py context
+            Python::attach(|py| {
+                !(reader_cb.is_none(py)) || !(writer_cb.is_none(py))
+            })
+        } else {
+            false
+        }
     }
 
     fn _udp_conn(
