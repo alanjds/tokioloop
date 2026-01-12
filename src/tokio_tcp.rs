@@ -364,7 +364,7 @@ impl TokioTCPServer {
             pyloop,
             transports: Arc::new(Mutex::new(Vec::new())),
             closed: Arc::new(false.into()),
-            socks: Python::with_gil(|py| py.None()),
+            socks: Python::attach(|py| py.None()),
             transports_py: Vec::new(),
         });
 
@@ -401,7 +401,7 @@ impl TokioTCPServer {
                     Ok((stream, addr)) => {
                         log::debug!("TokioTCPServer: New connection accepted from {}", addr);
 
-                        Python::with_gil(|py| {
+                        Python::attach(|py| {
                             let server = TokioTCPServer {
                                 listener: Some(listener.clone()),
                                 protocol_factory: protocol_factory.clone_ref(py),
@@ -469,10 +469,10 @@ impl TokioTCPServer {
             lfd: Some(self.listener.as_ref().unwrap().as_raw_fd() as usize),
         };
 
-        let pytransport = Python::with_gil(|py| Py::new(py, transport).unwrap());
+        let pytransport = Python::attach(|py| Py::new(py, transport).unwrap());
 
         // Create a dummy handle for now
-        let handle = Python::with_gil(|py| {
+        let handle = Python::attach(|py| {
             let cb_handle = crate::handles::CBHandle::new0(py.None(), py.None());
             Box::new(Py::new(py, cb_handle).unwrap())
         });
