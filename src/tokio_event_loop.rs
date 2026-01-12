@@ -491,15 +491,10 @@ impl TEventLoop {
                                     // Execute Python callback in GIL
                                     log::trace!("PyO3: attaching Python to run the task");
                                     Python::attach(|py| {
-                                        // if let Err(e) = std::panic::catch_unwind(|| {
-                                            log::debug!("Executing handle in tokio context");
-                                        //
-                                        //     // Execute the handle with proper context
-                                            let _ = handle.run(py, &handlers, &state);
-                                            log::debug!("Handle execution completed");
-                                        // }) {
-                                        //   log::error!("Panic during handle execution: {:?}", e);
-                                        // }
+                                        log::debug!("Executing handle in tokio context");
+                                        // Execute the handle with proper context
+                                        let _ = handle.run(py, &handlers, &state);
+                                        log::debug!("Handle execution completed");
                                     });
                                 }
                             } else {
