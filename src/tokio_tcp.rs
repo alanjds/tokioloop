@@ -24,12 +24,13 @@ use crate::{
 
 /// Internal state management for tokio TCP connections
 pub(crate) struct TokioTCPTransportState {
-    stream: TcpStream,
+    stream: Option<TcpStream>,
     read_buf: Vec<u8>,
     write_buf: VecDeque<Vec<u8>>,
     closing: bool,
     weof: bool,
     paused: bool,
+    io_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Main transport class implementing asyncio transport interface
@@ -67,12 +68,13 @@ impl TokioTCPTransport {
         let protocol = protocol_factory.call0(py)?;
 
         let state = Arc::new(Mutex::new(TokioTCPTransportState {
-            stream: tokio_stream,
+            stream: Some(tokio_stream),
             read_buf: Vec::with_capacity(8192),
             write_buf: VecDeque::new(),
             closing: false,
             weof: false,
             paused: false,
+            io_task: None,
         }));
 
         let transport = Self {
@@ -92,8 +94,143 @@ impl TokioTCPTransport {
 
     pub fn attach(transport: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
         let rself = transport.borrow(py);
+
+        // Start the I/O processing task
+        Self::start_io_task(transport, py)?;
+
         rself.protocol.call_method1(py, pyo3::intern!(py, "connection_made"), (transport.clone_ref(py),))?;
         Ok(rself.protocol.clone_ref(py))
+    }
+
+    fn start_io_task(transport: &Py<Self>, py: Python) -> PyResult<()> {
+        let transport_clone = transport.clone_ref(py);
+        let protocol = transport.borrow(py).protocol.clone_ref(py);
+        let pyloop = transport.borrow(py).pyloop.clone_ref(py);
+        let state = transport.borrow(py).state.clone();
+
+        let runtime = pyloop.get().runtime.clone();
+
+        // Spawn the I/O processing task
+        let state_clone = state.clone();
+        let io_task = runtime.spawn(async move {
+            Self::io_processing_loop(transport_clone, state_clone, protocol).await;
+        });
+
+        // Store the task handle
+        {
+            let mut state_lock = state.lock().unwrap();
+            state_lock.io_task = Some(io_task);
+        }
+
+        Ok(())
+    }
+
+    async fn io_processing_loop(
+        transport: Py<TokioTCPTransport>,
+        state: Arc<Mutex<TokioTCPTransportState>>,
+        protocol: Py<PyAny>,
+    ) {
+        let mut read_buf = [0u8; 8192];
+
+        // Extract the stream and split it for reading and writing
+        let stream_opt = {
+            let mut state_lock = state.lock().unwrap();
+            std::mem::take(&mut state_lock.stream)
+        };
+
+        let Some(stream) = stream_opt else {
+            log::error!("No stream available for I/O processing");
+            return;
+        };
+
+        let (mut reader, mut writer) = tokio::io::split(stream);
+
+        loop {
+            // Check if we should stop
+            let (should_stop, is_paused, has_writes) = {
+                let state_lock = state.lock().unwrap();
+                (state_lock.closing, state_lock.paused, !state_lock.write_buf.is_empty())
+            };
+
+            if should_stop {
+                break;
+            }
+
+            // If paused, just wait then recheck (loop)
+            if is_paused {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+
+            tokio::select! {
+                // Handle reading
+                result = reader.read(&mut read_buf) => {
+                    match result {
+                        Ok(0) => {
+                            // EOF received
+                            log::debug!("TCP connection EOF received");
+                            Python::attach(|py| {
+                                let _ = protocol.call_method1(py, pyo3::intern!(py, "eof_received"), ());
+                            });
+                            break;
+                        }
+                        Ok(n) => {
+                            // Data received, forward to protocol
+                            let data = read_buf[..n].to_vec();
+                            Python::attach(|py| {
+                                let _ = protocol.call_method1(
+                                    py,
+                                    pyo3::intern!(py, "data_received"),
+                                    (PyBytes::new(py, &data),)
+                                );
+                            });
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // No data available, continue
+                        }
+                        Err(e) => {
+                            log::error!("TCP read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+
+                // Handle writing
+                _ = async {
+                    let write_data = {
+                        let mut state_lock = state.lock().unwrap();
+                        if !state_lock.write_buf.is_empty() {
+                            Some(state_lock.write_buf.pop_front().unwrap_or_default())
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(data) = write_data {
+                        if let Err(e) = writer.write_all(&data).await {
+                            log::error!("TCP write error: {}", e);
+                        } else {
+                            log::debug!("TCP wrote {} bytes", data.len());
+                            // Flush the data
+                            if let Err(e) = writer.flush().await {
+                                log::error!("TCP flush error: {}", e);
+                            }
+                        }
+                    }
+                }, if has_writes => {}
+
+                // Prevent a busy loop
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+        }
+
+        log::debug!("Prepare to call connection_lost on TCP");
+        // Clean up and call connection_lost
+        Python::attach(|py| {
+            let transport_ref = transport.borrow(py);
+            transport_ref.call_connection_lost(py, None);
+        });
+        log::debug!("Called connection_lost on TCP");
     }
 
     #[inline]
@@ -104,7 +241,7 @@ impl TokioTCPTransport {
     #[inline]
     pub fn get_local_addr(&self) -> Result<String> {
         let state = self.state.lock().unwrap();
-        let local_addr = state.stream.local_addr()
+        let local_addr = state.stream.as_ref().unwrap().local_addr()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(local_addr.to_string())
     }
@@ -112,7 +249,7 @@ impl TokioTCPTransport {
     #[inline]
     pub fn get_remote_addr(&self) -> Result<String> {
         let state = self.state.lock().unwrap();
-        let peer_addr = state.stream.peer_addr()
+        let peer_addr = state.stream.as_ref().unwrap().peer_addr()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(peer_addr.to_string())
     }
@@ -338,12 +475,13 @@ impl TokioTCPServer {
         let transport = TokioTCPTransport {
             fd: stream.as_raw_fd() as usize,
             state: Arc::new(Mutex::new(TokioTCPTransportState {
-                stream,
+                stream: Some(stream),
                 read_buf: Vec::with_capacity(8192),
                 write_buf: VecDeque::new(),
                 closing: false,
                 weof: false,
                 paused: false,
+                io_task: None,
             })),
             pyloop: pyloop.clone_ref(py),
             protocol: protocol.clone_ref(py),

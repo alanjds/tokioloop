@@ -18,7 +18,7 @@ class BaseProto(asyncio.Protocol):
 
     def __repr__(self) -> str:
         kind = self.__class__.__name__
-        return f'{kind}(state={self.state} transport={self.transport})'
+        return f'{kind}(state={self.state} transport={self.transport.__class__.__name__})'
 
     def _assert_state(self, *expected):
         if self.state not in expected:
@@ -31,7 +31,7 @@ class BaseProto(asyncio.Protocol):
         self.state = 'CONNECTED'
 
     def data_received(self, data):
-        logger.info('Date received by %r', self)
+        logger.debug('Data received by %r', self)
         self._assert_state('CONNECTED')
 
     def eof_received(self):
