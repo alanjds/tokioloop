@@ -25,18 +25,22 @@ class BaseProto(asyncio.Protocol):
             raise AssertionError(f'state: {self.state!r}, expected: {expected!r}')
 
     def connection_made(self, transport):
+        logger.info('Connection made to %r', self)
         self.transport = transport
         self._assert_state('INITIAL')
         self.state = 'CONNECTED'
 
     def data_received(self, data):
+        logger.info('Date received by %r', self)
         self._assert_state('CONNECTED')
 
     def eof_received(self):
+        logger.info('EOS received by %r', self)
         self._assert_state('CONNECTED')
         self.state = 'EOF'
 
     def connection_lost(self, exc):
+        logger.info('Connection lost by %r', self)
         self._assert_state('CONNECTED', 'EOF')
         self.transport = None
         self.state = 'CLOSED'
