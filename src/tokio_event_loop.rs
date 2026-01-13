@@ -18,6 +18,7 @@ use crate::{
     log::{LogExc, log_exc_to_py_ctx},
     server::TokioServer,
     tokio_tcp::{TokioTCPServer, TokioTCPServerRef},
+    event_loop::{TEventLoop as TokioEventLoop},
 };
 use pyo3::IntoPyObjectExt;
 use socket2::Socket;
@@ -55,6 +56,12 @@ impl Ord for TokioTimer {
         // Reverse for min-heap behavior (earliest time first)
         other.when.cmp(&self.when)
     }
+}
+
+struct PyHandleData {
+    interest: Interest,
+    cbr: Option<Py<crate::tokio_handles::TCBHandle>>,
+    cbw: Option<Py<crate::tokio_handles::TCBHandle>>,
 }
 
 enum ScheduledTask {
@@ -363,6 +370,12 @@ impl TEventLoop {
         let signal_socket_rx = self.signal_socket_rx.clone();
         let sig_listening_clone = Arc::clone(&self.sig_listening);
 
+        // Set this event loop as the running loop in asyncio
+        // This is crucial for asyncio.start_server and other asyncio functions to work
+        let asyncio = py.import("asyncio.events")?;
+        let _set_running_loop = asyncio.getattr("_set_running_loop")?;
+        _set_running_loop.call1((self.clone().into_py(py),))?;
+
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
             // Main tokio task
@@ -514,22 +527,31 @@ impl TEventLoop {
             });
 
             // Block until completion
-            match runtime.block_on(task_handle) {
+            let result = match runtime.block_on(task_handle) {
                 Ok(Ok(())) => {
                     log::info!("Tokio event loop completed successfully");
-                    return Ok(());
+                    Ok(())
                 }
                 Ok(Err(e)) => {
                     log::error!("Tokio event loop task failed with PyErr: {:?}", e);
-                    return Err(e);
+                    Err(e)
                 }
                 Err(e) => {
                     log::error!("Tokio event loop task failed with JoinError: {:?}", e);
-                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                         format!("Tokio event loop failed: {:?}", e)
-                    ));
+                    ))
                 }
             };
+
+            // Clear the running loop after the event loop stops
+            Python::attach(|py| {
+                let asyncio = py.import("asyncio.events")?;
+                let _clear_running_loop = asyncio.getattr("_clear_running_loop")?;
+                let _ = _clear_running_loop.call0()?;
+            });
+
+            result
         })
     }
 
