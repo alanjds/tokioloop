@@ -752,7 +752,7 @@ impl TEventLoop {
             )?;
 
             // Start listening for connections
-            server.start_listening(py)?;
+            TokioTCPServer::start_listening(server.clone(), py)?;
             servers.push(server);
         }
 

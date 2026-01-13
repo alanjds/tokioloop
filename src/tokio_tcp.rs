@@ -87,9 +87,6 @@ impl TokioTCPTransport {
             lfd: None,
         };
 
-        // Start async I/O tasks
-        transport.start_io_tasks(py, state.clone())?;
-
         Ok(transport)
     }
 
@@ -126,47 +123,6 @@ impl TokioTCPTransport {
             None => py.None(),
         };
         let _ = self.protocol.call_method1(py, pyo3::intern!(py, "connection_lost"), (err_arg,));
-    }
-
-    fn start_io_tasks(&self, py: Python, state: Arc<Mutex<TokioTCPTransportState>>) -> PyResult<()> {
-        log::debug!("TokioTCPTransport::start_io_tasks called - spawning mock async I/O tasks");
-
-        // Mock implementation - just spawn tasks that don't do anything for now
-        let runtime = self.pyloop.get().runtime.clone();
-        let protocol = self.protocol.clone_ref(py);
-        let state_clone = state.clone();
-
-        // Spawn read task (mock)
-        let read_handle = runtime.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-
-        // Spawn write task (mock)
-        let state_write = state.clone();
-        let pyloop_clone = self.pyloop.clone_ref(py);
-        let write_handle = runtime.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        });
-
-        Ok(())
-    }
-
-    async fn read_task(
-        state: Arc<Mutex<TokioTCPTransportState>>,
-        protocol: Py<PyAny>,
-    ) {
-        log::debug!("TokioTCPTransport::read_task started (mock)");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        log::debug!("Read task ended (mock)");
-    }
-
-    async fn write_task(
-        state: Arc<Mutex<TokioTCPTransportState>>,
-        _pyloop: Py<TEventLoop>,
-    ) {
-        log::debug!("TokioTCPTransport::write_task started (mock)");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        log::debug!("Write task ended (mock)");
     }
 }
 
@@ -324,7 +280,7 @@ impl TokioTCPTransport {
 /// Server implementation using tokio::net::TcpListener
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub(crate) struct TokioTCPServer {
-    listener: Option<Arc<TcpListener>>,
+    listener: Option<TcpListener>,
     protocol_factory: Py<PyAny>,
     pyloop: Py<TEventLoop>,
     transports: Arc<Mutex<Vec<Py<TokioTCPTransport>>>>,
@@ -356,10 +312,10 @@ impl TokioTCPServer {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to convert socket2 to tokio listener: {}", e)))?;
 
         log::debug!("TokioTCPServer::from_fd: Tokio listener created successfully");
-        log::debug!("TokioTCPServer::from_fd: Listener local address: {:?}", tokio_listener.local_addr());
+        log::debug!("TokioTCPServer::from_fd: Will serve on the address: {:?}", tokio_listener.local_addr());
 
         let server = Arc::new(Self {
-            listener: Some(Arc::new(tokio_listener)),
+            listener: Some(tokio_listener),
             protocol_factory,
             pyloop,
             transports: Arc::new(Mutex::new(Vec::new())),
@@ -371,113 +327,36 @@ impl TokioTCPServer {
         Ok(server)
     }
 
-    pub fn start_listening(&self, py: Python) -> PyResult<()> {
-        let listener = self.listener.as_ref().unwrap().clone();
-        let protocol_factory = self.protocol_factory.clone_ref(py);
-        let pyloop = self.pyloop.clone_ref(py);
-        let transports = self.transports.clone();
-        let closed = self.closed.clone();
-
-        let runtime = pyloop.get().runtime.clone();
-
-        // Add debug information about the listener
-        log::debug!("TokioTCPServer: Starting listener loop");
-        log::debug!("TokioTCPServer: Listener local address: {:?}", listener.local_addr());
-
-        runtime.spawn(async move {
-            log::debug!("TokioTCPServer: Listener task started");
-
-            loop {
-                // Check if server is closed by checking the closed flag
-                let is_closed = closed.load(atomic::Ordering::Relaxed);
-
-                if is_closed {
-                    log::debug!("TokioTCPServer: Server closed, stopping listener loop");
-                    break;
-                }
-
-                log::debug!("TokioTCPServer: Waiting for connection...");
-                match listener.accept().await {
-                    Ok((stream, addr)) => {
-                        log::debug!("TokioTCPServer: New connection accepted from {}", addr);
-
-                        Python::attach(|py| {
-                            let server = TokioTCPServer {
-                                listener: Some(listener.clone()),
-                                protocol_factory: protocol_factory.clone_ref(py),
-                                pyloop: pyloop.clone_ref(py),
-                                transports: transports.clone(),
-                                closed: Arc::new(AtomicBool::new(false)), // Create new AtomicBool
-                                socks: py.None(),
-                                transports_py: Vec::new(),
-                            };
-
-                            let (transport, _handle) = server.new_stream(py, stream);
-
-                            // Store the transport
-                            {
-                                let mut transports_lock = transports.lock().unwrap();
-                                transports_lock.push(transport.clone_ref(py));
-                            }
-
-                            // Attach the protocol
-                            let _ = TokioTCPTransport::attach(&transport, py);
-                        });
-                    }
-                    Err(e) => {
-                        log::error!("TokioTCPServer: Error accepting connection: {}", e);
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                        // Continue listening
-                    }
-                }
-            }
-
-            log::debug!("TokioTCPServer: Listener loop stopped");
-        });
-
-        Ok(())
-    }
-
-    pub fn new_stream(
-        &self,
+    pub fn create_transport_from_stream(
         py: Python,
+        pyloop: &Py<TEventLoop>,
         stream: TcpStream,
-    ) -> (Py<TokioTCPTransport>, BoxedHandle) {
-        let protocol = self.protocol_factory.call0(py).unwrap();
-
-        // Get the file descriptor from the stream
-        let fd = stream.as_raw_fd() as usize;
-
-        let state = Arc::new(Mutex::new(TokioTCPTransportState {
-            stream,
-            read_buf: Vec::with_capacity(8192),
-            write_buf: VecDeque::new(),
-            closing: false,
-            weof: false,
-            paused: false,
-        }));
+        protocol_factory: Py<PyAny>,
+    ) -> PyResult<Py<TokioTCPTransport>> {
+        let protocol = protocol_factory.call0(py)?;
 
         let transport = TokioTCPTransport {
-            fd,
-            state: state.clone(),
-            pyloop: self.pyloop.clone_ref(py),
+            fd: stream.as_raw_fd() as usize,
+            state: Arc::new(Mutex::new(TokioTCPTransportState {
+                stream,
+                read_buf: Vec::with_capacity(8192),
+                write_buf: VecDeque::new(),
+                closing: false,
+                weof: false,
+                paused: false,
+            })),
+            pyloop: pyloop.clone_ref(py),
             protocol: protocol.clone_ref(py),
-            extra: std::collections::HashMap::new(),
+            extra: HashMap::new(),
             closing: false.into(),
             paused: false.into(),
             weof: false.into(),
-            lfd: Some(self.listener.as_ref().unwrap().as_raw_fd() as usize),
+            lfd: None,
         };
 
-        let pytransport = Python::attach(|py| Py::new(py, transport).unwrap());
+        let pytransport = Py::new(py, transport)?;
 
-        // Create a dummy handle for now
-        let handle = Python::attach(|py| {
-            let cb_handle = crate::handles::CBHandle::new0(py.None(), py.None());
-            Box::new(Py::new(py, cb_handle).unwrap())
-        });
-
-        (pytransport, handle)
+        Ok(pytransport)
     }
 
     #[inline]
@@ -506,23 +385,87 @@ fn _try_socket2_conversion(fd: i32, backlog: i32) -> Result<socket2::Socket, PyE
     use socket2::{Socket, Domain, Type};
 
     log::trace!("Socket conversion via socket2: fd={}", fd);
-
     // Convert fd to socket2 Socket
     let socket = unsafe { Socket::from_raw_fd(fd) };
-
     // Ensure socket is in correct state
     socket.set_nonblocking(true)
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set socket nonblocking: {}", e)))?;
-
     log::trace!("Socket conversion via socket2 successful");
-
     // Set backlog if socket is not already listening
     if let Err(e) = socket.listen(backlog) {
         log::debug!("Socket conversion: listen failed (might already be listening): {}", e);
         // Don't fail if already listening, just continue
     }
-
     Ok(socket)
+}
+
+impl TokioTCPServer {
+    pub fn start_listening(server: TokioTCPServerRef, py: Python) -> PyResult<()> {
+        let server_clone = server.clone();
+
+        let protocol_factory = server_clone.protocol_factory.clone_ref(py);
+        let pyloop = server_clone.pyloop.clone_ref(py);
+        let transports = server_clone.transports.clone();
+        let closed = server_clone.closed.clone();
+
+        let runtime = pyloop.get().runtime.clone();
+
+        runtime.spawn(async move {
+            log::debug!("TokioTCPServer: Starting listener loop");
+
+            let listener = server_clone.listener.as_ref().unwrap().clone();
+            log::debug!("TokioTCPServer: Will serve on the address: {:?}", listener.local_addr());
+
+            loop {
+                let is_closed = closed.load(atomic::Ordering::Relaxed);
+
+                if is_closed {
+                    log::debug!("TokioTCPServer: Server closed, stopping listener loop");
+                    break;
+                }
+
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        log::debug!("TokioTCPServer: New connection accepted from {}", addr);
+
+                        Python::attach(|py| {
+                            let transport = TokioTCPServer::create_transport_from_stream(
+                                py,
+                                &pyloop,
+                                stream,
+                                protocol_factory.clone_ref(py),
+                            );
+
+                            match transport {
+                                Ok(transport_py) => {
+                                    // Store transport
+                                    {
+                                        let mut transports_lock = transports.lock().unwrap();
+                                        transports_lock.push(transport_py.clone_ref(py));
+                                    }
+
+                                    // Attach protocol
+                                    let _ = TokioTCPTransport::attach(&transport_py, py);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to create transport for connection: {}", e);
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("TokioTCPServer: Error accepting connection: {}", e);
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        // Continue listening
+                    }
+                }
+            }
+
+            log::debug!("TokioTCPServer: Listener loop stopped");
+        });
+
+        Ok(())
+    }
 }
 
 pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {

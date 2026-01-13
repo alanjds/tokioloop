@@ -164,7 +164,7 @@ impl TokioServer {
             match server {
                 TServerType::TokioTCP(inner) => {
                     log::debug!("Starting TokioTCP server");
-                    inner.start_listening(py)?;
+                    TokioTCPServer::start_listening(inner.clone(), py)?;
                 }
             }
         }
