@@ -259,6 +259,7 @@ impl TokioTCPTransport {
             Some(e) => e.into_py_any(py).unwrap_or_else(|_| py.None()),
             None => py.None(),
         };
+        log::trace!("TokioTCPTransport::call_connection_lost calling {}.connection_lost", self.protocol);
         let _ = self.protocol.call_method1(py, pyo3::intern!(py, "connection_lost"), (err_arg,));
     }
 }
@@ -503,6 +504,7 @@ impl TokioTCPServer {
     }
 
     pub fn close(&self, py: Python) {
+        log::trace!("TokioTCPServer::close called");
         if self.closed.compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_err() {
             return;
         }
@@ -510,8 +512,10 @@ impl TokioTCPServer {
         // Close all transports
         let transports = self.transports.lock().unwrap();
         for transport in transports.iter() {
+            log::trace!("TokioTCPServer: closing transport {}", transport);
             let _ = transport.borrow(py).close(py);
         }
+        log::trace!("TokioTCPServer: closed all transports");
     }
 
     fn is_serving(&self) -> bool {
