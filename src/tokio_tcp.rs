@@ -414,7 +414,7 @@ impl TokioTCPServer {
             log::debug!("TokioTCPServer: Starting listener loop");
 
             let listener = server_clone.listener.as_ref().unwrap().clone();
-            log::debug!("TokioTCPServer: Will serve on the address: {:?}", listener.local_addr());
+            log::debug!("TokioTCPServer: Will listen on the address: {:?}", listener.local_addr());
 
             loop {
                 let is_closed = closed.load(atomic::Ordering::Relaxed);
@@ -426,7 +426,7 @@ impl TokioTCPServer {
 
                 match listener.accept().await {
                     Ok((stream, addr)) => {
-                        log::debug!("TokioTCPServer: New connection accepted from {}", addr);
+                        log::debug!("TokioTCPServer: New connection accepted from client on {}", addr);
 
                         Python::attach(|py| {
                             let transport = TokioTCPServer::create_transport_from_stream(
@@ -438,6 +438,7 @@ impl TokioTCPServer {
 
                             match transport {
                                 Ok(transport_py) => {
+                                    log::trace!("Transport created: {}", transport_py);
                                     // Store transport
                                     {
                                         let mut transports_lock = transports.lock().unwrap();
@@ -445,7 +446,10 @@ impl TokioTCPServer {
                                     }
 
                                     // Attach protocol
-                                    let _ = TokioTCPTransport::attach(&transport_py, py);
+                                    match TokioTCPTransport::attach(&transport_py, py) {
+                                        Ok(result) => log::trace!("Transport attached: {}", result),
+                                        Err(e) => log::error!("Transport not attached: {}", e)
+                                    };
                                 }
                                 Err(e) => {
                                     log::error!("Failed to create transport for connection: {}", e);
