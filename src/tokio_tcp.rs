@@ -34,7 +34,7 @@ pub(crate) struct TokioTCPTransportState {
 }
 
 /// Main transport class implementing asyncio transport interface
-#[pyclass(frozen, unsendable, module = "rloop._rloop")]
+#[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct TokioTCPTransport {
     fd: usize,
     state: Arc<Mutex<TokioTCPTransportState>>,
