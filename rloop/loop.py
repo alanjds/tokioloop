@@ -1129,6 +1129,17 @@ class RLoop(_BaseRustLoop, __BaseLoop, __asyncio.AbstractEventLoop):
     pass
 
 
+def _register_tokio_thread(loop):
+    """Register the TokioLoop on the current thread
+
+    As TokioLoop can span coroutines within many threads,
+    asyncio needs a way to know which TokioLoop the coroutine belongs
+    and that TokioLoop is already running on this thread.
+    """
+    _tokioloop_threadlocal.current_loop = loop
+    _tokioloop_registry[threading.get_ident()].add(loop)  # by default, WeakSet.add
+
+
 @functools.wraps(asyncio.events.get_running_loop)
 def _TOKIOLOOP_PATCHED_get_running_loop():
     if hasattr(_tokioloop_threadlocal, 'current_loop'):
@@ -1178,12 +1189,8 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
 
     #: special methods
     def _run_forever_pre(self):
-        # As TokioLoop can span coroutines within many threads,
-        # asyncio needs a way to know which TokioLoop the coro belongs
-        # and that TokioLoop is already running on this thread.
         result = super()._run_forever_pre()
-        _tokioloop_threadlocal.current_loop = self
-        _tokioloop_registry[threading.get_ident()].add(self)  # by default, WeakSet.add
+        _register_tokio_thread(self)
         return result
 
     def _run_forever_post(self, old_agen_hooks):
