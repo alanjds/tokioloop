@@ -521,20 +521,12 @@ impl TEventLoop {
 
                                     // Execute Python callback in GIL
                                     log::trace!("PyO3: attaching Python to run the task");
-                                    Python::attach(|py| -> PyResult<()> {
-                                        let rloop_mod = py.import("rloop.loop")?;
-                                        let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
-                                        let loop_id_clone = loop_id.clone();
-                                        log::trace!("Calling rloop.loop._register_tokio_thread(\"{}\")", loop_id_clone);
-                                        register_fn.call1((loop_id_clone,))?;
-
+                                    Python::attach(|py|{
                                         log::debug!("Executing handle in tokio context");
                                         // Execute the handle with proper context
                                         let _ = handle.run(py, &handlers, &state);
                                         log::debug!("Handle execution completed");
-
-                                        Ok(())
-                                    }).expect("Failed to register tokio thread");
+                                    })
                                 }
                             } else {
                                 log::debug!("Handle channel closed, breaking from select");

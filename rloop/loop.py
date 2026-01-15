@@ -1157,18 +1157,18 @@ def _TOKIOLOOP_PATCHED_get_running_loop():
     try:
         return asyncio.events._ORIGINAL_get_running_loop()
     except RuntimeError:
-        thread_id = threading.get_ident()
-
         if hasattr(_tokioloop_threadlocal, 'current_loop'):
             loop = _tokioloop_threadlocal.current_loop
             if loop and not loop.is_closed():
                 asyncio.events._set_running_loop(loop)
 
-        # elif thread_id in _tokioloop_threads:
-        #     for loop in _tokioloop_threads[thread_id]:
-        #         if loop and not loop.is_closed():
-        #             asyncio.events._set_running_loop(loop)
-        #             break
+        else:
+            thread_id = threading.get_ident()
+            if thread_id in _tokioloop_threads:
+                for loop in _tokioloop_threads[thread_id]:
+                    if loop and not loop.is_closed():
+                        asyncio.events._set_running_loop(loop)
+                        break
 
     # Fall back to original implementation
     try:
