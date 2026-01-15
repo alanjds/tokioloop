@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio as __asyncio
 import asyncio.events
 import errno
@@ -40,7 +42,8 @@ from .utils import _can_use_pidfd, _HAS_IPv6, _interleave_addrinfos, _ipaddr_inf
 logger = logging.getLogger(__name__)
 
 # Active loops by thread
-_tokioloop_registry = defaultdict(weakref.WeakSet)
+_tokioloop_threads = defaultdict(weakref.WeakSet)
+_tokioloop_loops = weakref.WeakValueDictionary()
 _tokioloop_threadlocal = threading.local()  # Running TokioLoop event loops
 
 
@@ -1129,26 +1132,55 @@ class RLoop(_BaseRustLoop, __BaseLoop, __asyncio.AbstractEventLoop):
     pass
 
 
-def _register_tokio_thread(loop):
+def _register_tokio_thread(loop: TokioLoop | str):
     """Register the TokioLoop on the current thread
 
     As TokioLoop can span coroutines within many threads,
     asyncio needs a way to know which TokioLoop the coroutine belongs
     and that TokioLoop is already running on this thread.
     """
-    _tokioloop_threadlocal.current_loop = loop
-    _tokioloop_registry[threading.get_ident()].add(loop)  # by default, WeakSet.add
+    if isinstance(loop, (str, bytes)):
+        loop_id = int(loop, 16)
+        loop_obj: TokioLoop = _tokioloop_loops[loop_id]
+    else:
+        loop_id = id(loop)
+        loop_obj: TokioLoop = loop
+    _tokioloop_loops[loop_id] = loop_obj
+    _tokioloop_threadlocal.current_loop = loop_obj
+    _tokioloop_threads[threading.get_ident()].add(loop_obj)  # by default, WeakSet.add
+
+    logger.info('Current _tokioloop_threadlocal.current_loop set: %s', _tokioloop_threadlocal.current_loop)
 
 
 @functools.wraps(asyncio.events.get_running_loop)
 def _TOKIOLOOP_PATCHED_get_running_loop():
-    if hasattr(_tokioloop_threadlocal, 'current_loop'):
-        loop = _tokioloop_threadlocal.current_loop
-        if loop and not loop.is_closed():
-            return loop
+    try:
+        return asyncio.events._ORIGINAL_get_running_loop()
+    except RuntimeError:
+        thread_id = threading.get_ident()
+
+        if hasattr(_tokioloop_threadlocal, 'current_loop'):
+            loop = _tokioloop_threadlocal.current_loop
+            if loop and not loop.is_closed():
+                asyncio.events._set_running_loop(loop)
+
+        # elif thread_id in _tokioloop_threads:
+        #     for loop in _tokioloop_threads[thread_id]:
+        #         if loop and not loop.is_closed():
+        #             asyncio.events._set_running_loop(loop)
+        #             break
 
     # Fall back to original implementation
-    return asyncio.events._ORIGINAL_get_running_loop()
+    try:
+        return asyncio.events._ORIGINAL_get_running_loop()
+    except Exception:
+        logger.info('Current thread ID: %s', threading.get_ident())
+        logger.info('Current _tokioloop_loops: %s', dict(_tokioloop_loops.items()))
+        logger.info('Current _tokioloop_threads: %s', _tokioloop_threads)
+        logger.info(
+            'Current _tokioloop_threadlocal.current_loop: %s', getattr(_tokioloop_threadlocal, 'current_loop', None)
+        )
+        raise
 
 
 class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
@@ -1195,7 +1227,7 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
 
     def _run_forever_post(self, old_agen_hooks):
         # Clear thread-local registration
-        _tokioloop_registry[threading.get_ident()].discard(self)
+        _tokioloop_threads[threading.get_ident()].discard(self)
         try:
             delattr(_tokioloop_threadlocal, 'current_loop')
         except AttributeError:
