@@ -354,6 +354,7 @@ impl TEventLoop {
             let rloop_mod = py.import("rloop.loop")?;
             let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
             let loop_id_clone = loop_id.clone();
+            log::trace!("Calling rloop.loop._register_tokio_thread(\"{}\")", loop_id_clone);
             register_fn.call1((loop_id_clone,))?;
             Ok(())
         }).expect("Failed to register tokio thread");
@@ -392,6 +393,7 @@ impl TEventLoop {
                     let rloop_mod = py.import("rloop.loop")?;
                     let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
                     let loop_id_clone = loop_id.clone();
+                    log::trace!("Calling rloop.loop._register_tokio_thread(\"{}\")", loop_id_clone);
                     register_fn.call1((loop_id_clone,))?;
                     Ok(())
                 }).expect("Failed to register tokio thread");
