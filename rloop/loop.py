@@ -1,5 +1,7 @@
 import asyncio as __asyncio
+import asyncio.events
 import errno
+import functools
 import logging
 import os
 import signal
@@ -8,11 +10,13 @@ import subprocess
 import sys
 import threading
 import warnings
+import weakref
 from asyncio.coroutines import iscoroutine as _iscoroutine, iscoroutinefunction as _iscoroutinefunction
 from asyncio.events import _get_running_loop, _set_running_loop
 from asyncio.futures import Future as _Future, isfuture as _isfuture, wrap_future as _wrap_future
 from asyncio.staggered import staggered_race as _staggered_race
 from asyncio.tasks import Task as _Task, ensure_future as _ensure_future, gather as _gather
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context as _copy_context
 from itertools import chain as _iterchain
@@ -34,6 +38,10 @@ from .utils import _can_use_pidfd, _HAS_IPv6, _interleave_addrinfos, _ipaddr_inf
 
 
 logger = logging.getLogger(__name__)
+
+# Active loops by thread
+_tokioloop_registry = defaultdict(weakref.WeakSet)
+_tokioloop_threadlocal = threading.local()  # Running TokioLoop event loops
 
 
 class _BaseRustLoop:
@@ -1121,10 +1129,32 @@ class RLoop(_BaseRustLoop, __BaseLoop, __asyncio.AbstractEventLoop):
     pass
 
 
+@functools.wraps(asyncio.events.get_running_loop)
+def _TOKIOLOOP_PATCHED_get_running_loop():
+    if hasattr(_tokioloop_threadlocal, 'current_loop'):
+        loop = _tokioloop_threadlocal.current_loop
+        if loop and not loop.is_closed():
+            return loop
+
+    # Fall back to original implementation
+    return asyncio.events._ORIGINAL_get_running_loop()
+
+
 class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     """Rust EventLoop based on `tokio`"""
 
+    @classmethod
+    def _patch_asyncio_events_get_running_loop(cls) -> bool:
+        if getattr(asyncio.events, '_ORIGINAL_get_running_loop', None) is None:
+            asyncio.events._ORIGINAL_get_running_loop = asyncio.events.get_running_loop
+            asyncio.events.get_running_loop = _TOKIOLOOP_PATCHED_get_running_loop
+            asyncio.events._TOKIO_PATCHED = True
+            return True
+        return False
+
     def __init__(self):
+        self.__class__._patch_asyncio_events_get_running_loop()
+
         super().__init__()
         self._exc_handler = _exception_handler
         # TODO: Initialize tokio-specific components
@@ -1145,6 +1175,26 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
         self._ssock_w = None
         self._sig_listening = False
         self._sig_wfd = None
+
+    #: special methods
+    def _run_forever_pre(self):
+        # As TokioLoop can span coroutines within many threads,
+        # asyncio needs a way to know which TokioLoop the coro belongs
+        # and that TokioLoop is already running on this thread.
+        result = super()._run_forever_pre()
+        _tokioloop_threadlocal.current_loop = self
+        _tokioloop_registry[threading.get_ident()].add(self)  # by default, WeakSet.add
+        return result
+
+    def _run_forever_post(self, old_agen_hooks):
+        # Clear thread-local registration
+        _tokioloop_registry[threading.get_ident()].discard(self)
+        try:
+            delattr(_tokioloop_threadlocal, 'current_loop')
+        except AttributeError:
+            logger.warning("Could not de-register '%r' from threadlocal", self)
+
+        super()._run_forever_post(old_agen_hooks)
 
     #: running methods
 

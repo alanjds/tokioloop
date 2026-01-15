@@ -18,7 +18,6 @@ use crate::{
     log::{LogExc, log_exc_to_py_ctx},
     server::TokioServer,
     tokio_tcp::{TokioTCPServer, TokioTCPServerRef},
-    event_loop::{TEventLoop as TokioEventLoop},
 };
 use pyo3::IntoPyObjectExt;
 use socket2::Socket;
@@ -106,7 +105,7 @@ impl LoopHandlers {
 }
 
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
-    pub struct TEventLoop {
+pub struct TEventLoop {
     pub(crate) runtime: Arc<Runtime>,
     scheduler_tx: Sender<ScheduledTask>,
     scheduler_rx: Receiver<ScheduledTask>,
@@ -370,12 +369,6 @@ impl TEventLoop {
         let signal_socket_rx = self.signal_socket_rx.clone();
         let sig_listening_clone = Arc::clone(&self.sig_listening);
 
-        // Set this event loop as the running loop in asyncio
-        // This is crucial for asyncio.start_server and other asyncio functions to work
-        let asyncio = py.import("asyncio.events")?;
-        let _set_running_loop = asyncio.getattr("_set_running_loop")?;
-        _set_running_loop.call1((self.clone().into_py(py),))?;
-
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
             // Main tokio task
@@ -543,13 +536,6 @@ impl TEventLoop {
                     ))
                 }
             };
-
-            // Clear the running loop after the event loop stops
-            Python::attach(|py| {
-                let asyncio = py.import("asyncio.events")?;
-                let _clear_running_loop = asyncio.getattr("_clear_running_loop")?;
-                let _ = _clear_running_loop.call0()?;
-            });
 
             result
         })
