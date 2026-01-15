@@ -344,35 +344,58 @@ impl TEventLoop {
         *guard = val;
     }
 
-    fn _run(&self, py: Python) -> PyResult<()> {
-        let runtime = self.runtime.clone();
+    fn _run(pyself: Py<Self>, py: Python) -> PyResult<()> {
+        use core::ffi::c_void;
+
+        let self_ = pyself.get();
+        let loop_id = format!("{:p}", pyself.as_ptr() as *const _ as *const c_void);
+
+        let _ = Python::attach(|py| -> PyResult<()> {
+            let rloop_mod = py.import("rloop.loop")?;
+            let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
+            let loop_id_clone = loop_id.clone();
+            register_fn.call1((loop_id_clone,))?;
+            Ok(())
+        }).expect("Failed to register tokio thread");
+
+        let runtime = self_.runtime.clone();
 
         // Create LoopHandlers for use in the async task
         let loop_handlers = LoopHandlers {
-            exc_handler: Arc::clone(&self.exc_handler),
-            exception_handler: Arc::clone(&self.exception_handler),
+            exc_handler: Arc::clone(&self_.exc_handler),
+            exception_handler: Arc::clone(&self_.exception_handler),
         };
 
         // Clone receiver BEFORE the async block - this is the key fix!
-        let scheduler_rx = self.scheduler_rx.clone();
+        let scheduler_rx = self_.scheduler_rx.clone();
 
         // Keep the same sender - all scheduling uses the same channel
         // This ensures the receiver in _run() is connected to all tasks
 
-        let stopping_clone = Arc::clone(&self.stopping);
-        let epoch = self.epoch;
+        let stopping_clone = Arc::clone(&self_.stopping);
+        let epoch = self_.epoch;
 
         // Get a copy of the scheduler sender for signal handling
-        let _scheduler_tx = self.scheduler_tx.clone();
+        let _scheduler_tx = self_.scheduler_tx.clone();
 
         // Get signal socket references for use in the async task
-        let signal_socket_rx = self.signal_socket_rx.clone();
-        let sig_listening_clone = Arc::clone(&self.sig_listening);
+        let signal_socket_rx = self_.signal_socket_rx.clone();
+        let sig_listening_clone = Arc::clone(&self_.sig_listening);
 
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
             // Main tokio task
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
+
+                // Register this Python event loop within the current tokio thread
+                Python::attach(|py| -> PyResult<()> {
+                    let rloop_mod = py.import("rloop.loop")?;
+                    let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
+                    let loop_id_clone = loop_id.clone();
+                    register_fn.call1((loop_id_clone,))?;
+                    Ok(())
+                }).expect("Failed to register tokio thread");
+
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
                 let (current_handles_tx, mut current_handles_rx) = tokio::sync::mpsc::unbounded_channel::<TBoxedHandle>();
 
