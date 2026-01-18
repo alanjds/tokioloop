@@ -1,8 +1,5 @@
 use std::{
-    collections::{BinaryHeap, VecDeque},
-    sync::{atomic, Arc, RwLock},
-    os::fd::{FromRawFd, IntoRawFd},
-    time::{Duration, Instant},
+    collections::{BinaryHeap, VecDeque}, os::fd::{FromRawFd, IntoRawFd}, sync::{atomic, Arc, OnceLock, RwLock}, time::{Duration, Instant}
 };
 
 use anyhow::Result;
@@ -106,7 +103,7 @@ impl LoopHandlers {
 
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub struct TEventLoop {
-    pub(crate) runtime: Arc<Runtime>,
+    runtime: OnceLock<Arc<Runtime>>,
     scheduler_tx: Sender<ScheduledTask>,
     scheduler_rx: Receiver<ScheduledTask>,
     counter_ready: atomic::AtomicUsize,
@@ -136,11 +133,6 @@ impl TEventLoop {
                 self.exception_handler.read().unwrap().clone_ref(py),
             ),
         )
-    }
-
-    /// Get a clone of the tokio runtime for spawning tasks
-    pub fn runtime(&self) -> Arc<Runtime> {
-        Arc::clone(&self.runtime)
     }
 
     pub fn schedule0(&self, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
@@ -264,20 +256,24 @@ impl TEventLoop {
         }
         Ok(())
     }
+
+    pub fn get_runtime(&self) -> Arc<Runtime> {
+        let runtime = self.runtime.get()
+            .expect("Runtime not initialized - call initialize_runtime first")
+            .clone();
+        runtime
+    }
 }
 
 #[pymethods]
 impl TEventLoop {
     #[new]
     fn new(py: Python) -> PyResult<Self> {
-        let runtime = Runtime::new()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create Tokio runtime: {}", e)))?;
-
         let (scheduler_tx, scheduler_rx) = async_channel::unbounded::<ScheduledTask>();
         let (signal_socket_tx, signal_socket_rx) = async_channel::unbounded::<u8>();
 
         Ok(Self {
-            runtime: Arc::new(runtime),
+            runtime: OnceLock::new(),  // Will be initialized later
             scheduler_tx,
             scheduler_rx,
             counter_ready: atomic::AtomicUsize::new(0),
@@ -297,9 +293,35 @@ impl TEventLoop {
         })
     }
 
-    #[getter(_clock)]
-    fn _get_clock(&self) -> u128 {
-        Instant::now().duration_since(self.epoch).as_micros()
+    fn initialize_runtime(&self, py: Python, loop_id: usize) -> PyResult<()> {
+        use tokio::runtime::Builder;
+
+        let loop_id_clone = loop_id;
+
+        // Create custom runtime with automatic thread registration
+        let runtime = Builder::new_multi_thread()
+            .thread_name(format!("tokio-worker-{}", loop_id))
+            .on_thread_start(move || {
+                // This runs exactly once when each tokio worker thread starts
+                Python::attach(|py| -> PyResult<()> {
+                    let rloop_mod = py.import("rloop.loop")?;
+                    let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
+                    register_fn.call1((loop_id_clone,))?;
+                    log::trace!("Registered tokio thread with loop_id: {}", loop_id_clone);
+                    Ok(())
+                }).expect("Failed to register tokio thread");
+            })
+            .enable_all()
+            .build()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create Tokio runtime: {}", e)))?;
+
+        // Use interior mutability to modify runtime field
+        self.runtime.set(Arc::new(runtime))
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Runtime already initialized"
+            ))?;
+
+        Ok(())
     }
 
     #[getter(_closed)]
@@ -344,59 +366,45 @@ impl TEventLoop {
         *guard = val;
     }
 
-    fn _run(pyself: Py<Self>, py: Python) -> PyResult<()> {
-        use core::ffi::c_void;
-
-        let self_ = pyself.get();
-        let loop_id = format!("{:p}", pyself.as_ptr() as *const _ as *const c_void);
-
-        let _ = Python::attach(|py| -> PyResult<()> {
-            let rloop_mod = py.import("rloop.loop")?;
-            let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
-            let loop_id_clone = loop_id.clone();
-            log::trace!("Calling rloop.loop._register_tokio_thread(\"{}\")", loop_id_clone);
-            register_fn.call1((loop_id_clone,))?;
-            Ok(())
-        }).expect("Failed to register tokio thread");
-
-        let runtime = self_.runtime.clone();
+    fn _run(&self, py: Python) -> PyResult<()> {
+        let runtime = self.get_runtime();
 
         // Create LoopHandlers for use in the async task
         let loop_handlers = LoopHandlers {
-            exc_handler: Arc::clone(&self_.exc_handler),
-            exception_handler: Arc::clone(&self_.exception_handler),
+            exc_handler: Arc::clone(&self.exc_handler),
+            exception_handler: Arc::clone(&self.exception_handler),
         };
 
         // Clone receiver BEFORE the async block - this is the key fix!
-        let scheduler_rx = self_.scheduler_rx.clone();
+        let scheduler_rx = self.scheduler_rx.clone();
 
         // Keep the same sender - all scheduling uses the same channel
         // This ensures the receiver in _run() is connected to all tasks
 
-        let stopping_clone = Arc::clone(&self_.stopping);
-        let epoch = self_.epoch;
+        let stopping_clone = Arc::clone(&self.stopping);
+        let epoch = self.epoch;
 
         // Get a copy of the scheduler sender for signal handling
-        let _scheduler_tx = self_.scheduler_tx.clone();
+        let _scheduler_tx = self.scheduler_tx.clone();
 
         // Get signal socket references for use in the async task
-        let signal_socket_rx = self_.signal_socket_rx.clone();
-        let sig_listening_clone = Arc::clone(&self_.sig_listening);
+        let signal_socket_rx = self.signal_socket_rx.clone();
+        let sig_listening_clone = Arc::clone(&self.sig_listening);
 
         // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
             // Main tokio task
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
 
-                // Register this Python event loop within the current tokio thread
-                Python::attach(|py| -> PyResult<()> {
-                    let rloop_mod = py.import("rloop.loop")?;
-                    let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
-                    let loop_id_clone = loop_id.clone();
-                    log::trace!("Calling rloop.loop._register_tokio_thread(\"{}\")", loop_id_clone);
-                    register_fn.call1((loop_id_clone,))?;
-                    Ok(())
-                }).expect("Failed to register tokio thread");
+                // // Register this Python event loop within the current tokio thread
+                // Python::attach(|py| -> PyResult<()> {
+                //     let rloop_mod = py.import("rloop.loop")?;
+                //     let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
+                //     let loop_id_clone = loop_id.clone();
+                //     log::trace!("Calling rloop.loop._register_tokio_thread(\"{}\")", loop_id_clone);
+                //     register_fn.call1((loop_id_clone,))?;
+                //     Ok(())
+                // }).expect("Failed to register tokio thread");
 
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
                 let (current_handles_tx, mut current_handles_rx) = tokio::sync::mpsc::unbounded_channel::<TBoxedHandle>();
@@ -859,7 +867,7 @@ impl TEventLoop {
         log::debug!("TokioEventLoop::_ssock_set called with fd_r: {}, fd_w: {}", fd_r, fd_w);
 
         // Spawn a background task to handle signal socket reading
-        let runtime = self.runtime.clone();
+        let runtime = self.get_runtime();
         let signal_socket_tx = self.signal_socket_tx.clone();
         let sig_listening = self.sig_listening.clone();
         let stopping_clone = self.stopping.clone();

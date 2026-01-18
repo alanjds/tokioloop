@@ -18,7 +18,6 @@ from asyncio.events import _get_running_loop, _set_running_loop
 from asyncio.futures import Future as _Future, isfuture as _isfuture, wrap_future as _wrap_future
 from asyncio.staggered import staggered_race as _staggered_race
 from asyncio.tasks import Task as _Task, ensure_future as _ensure_future, gather as _gather
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context as _copy_context
 from itertools import chain as _iterchain
@@ -41,8 +40,7 @@ from .utils import _can_use_pidfd, _HAS_IPv6, _interleave_addrinfos, _ipaddr_inf
 
 logger = logging.getLogger(__name__)
 
-# Active loops by thread
-_tokioloop_threads = defaultdict(weakref.WeakSet)
+# Active loops by their id()
 _tokioloop_loops = weakref.WeakValueDictionary()
 _tokioloop_threadlocal = threading.local()  # Running TokioLoop event loops
 
@@ -1132,24 +1130,37 @@ class RLoop(_BaseRustLoop, __BaseLoop, __asyncio.AbstractEventLoop):
     pass
 
 
-def _register_tokio_thread(loop: TokioLoop | str):
+def _register_tokio_thread(loop: TokioLoop | str, setcurrent=True):
     """Register the TokioLoop on the current thread
 
     As TokioLoop can span coroutines within many threads,
     asyncio needs a way to know which TokioLoop the coroutine belongs
     and that TokioLoop is already running on this thread.
     """
-    if isinstance(loop, (str, bytes)):
-        loop_id = int(loop, 16)
+    # breakpoint()
+    if isinstance(loop, int):
+        # loop_id = int(loop, 16)  # for str
+        loop_id = loop
         loop_obj: TokioLoop = _tokioloop_loops[loop_id]
     else:
         loop_id = id(loop)
         loop_obj: TokioLoop = loop
-    _tokioloop_loops[loop_id] = loop_obj
-    _tokioloop_threadlocal.current_loop = loop_obj
-    _tokioloop_threads[threading.get_ident()].add(loop_obj)  # by default, WeakSet.add
 
-    logger.info('Current _tokioloop_threadlocal.current_loop set: %s', _tokioloop_threadlocal.current_loop)
+    assert loop_id and type(loop_id) is int
+    assert loop_obj and type(loop_obj) is TokioLoop
+
+    _tokioloop_loops[loop_id] = loop_obj
+
+    if setcurrent:
+        _tokioloop_threadlocal.current_loop = loop_obj
+        logger.info(
+            'Current _tokioloop_threadlocal.current_loop set [thread_id=%s]: %s',
+            threading.get_ident(),
+            _tokioloop_threadlocal.current_loop,
+        )
+
+        assert hasattr(_tokioloop_threadlocal, 'current_loop')
+        assert _tokioloop_threadlocal.current_loop is loop_obj
 
 
 @functools.wraps(asyncio.events.get_running_loop)
@@ -1157,18 +1168,32 @@ def _TOKIOLOOP_PATCHED_get_running_loop():
     try:
         return asyncio.events._ORIGINAL_get_running_loop()
     except RuntimeError:
+        thread_id = threading.get_ident()
+
+        # Check if we have a thread-local loop
         if hasattr(_tokioloop_threadlocal, 'current_loop'):
             loop = _tokioloop_threadlocal.current_loop
             if loop and not loop.is_closed():
                 asyncio.events._set_running_loop(loop)
+                logger.debug('Thread %s: Set with loop %s', thread_id, loop)
+                # return loop
+            else:
+                logger.debug('Thread %s: Thread-local loop exists but is %s', thread_id, loop)
 
-        else:
-            thread_id = threading.get_ident()
-            if thread_id in _tokioloop_threads:
-                for loop in _tokioloop_threads[thread_id]:
-                    if loop and not loop.is_closed():
-                        asyncio.events._set_running_loop(loop)
-                        break
+            # Try to auto-recover: find any non-closed loop that might be associated with this thread
+            for loop_id, loop_obj in _tokioloop_loops.items():
+                if loop_obj and not loop_obj.is_closed():
+                    logger.debug(f'Thread {thread_id}: Auto-recovering with loop {loop_id}')
+                    _tokioloop_threadlocal.current_loop = loop_obj
+                    asyncio.events._set_running_loop(loop_obj)
+                    # return loop_obj
+
+        if hasattr(_tokioloop_threadlocal, 'current_loop'):
+            loop = _tokioloop_threadlocal.current_loop
+            if loop and not loop.is_closed():
+                asyncio.events._set_running_loop(loop)
+            else:
+                logger.info('No loop to be set: %r %s', loop, loop)
 
     # Fall back to original implementation
     try:
@@ -1176,9 +1201,10 @@ def _TOKIOLOOP_PATCHED_get_running_loop():
     except Exception:
         logger.info('Current thread ID: %s', threading.get_ident())
         logger.info('Current _tokioloop_loops: %s', dict(_tokioloop_loops.items()))
-        logger.info('Current _tokioloop_threads: %s', _tokioloop_threads)
         logger.info(
-            'Current _tokioloop_threadlocal.current_loop: %s', getattr(_tokioloop_threadlocal, 'current_loop', None)
+            'Current _tokioloop_threadlocal.current_loop [thread_id=%s]: %s',
+            threading.get_ident(),
+            getattr(_tokioloop_threadlocal, 'current_loop', None),
         )
         raise
 
@@ -1198,7 +1224,10 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     def __init__(self):
         self.__class__._patch_asyncio_events_get_running_loop()
 
+        _register_tokio_thread(self, setcurrent=False)
         super().__init__()
+        self.initialize_runtime(id(self))
+
         self._exc_handler = _exception_handler
         # TODO: Initialize tokio-specific components
         # For now, we'll use the same child watcher as RLoop
@@ -1226,14 +1255,14 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
         return result
 
     def _run_forever_post(self, old_agen_hooks):
+        result = super()._run_forever_post(old_agen_hooks)
         # Clear thread-local registration
-        _tokioloop_threads[threading.get_ident()].discard(self)
         try:
             delattr(_tokioloop_threadlocal, 'current_loop')
         except AttributeError:
             logger.warning("Could not de-register '%r' from threadlocal", self)
 
-        super()._run_forever_post(old_agen_hooks)
+        return result
 
     #: running methods
 

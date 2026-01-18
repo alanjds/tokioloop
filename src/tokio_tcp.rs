@@ -108,7 +108,7 @@ impl TokioTCPTransport {
         let pyloop = transport.borrow(py).pyloop.clone_ref(py);
         let state = transport.borrow(py).state.clone();
 
-        let runtime = pyloop.get().runtime.clone();
+        let runtime = pyloop.borrow(py).get_runtime();
 
         // Spawn the I/O processing task
         let state_clone = state.clone();
@@ -550,7 +550,7 @@ impl TokioTCPServer {
         let transports = server_clone.transports.clone();
         let closed = server_clone.closed.clone();
 
-        let runtime = pyloop.get().runtime.clone();
+        let runtime = pyloop.borrow(py).get_runtime();
 
         runtime.spawn(async move {
             log::debug!("TokioTCPServer: Starting listener loop");
