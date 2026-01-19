@@ -1205,13 +1205,21 @@ def _TOKIOLOOP_PATCHED_get_running_loop():
             else:
                 logger.debug('Thread %s: Thread-local loop exists but is %s', thread_id, loop)
 
-        # else:
-        #     # Try to auto-recover: find any non-closed loop that might be associated with this thread
-        #     for loop_id, loop_obj in _tokioloop_loops.items():
-        #         if loop_obj and not loop_obj.is_closed():
-        #             logger.warning(f'Thread {thread_id}: Auto-recovering with loop {loop_id}')
-        #             _tokioloop_threadlocal.current_loop = loop_obj
-        #             asyncio.events._set_running_loop(loop_obj)
+        else:
+            ### THIS IS A HACK!!
+            # When attaching PyO3 via Python::attach() on Rust, it may start a clean threadlocal
+            # even if reusing an existing OS Thread. To solve it, the context will need to be
+            # applied every time the Python::attach() got called.
+            # For now, I will just assume that only one loop will be running.
+            # but this SHOULD be fixed later.
+            ###
+
+            # Try to auto-recover: find any non-closed loop that might be associated with this thread
+            for loop_id, loop_obj in _tokioloop_loops.items():
+                if loop_obj and not loop_obj.is_closed():
+                    logger.warning(f'Thread {thread_id}: Auto-recovering with loop {loop_id}')
+                    _tokioloop_threadlocal.current_loop = loop_obj
+                    asyncio.events._set_running_loop(loop_obj)
 
         if hasattr(_tokioloop_threadlocal, 'current_loop'):
             loop = _tokioloop_threadlocal.current_loop
