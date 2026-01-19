@@ -571,6 +571,7 @@ class _BaseRustLoop:
                 raise ValueError('Neither host/port nor sock were specified')
             if sock.type != socket.SOCK_STREAM:
                 raise ValueError(f'A Stream Socket was expected, got {sock!r}')
+
             sockets = [sock]
 
         rsocks = []
@@ -1328,36 +1329,3 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     def _check_closed(self):
         if self._closed:
             raise RuntimeError('Event loop is closed')
-
-    def call_soon(self, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
-        # TODO: Implement tokio-based call_soon
-        # For now, delegate to the Rust implementation
-        return super().call_soon(callback, *args)
-
-    def call_soon_threadsafe(self, callback, *args, context=None) -> Union[CBHandle, TimerHandle]:
-        # TODO: Implement tokio-based call_soon_threadsafe
-        # For now, delegate to the Rust implementation
-        return super().call_soon_threadsafe(callback, *args)
-
-    if _PYV < _PY_311:
-        raise RuntimeError('Minimum version is Python 3.11')
-
-    #: network I/O methods - TODO: Implement tokio-specific versions
-    # For now, these will use the same implementations as RLoop
-    # but they should eventually use tokio's async I/O primitives
-
-    def add_reader(self, fd, callback, *args, context=None):
-        """Add a reader callback for a file descriptor."""
-        return super().add_reader(fd, callback, *args, context=context)
-
-    def add_writer(self, fd, callback, *args, context=None):
-        """Add a writer callback for a file descriptor."""
-        return super().add_writer(fd, callback, *args, context=context)
-
-    def remove_reader(self, fd):
-        """Remove a reader callback for a file descriptor."""
-        return super().remove_reader(fd)
-
-    def remove_writer(self, fd):
-        """Remove a writer callback for a file descriptor."""
-        return super().remove_writer(fd)
