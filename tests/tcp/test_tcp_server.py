@@ -32,6 +32,7 @@ def test_create_server_stream_bittype(loop):
 
 @pytest.mark.skipif(not _HAS_IPv6, reason='no IPv6')
 def test_create_server_ipv6(loop):
+    logger.warning('Loop used on test: %s %r', id(loop), loop)
     async def main():
         srv = await asyncio.start_server(lambda: None, '::1', 0)
         try:
