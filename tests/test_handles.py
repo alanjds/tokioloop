@@ -2,7 +2,6 @@ import threading
 from logging import getLogger
 
 import pytest
-from conftest import _namegetter
 
 
 logger = getLogger(__name__)
@@ -87,7 +86,7 @@ def test_call_at(loop):
     loop.run_forever()
     dt = loop.time() - t0
 
-    if _namegetter(loop).startswith('uvloop'):
+    if loop.__class__.__module__.startswith('uvloop'):
         # uvloop may be a bit loose on delaying
         delay *= 0.9
 
