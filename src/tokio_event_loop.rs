@@ -732,23 +732,6 @@ impl TEventLoop {
             ));
         }
 
-        // Convert socket to tokio TcpStream
-        let (fd, family) = sock;
-
-        // Duplicate file descriptor to avoid IO safety violations
-        let fd_dup = unsafe { libc::dup(fd) };
-        if fd_dup == -1 {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to duplicate TCP socket file descriptor: {}", std::io::Error::last_os_error())
-            ));
-        }
-
-        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd_dup) };
-        let tokio_stream = tokio::net::TcpStream::from_std(std_stream)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                "Failed to convert socket to tokio stream: {}", e
-            )))?;
-
         // Create protocol instance
         let protocol = protocol_factory.call0(py)?;
 
@@ -756,7 +739,7 @@ impl TEventLoop {
         let transport = crate::tokio_tcp::TokioTCPTransport::from_py(
             py,
             &pyself,
-            (fd_dup, family),
+            sock, //(fd, family),
             protocol_factory,
         )?;
 

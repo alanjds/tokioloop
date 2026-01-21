@@ -56,14 +56,18 @@ impl TokioTCPTransport {
         sock: (i32, i32),
         protocol_factory: Py<PyAny>,
     ) -> PyResult<Self> {
+        log::trace!("TokioTCPTransport::from_py called");
         let (fd, _family) = sock;
 
         // Convert the socket file descriptor to a tokio TcpStream
-        let std_stream = unsafe {
-            std::net::TcpStream::from_raw_fd(fd)
-        };
+        let socket = _try_socket2_conversion(fd, 0)?;
+
+        // Convert to std TcpStream then to tokio
+        let std_stream: std::net::TcpStream = socket.into();
         let tokio_stream = tokio::net::TcpStream::from_std(std_stream)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to convert socket to tokio stream: {}", e)))?;
+
+        log::debug!("TokioTCPTransport::from_py: Tokio stream created successfully");
 
         let protocol = protocol_factory.call0(py)?;
 
@@ -523,7 +527,7 @@ impl TokioTCPServer {
     }
 }
 
-fn _try_socket2_conversion(fd: i32, backlog: i32) -> Result<socket2::Socket, PyErr> {
+pub fn _try_socket2_conversion(fd: i32, backlog: i32) -> Result<socket2::Socket, PyErr> {
     use socket2::{Socket, Domain, Type};
 
     log::trace!("Socket conversion via socket2: fd={}", fd);
@@ -534,9 +538,11 @@ fn _try_socket2_conversion(fd: i32, backlog: i32) -> Result<socket2::Socket, PyE
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to set socket nonblocking: {}", e)))?;
     log::trace!("Socket conversion via socket2 successful");
     // Set backlog if socket is not already listening
-    if let Err(e) = socket.listen(backlog) {
-        log::debug!("Socket conversion: listen failed (might already be listening): {}", e);
-        // Don't fail if already listening, just continue
+    if backlog != 0 {
+        if let Err(e) = socket.listen(backlog) {
+            log::debug!("Socket conversion: listen failed (might already be listening): {}", e);
+            // Don't fail if already listening, just continue
+        }
     }
     Ok(socket)
 }
