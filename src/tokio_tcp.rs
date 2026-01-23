@@ -29,6 +29,7 @@ pub(crate) struct TokioTCPTransportState {
     write_buf: VecDeque<Vec<u8>>,
     closing: bool,
     weof: bool,
+    read_eof: bool,
     paused: bool,
     io_task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -77,6 +78,7 @@ impl TokioTCPTransport {
             write_buf: VecDeque::new(),
             closing: false,
             weof: false,
+            read_eof: false,
             paused: false,
             io_task: None,
         }));
@@ -151,12 +153,14 @@ impl TokioTCPTransport {
 
         loop {
             // Check if we should stop
-            let (should_stop, is_paused, has_writes) = {
+            let (is_closing, is_paused, has_writes, weof, read_eof) = {
                 let state_lock = state.lock().unwrap();
-                (state_lock.closing, state_lock.paused, !state_lock.write_buf.is_empty())
+                (state_lock.closing, state_lock.paused, !state_lock.write_buf.is_empty(), state_lock.weof, state_lock.read_eof)
             };
 
-            if should_stop {
+            // Exit if closing, or only if both EOF received AND write shutdown completed
+            // Do not exit just with weof=true: may still be needed to read data
+            if is_closing || (read_eof && weof && !has_writes) {
                 break;
             }
 
@@ -167,16 +171,19 @@ impl TokioTCPTransport {
             }
 
             tokio::select! {
-                // Handle reading
-                result = reader.read(&mut read_buf) => {
+                // Handle reading: only if we have not received EOF yet
+                result = reader.read(&mut read_buf), if !read_eof => {
                     match result {
                         Ok(0) => {
                             // EOF received
                             log::debug!("TCP connection EOF received");
+                            {
+                                let mut state_lock = state.lock().unwrap();
+                                state_lock.read_eof = true;
+                            }
                             Python::attach(|py| {
                                 let _ = protocol.call_method1(py, pyo3::intern!(py, "eof_received"), ());
                             });
-                            break;
                         }
                         Ok(n) => {
                             // Data received, forward to protocol
@@ -199,17 +206,21 @@ impl TokioTCPTransport {
                     }
                 }
 
-                // Handle writing
+                // Handle writing and EOF shutdown together
                 _ = async {
-                    let write_data = {
+                    let (write_data, should_shutdown_now) = {
                         let mut state_lock = state.lock().unwrap();
-                        if !state_lock.write_buf.is_empty() {
+                        let write_data = if !state_lock.write_buf.is_empty() {
                             Some(state_lock.write_buf.pop_front().unwrap_or_default())
                         } else {
                             None
-                        }
+                        };
+
+                        let should_shutdown_now = state_lock.weof && state_lock.write_buf.is_empty();
+                        (write_data, should_shutdown_now)
                     };
 
+                    // Handle writing first
                     if let Some(data) = write_data {
                         if let Err(e) = writer.write_all(&data).await {
                             log::error!("TCP write error: {}", e);
@@ -221,7 +232,15 @@ impl TokioTCPTransport {
                             }
                         }
                     }
-                }, if has_writes => {}
+
+                    // Handle EOF shutdown after writing
+                    if should_shutdown_now {
+                        // Shutdown the write half of the connection
+                        if let Err(e) = writer.shutdown().await {
+                            log::debug!("TCP shutdown error (may be expected): {}", e);
+                        }
+                    }
+                }, if has_writes || weof => {}
 
                 // Prevent a busy loop
                 _ = tokio::time::sleep(Duration::from_millis(1)) => {}
@@ -393,11 +412,8 @@ impl TokioTCPTransport {
         let mut state = self.state.lock().unwrap();
         state.closing = true;
 
-        // Call connection_lost if write buffer is empty
-        if state.write_buf.is_empty() {
-            drop(state);
-            self.call_connection_lost(py, None);
-        }
+        // Don't call connection_lost immediately: let the I/O loop handle it
+        // Allows for any pending data to be received
     }
 
     fn abort(&self, py: Python) {
@@ -485,6 +501,7 @@ impl TokioTCPServer {
                 write_buf: VecDeque::new(),
                 closing: false,
                 weof: false,
+                read_eof: false,
                 paused: false,
                 io_task: None,
             })),
