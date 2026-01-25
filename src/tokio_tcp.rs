@@ -30,8 +30,11 @@ pub(crate) struct TokioTCPTransportState {
     closing: bool,
     weof: bool,
     read_eof: bool,
+    write_shutdown_done: bool,
     paused: bool,
     io_task: Option<tokio::task::JoinHandle<()>>,
+    local_addr: Option<SocketAddr>,
+    peer_addr: Option<SocketAddr>,
 }
 
 /// Main transport class implementing asyncio transport interface
@@ -70,6 +73,10 @@ impl TokioTCPTransport {
 
         log::debug!("TokioTCPTransport::from_py: Tokio stream created successfully");
 
+        // Store the addresses before moving the strean
+        let local_addr = tokio_stream.local_addr().ok();
+        let peer_addr = tokio_stream.peer_addr().ok();
+
         let protocol = protocol_factory.call0(py)?;
 
         let state = Arc::new(Mutex::new(TokioTCPTransportState {
@@ -79,13 +86,16 @@ impl TokioTCPTransport {
             closing: false,
             weof: false,
             read_eof: false,
+            write_shutdown_done: false,
             paused: false,
             io_task: None,
+            local_addr,
+            peer_addr,
         }));
 
         let transport = Self {
             fd: fd as usize,
-            state: state.clone(),
+            state,
             pyloop: event_loop.clone_ref(py),
             protocol: protocol.clone_ref(py),
             extra: HashMap::new(),
@@ -149,18 +159,22 @@ impl TokioTCPTransport {
             return;
         };
 
+        // For logs
+        let fd = stream.as_raw_fd();
+
         let (mut reader, mut writer) = tokio::io::split(stream);
+
+        let mut connection_lost_called = false;
 
         loop {
             // Check if we should stop
-            let (is_closing, is_paused, has_writes, weof, read_eof) = {
+            let (is_closing, is_paused, read_eof) = {
                 let state_lock = state.lock().unwrap();
-                (state_lock.closing, state_lock.paused, !state_lock.write_buf.is_empty(), state_lock.weof, state_lock.read_eof)
+                (state_lock.closing, state_lock.paused, state_lock.read_eof)
             };
 
-            // Exit if closing, or only if both EOF received AND write shutdown completed
-            // Do not exit just with weof=true: may still be needed to read data
-            if is_closing || (read_eof && weof && !has_writes) {
+            if is_closing {
+                log::trace!("TCP connection is_closing. Exiting the loop [fd={}]", fd);
                 break;
             }
 
@@ -176,13 +190,13 @@ impl TokioTCPTransport {
                     match result {
                         Ok(0) => {
                             // EOF received
-                            log::debug!("TCP connection EOF received");
+                            log::trace!("TCP connection EOF received [fd={}]", fd);
                             {
                                 let mut state_lock = state.lock().unwrap();
                                 state_lock.read_eof = true;
                             }
                             Python::attach(|py| {
-                                let _ = protocol.call_method1(py, pyo3::intern!(py, "eof_received"), ());
+                                let _ = protocol.call_method0(py, pyo3::intern!(py, "eof_received"));
                             });
                         }
                         Ok(n) => {
@@ -200,60 +214,82 @@ impl TokioTCPTransport {
                             // No data available, continue
                         }
                         Err(e) => {
-                            log::error!("TCP read error: {}", e);
+                            log::error!("TCP read error: [fd={}] {}", fd, e);
                             break;
                         }
                     }
                 }
 
-                // Handle writing and EOF shutdown together
                 _ = async {
+                    // Writing & shutdown should be handled with both locked
                     let (write_data, should_shutdown_now) = {
                         let mut state_lock = state.lock().unwrap();
-                        let write_data = if !state_lock.write_buf.is_empty() {
-                            Some(state_lock.write_buf.pop_front().unwrap_or_default())
-                        } else {
-                            None
-                        };
-
-                        let should_shutdown_now = state_lock.weof && state_lock.write_buf.is_empty();
-                        (write_data, should_shutdown_now)
+                        let write_data = state_lock.write_buf.pop_front();
+                        let should_shutdown = state_lock.weof
+                            && state_lock.write_buf.is_empty()
+                            && !state_lock.write_shutdown_done;
+                        (write_data, should_shutdown)
                     };
 
                     // Handle writing first
                     if let Some(data) = write_data {
                         if let Err(e) = writer.write_all(&data).await {
-                            log::error!("TCP write error: {}", e);
+                            log::error!("TCP write error: [fd={}] {}", fd, e);
                         } else {
-                            log::debug!("TCP wrote {} bytes", data.len());
-                            // Flush the data
+                            log::trace!("TCP wrote {} bytes [fd={}]", data.len(), fd);
                             if let Err(e) = writer.flush().await {
-                                log::error!("TCP flush error: {}", e);
+                                log::error!("TCP flush error: [fd={}] {}", fd, e);
                             }
                         }
                     }
 
-                    // Handle EOF shutdown after writing
+                    // Shutdown only with empty buffer
                     if should_shutdown_now {
-                        // Shutdown the write half of the connection
+                        log::trace!("TCP writer shutdown starting [fd={}]", fd);
                         if let Err(e) = writer.shutdown().await {
-                            log::debug!("TCP shutdown error (may be expected): {}", e);
+                            log::debug!("TCP writer shutdown error (may be expected): [fd={}] {}", fd, e);
                         }
+
+                        let mut state_lock = state.lock().unwrap();
+                        state_lock.write_shutdown_done = true;
+                        log::debug!("TCP writer shutdown completed [fd={}]", fd);
                     }
-                }, if has_writes || weof => {}
+                }, if {
+                    let state_lock = state.lock().unwrap();
+                    !state_lock.write_buf.is_empty() ||
+                    (state_lock.weof && !state_lock.write_shutdown_done)
+                } => {}
 
                 // Prevent a busy loop
                 _ = tokio::time::sleep(Duration::from_millis(1)) => {}
             }
+
+            // Graceful shutdown only after everything else. May never occur
+            let should_exit = {
+                let state_lock = state.lock().unwrap();
+                state_lock.read_eof
+                    && state_lock.write_shutdown_done
+                    && state_lock.write_buf.is_empty()
+            };
+
+            if should_exit {
+                log::trace!("TCP connection gracefully closed (read EOF + write shutdown done) [fd={}]", fd);
+                break;
+            }
         }
 
-        log::debug!("Prepare to call connection_lost on TCP");
-        // Clean up and call connection_lost
+        log::trace!("Prepare to call connection_lost on TCP [fd={}]", fd);
         Python::attach(|py| {
             let transport_ref = transport.borrow(py);
-            transport_ref.call_connection_lost(py, None);
+
+            if !connection_lost_called {
+                connection_lost_called = true;
+                transport_ref.call_connection_lost(py, None);
+                log::debug!("Called connection_lost on TCP [fd={}]", fd);
+            } else {
+                log::debug!("connection_lost already called, skipping [fd={}]", fd);
+            }
         });
-        log::debug!("Called connection_lost on TCP");
     }
 
     #[inline]
@@ -264,17 +300,17 @@ impl TokioTCPTransport {
     #[inline]
     pub fn get_local_addr(&self) -> Result<String> {
         let state = self.state.lock().unwrap();
-        let local_addr = state.stream.as_ref().unwrap().local_addr()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(local_addr.to_string())
+        state.local_addr
+            .map(|addr| addr.to_string())
+            .ok_or_else(|| anyhow::anyhow!("Local address not available"))
     }
 
     #[inline]
     pub fn get_remote_addr(&self) -> Result<String> {
         let state = self.state.lock().unwrap();
-        let peer_addr = state.stream.as_ref().unwrap().peer_addr()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        Ok(peer_addr.to_string())
+        state.peer_addr
+            .map(|addr| addr.to_string())
+            .ok_or_else(|| anyhow::anyhow!("Peer address not available"))
     }
 
     fn call_connection_lost(&self, py: Python, err: Option<PyErr>) {
@@ -417,13 +453,12 @@ impl TokioTCPTransport {
     }
 
     fn abort(&self, py: Python) {
+        // Let io_processing_loop call connection_lost: Avoid dup calls
         if self.closing.compare_exchange(false, true, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_ok() {
             let mut state = self.state.lock().unwrap();
             state.closing = true;
-            state.write_buf.clear(); // Clear pending writes
+            state.write_buf.clear();
         }
-
-        self.call_connection_lost(py, None);
     }
 
     fn is_reading(&self) -> bool {
@@ -493,6 +528,9 @@ impl TokioTCPServer {
     ) -> PyResult<Py<TokioTCPTransport>> {
         let protocol = protocol_factory.call0(py)?;
 
+        let local_addr = stream.local_addr().ok();
+        let peer_addr = stream.peer_addr().ok();
+
         let transport = TokioTCPTransport {
             fd: stream.as_raw_fd() as usize,
             state: Arc::new(Mutex::new(TokioTCPTransportState {
@@ -502,8 +540,11 @@ impl TokioTCPServer {
                 closing: false,
                 weof: false,
                 read_eof: false,
+                write_shutdown_done: false,
                 paused: false,
                 io_task: None,
+                local_addr,
+                peer_addr,
             })),
             pyloop: pyloop.clone_ref(py),
             protocol: protocol.clone_ref(py),
