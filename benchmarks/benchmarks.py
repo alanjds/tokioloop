@@ -12,7 +12,7 @@ from pathlib import Path
 
 WD = Path(__file__).resolve().parent
 CPU = multiprocessing.cpu_count()
-LOOPS = ['asyncio', 'rloop', 'uvloop']
+LOOPS = ['asyncio', 'rloop', 'tokioloop', 'uvloop']
 MSGS = [1024, 1024 * 10, 1024 * 100]
 CONCURRENCIES = sorted({1, max(CPU / 2, 1), max(CPU - 1, 1)})
 

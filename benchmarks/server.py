@@ -83,6 +83,11 @@ def run(args):
 
         loop = rloop.new_event_loop()
         print('using RLoop')
+    elif args.loop == 'tokioloop':
+        import rloop
+
+        loop = rloop.new_tokio_event_loop()
+        print('using TokioLoop')
     elif args.loop == 'uvloop':
         import uvloop
 
