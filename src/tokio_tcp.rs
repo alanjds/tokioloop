@@ -267,13 +267,15 @@ impl TokioTCPTransport {
             // Graceful shutdown only after everything else. May never occur
             let should_exit = {
                 let state_lock = state.lock().unwrap();
-                state_lock.read_eof
-                    && state_lock.write_shutdown_done
-                    && state_lock.write_buf.is_empty()
+                (state_lock.read_eof && state_lock.write_buf.is_empty())
+                // ^-- Exit when client closes without server doing write_eof()
+                    || (state_lock.read_eof
+                        && state_lock.write_shutdown_done
+                        && state_lock.write_buf.is_empty())
             };
 
             if should_exit {
-                log::trace!("TCP connection gracefully closed (read EOF + write shutdown done) [fd={}]", fd);
+                log::trace!("TCP connection gracefully closed (read EOF + no pending writes) [fd={}]", fd);
                 break;
             }
         }
