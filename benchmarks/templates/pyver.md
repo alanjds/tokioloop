@@ -16,7 +16,7 @@ The only test performed is the raw socket one.
 
 | Python version | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- |
-{{ for pykey in ["310", "311", "312", "313"]: }}
+{{ for pykey in ["311", "312", "313"]: }}
 {{ _data = globals().get(f"data{pykey}") }}
 {{ if not _data: }}
 {{ continue }}
@@ -30,7 +30,7 @@ The only test performed is the raw socket one.
 
 | Python version | Loop | Total requests | Throughput | Mean latency | 99p latency | Latency stdev |
 | --- | --- | --- | --- | --- | --- | --- |
-{{ for pykey in ["310", "311", "312", "313"]: }}
+{{ for pykey in ["311", "312", "313"]: }}
 {{ _data = globals().get(f"data{pykey}") }}
 {{ if not _data: }}
 {{ continue }}
