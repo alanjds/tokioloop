@@ -534,7 +534,14 @@ impl TEventLoop {
                                         // Execute the handle with proper context
                                         let _ = handle.run(py, &handlers, &state);
                                         log::debug!("Handle execution completed");
+                                        // to avoid panic when Py<T> tries to decrement refcount
+                                        drop(handle);
                                     })
+                                } else {
+                                    Python::attach(|_py|{
+                                        // to avoid panic when Py<T> tries to decrement refcount
+                                        drop(handle);
+                                    });
                                 }
                             } else {
                                 log::debug!("Handle channel closed, breaking from select");

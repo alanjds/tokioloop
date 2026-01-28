@@ -291,6 +291,9 @@ impl TokioTCPTransport {
             } else {
                 log::debug!("connection_lost already called, skipping [fd={}]", fd);
             }
+            // Explicitly drop transport_ref while still attached to Python
+            // to avoid panic when Py<T> tries to decrement refcount
+            drop(transport_ref);
         });
     }
 
@@ -332,8 +335,9 @@ impl TokioTCPTransport {
         self.fd
     }
 
-    fn get_extra_info(&self, py: Python, name: String, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        match name.as_str() {
+    #[pyo3(signature = (name, default=None))]
+    fn get_extra_info(&self, py: Python, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        match name {
             "socket" => {
                 // Return a mock socket object for compatibility
                 Ok(default.unwrap_or_else(|| py.None()))
@@ -370,7 +374,7 @@ impl TokioTCPTransport {
             }
             _ => {
                 let default_val = default.unwrap_or_else(|| py.None());
-                if let Some(value) = self.extra.get(&name) {
+                if let Some(value) = self.extra.get(name) {
                     Ok(value.clone_ref(py))
                 } else {
                     Ok(default_val)
