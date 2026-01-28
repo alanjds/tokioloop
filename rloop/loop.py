@@ -1251,10 +1251,10 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
 
     @classmethod
     def _patch_asyncio_events_get_running_loop(cls) -> bool:
-        if getattr(asyncio.events, '_ORIGINAL_get_running_loop', None) is None:
-            asyncio.events._ORIGINAL_get_running_loop = asyncio.events.get_running_loop
-            asyncio.events.get_running_loop = _TOKIOLOOP_PATCHED_get_running_loop
-            asyncio.events._TOKIO_PATCHED = True
+        if not hasattr(asyncio.events, '_ORIGINAL_get_running_loop'):
+            asyncio.events._ORIGINAL_get_running_loop = asyncio.events.get_running_loop  # type: ignore[attr-defined]
+            asyncio.events.get_running_loop = _TOKIOLOOP_PATCHED_get_running_loop  # type: ignore[assignment]
+            asyncio.events._TOKIO_PATCHED = True  # type: ignore[attr-defined]
             return True
         return False
 
