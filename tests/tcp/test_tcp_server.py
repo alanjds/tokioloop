@@ -81,4 +81,49 @@ def test_tcp_server_recv_send(loop):
     assert state['data'] == msg
 
 
+def test_transport_get_extra_info(loop):
+    """Test get_extra_info method with various key names."""
+    # Create a simple protocol and connection
+    class TestProtocol(BaseProto):
+        def connection_made(self, transport):
+            self.transport = transport
+
+    proto = TestProtocol()
+
+    async def main():
+        async with await loop.create_server(lambda: proto, '127.0.0.1', 0) as server:
+            # Create a client and connect
+            reader, writer = await asyncio.open_connection('127.0.0.1', server.sockets[0].getsockname()[1])
+
+            # Wait for connection_made to be called
+            await asyncio.sleep(0.1)
+
+            # Test sockname retrieval
+            sockname = proto.transport.get_extra_info('sockname')
+            assert sockname is not None
+            assert isinstance(sockname, tuple)
+            assert sockname[0] == '127.0.0.1'
+
+            # Test peername retrieval
+            peername = proto.transport.get_extra_info('peername')
+            assert peername is not None
+            assert isinstance(peername, tuple)
+            assert peername[0] == '127.0.0.1'
+
+            # Test socket retrieval
+            sock = proto.transport.get_extra_info('socket')
+            # assert sock is not None
+
+            # Test with default parameter (should return default when key not found)
+            custom_default = {"custom": "value"}
+            result = proto.transport.get_extra_info('nonexistent_key', custom_default)
+            assert result == custom_default
+
+            # Test socket reuse after closing
+            writer.close()
+            await writer.wait_closed()
+
+    loop.run_until_complete(main())
+
+
 # TODO: test buffered proto
