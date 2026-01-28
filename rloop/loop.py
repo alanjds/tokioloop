@@ -1243,6 +1243,67 @@ def _TOKIOLOOP_PATCHED_get_running_loop():
         raise
 
 
+@functools.wraps(asyncio.events.get_event_loop)
+def _TOKIOLOOP_PATCHED_get_event_loop():
+    try:
+        # Check if original exists before trying to call it
+        if hasattr(asyncio.events, '_ORIGINAL_get_event_loop'):
+            return asyncio.events._ORIGINAL_get_event_loop()
+        else:
+            # If no original yet, just call the current function
+            return asyncio.events.get_event_loop()
+    except RuntimeError:
+        thread_id = threading.get_ident()
+
+        # Check if we have a thread-local loop
+        if hasattr(_tokioloop_threadlocal, 'current_loop'):
+            loop = _tokioloop_threadlocal.current_loop
+            if loop and not loop.is_closed():
+                logger.debug('Thread %s: get_event_loop() returning thread-local loop %s', thread_id, loop)
+                return loop
+            else:
+                logger.debug('Thread %s: Thread-local loop exists but is %s', thread_id, loop)
+
+        else:
+            ### THIS IS A HACK!!
+            # When attaching PyO3 via Python::attach() on Rust, it may start a clean threadlocal
+            # even if reusing an existing OS Thread. To solve it, the context will need to be
+            # applied every time the Python::attach() got called.
+            # For now, I will just assume that only one loop will be running.
+            # but this SHOULD be fixed later.
+            ###
+
+            # Try to auto-recover: find any non-closed loop that might be associated with this thread
+            for loop_id, loop_obj in _tokioloop_loops.items():
+                if loop_obj and not loop_obj.is_closed():
+                    logger.warning(f'Thread {thread_id}: Auto-recovering with loop {loop_id} for get_event_loop()')
+                    _tokioloop_threadlocal.current_loop = loop_obj
+                    return loop_obj
+
+        if hasattr(_tokioloop_threadlocal, 'current_loop'):
+            loop = _tokioloop_threadlocal.current_loop
+            if not loop or loop.is_closed():
+                logger.debug('No loop to be set: %r %s', loop, loop)
+                # Clear the thread-local loop since it's closed/None
+                _tokioloop_threadlocal.current_loop = None
+
+    # Fall back to original implementation
+    try:
+        if hasattr(asyncio.events, '_ORIGINAL_get_event_loop'):
+            return asyncio.events._ORIGINAL_get_event_loop()
+        else:
+            return asyncio.events.get_event_loop()
+    except Exception:
+        logger.debug('Current thread ID: %s', threading.get_ident())
+        logger.debug('Current _tokioloop_loops: %s', dict(_tokioloop_loops.items()))
+        logger.debug(
+            'Current _tokioloop_threadlocal.current_loop [thread_id=%s]: %s',
+            threading.get_ident(),
+            getattr(_tokioloop_threadlocal, 'current_loop', None),
+        )
+        raise
+
+
 class TokioLoopPolicy(__asyncio.AbstractEventLoopPolicy):
     _local = threading.local()
 
@@ -1284,6 +1345,15 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
             return True
         return False
 
+    @classmethod
+    def _patch_asyncio_events_get_event_loop(cls) -> bool:
+        if not hasattr(asyncio.events, '_ORIGINAL_get_event_loop'):
+            asyncio.events._ORIGINAL_get_event_loop = asyncio.events.get_event_loop  # type: ignore[attr-defined]
+            asyncio.events.get_event_loop = _TOKIOLOOP_PATCHED_get_event_loop  # type: ignore[assignment]
+            asyncio.events._TOKIO_PATCHED = True  # type: ignore[attr-defined]
+            return True
+        return False
+
     def __init__(self):
         if not isinstance(asyncio.get_event_loop_policy(), TokioLoopPolicy):
             logger.info('Setting TokioLoopPolicy as default event loop policy')
@@ -1291,6 +1361,9 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
 
         if self.__class__._patch_asyncio_events_get_running_loop():
             logger.info('Patched asyncio.events.get_running_loop() for %s', self.__class__.__name__)
+
+        if self.__class__._patch_asyncio_events_get_event_loop():
+            logger.info('Patched asyncio.events.get_event_loop() for %s', self.__class__.__name__)
 
         _register_tokio_thread(self, setcurrent=False)
         asyncio.get_event_loop_policy().set_event_loop(self)
