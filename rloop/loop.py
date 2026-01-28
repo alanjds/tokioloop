@@ -1243,6 +1243,32 @@ def _TOKIOLOOP_PATCHED_get_running_loop():
         raise
 
 
+class TokioLoopPolicy(__asyncio.AbstractEventLoopPolicy):
+    _local = threading.local()
+
+    def get_event_loop(self):
+        try:
+            return _TOKIOLOOP_PATCHED_get_running_loop()
+        except RuntimeError:
+            if not hasattr(self._local, "loop"):
+                self._local.loop = TokioLoop()
+                _register_tokio_thread(self._local.loop)
+            return self._local.loop
+
+    def set_event_loop(self, loop):
+        if loop is not None and not isinstance(loop, TokioLoop):
+            raise TypeError("Must be TokioLoop instance")
+        self._local.loop = loop
+
+    def new_event_loop(self):
+        return TokioLoop()
+
+    def get_child_watcher(self):
+        if not hasattr(self._local, "loop") or self._local.loop.is_closed():
+            self._local.loop = TokioLoop()
+        return self._local.loop._watcher_child
+
+
 class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     """Rust EventLoop based on `tokio`"""
 
@@ -1259,10 +1285,15 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
         return False
 
     def __init__(self):
+        if not isinstance(asyncio.get_event_loop_policy(), TokioLoopPolicy):
+            logger.info('Setting TokioLoopPolicy as default event loop policy')
+            asyncio.set_event_loop_policy(TokioLoopPolicy())
+
         if self.__class__._patch_asyncio_events_get_running_loop():
             logger.info('Patched asyncio.events.get_running_loop() for %s', self.__class__.__name__)
 
         _register_tokio_thread(self, setcurrent=False)
+        asyncio.get_event_loop_policy().set_event_loop(self)
         super().__init__()
 
         loop_id = id(self)
