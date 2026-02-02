@@ -5,11 +5,12 @@ from ._rloop import Server as _Server
 
 
 class Server:
-    __slots__ = ['_inner', '_sff']
+    __slots__ = ['_inner', '_sff', '_active']
 
     def __init__(self, inner: _Server):
         self._inner = inner
         self._sff = None
+        self._active = False
 
     def get_loop(self):
         return self._inner._loop
@@ -17,8 +18,6 @@ class Server:
     def is_serving(self):
         return self._inner._is_serving()
 
-    async def start_serving(self):
-        self._inner._start_serving()
 
     async def serve_forever(self):
         if self._sff is not None:
@@ -75,13 +74,18 @@ class Server:
         self._inner._streams_abort()
 
     async def __aenter__(self):
+        await self.start_serving()
         return self
 
     async def __aexit__(self, *exc):
         self.close()
-        # await self.wait_closed()
+        await self.wait_closed()
 
-    # TODO
     @property
     def sockets(self):
-        return tuple(asyncio.trsock.TransportSocket(s) for s in self._inner._sockets)
+        return self._inner._sockets
+
+    async def start_serving(self):
+        if not self._active:
+            self._inner._start_serving()
+            self._active = True

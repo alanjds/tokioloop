@@ -4,22 +4,16 @@ use std::{
 };
 
 use anyhow::Result;
-use pyo3::prelude::*;
+use pyo3::{ffi::c_str, prelude::*};
 use pyo3::types::PyBytes;
 use pyo3::IntoPyObjectExt;
 use tokio::{
     net::{TcpStream, TcpListener},
-    sync::mpsc,
-    task::JoinHandle,
     io::{AsyncReadExt, AsyncWriteExt},
 };
 
 use crate::{
-    handles::BoxedHandle,
-    tokio_event_loop::{TEventLoop, LoopHandlers},
-    tokio_handles::{TBoxedHandle, TCBHandle},
-    py::{run_in_ctx, run_in_ctx0, run_in_ctx1},
-    log::LogExc,
+    tokio_event_loop::TEventLoop,
 };
 
 /// Internal state management for tokio TCP connections
@@ -79,6 +73,8 @@ impl TokioTCPTransport {
 
         let protocol = protocol_factory.call0(py)?;
 
+        let mut extra = HashMap::new();
+
         let state = Arc::new(Mutex::new(TokioTCPTransportState {
             stream: Some(tokio_stream),
             read_buf: Vec::with_capacity(8192),
@@ -98,7 +94,7 @@ impl TokioTCPTransport {
             state,
             pyloop: event_loop.clone_ref(py),
             protocol: protocol.clone_ref(py),
-            extra: HashMap::new(),
+            extra,
             closing: false.into(),
             paused: false.into(),
             weof: false.into(),
@@ -339,8 +335,12 @@ impl TokioTCPTransport {
     fn get_extra_info(&self, py: Python, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match name {
             "socket" => {
-                // Return a mock socket object for compatibility
-                Ok(default.unwrap_or_else(|| py.None()))
+                // Return the actual stored socket object
+                if let Some(socket) = self.extra.get("socket") {
+                    Ok(socket.clone_ref(py))
+                } else {
+                    Ok(default.unwrap_or_else(|| py.None()))
+                }
             }
             "sockname" => {
                 match self.get_local_addr() {
@@ -513,13 +513,19 @@ impl TokioTCPServer {
         log::debug!("TokioTCPServer::from_fd: Tokio listener created successfully");
         log::debug!("TokioTCPServer::from_fd: Will serve on the address: {:?}", tokio_listener.local_addr());
 
+        // Create an empty list for sockets (will be populated by Python side)
+        let socks = Python::with_gil(|py| {
+            let socket_list = py.eval(c_str!("[]"), None, None)?;
+            Ok::<Py<PyAny>, PyErr>(socket_list.into())
+        })?;
+
         let server = Arc::new(Self {
             listener: Some(tokio_listener),
             protocol_factory,
             pyloop,
             transports: Arc::new(Mutex::new(Vec::new())),
             closed: Arc::new(false.into()),
-            socks: Python::attach(|py| py.None()),
+            socks,
             transports_py: Vec::new(),
         });
 
@@ -536,9 +542,12 @@ impl TokioTCPServer {
 
         let local_addr = stream.local_addr().ok();
         let peer_addr = stream.peer_addr().ok();
+        let fd = stream.as_raw_fd();
+
+        let mut extra = HashMap::new();
 
         let transport = TokioTCPTransport {
-            fd: stream.as_raw_fd() as usize,
+            fd: fd as usize,
             state: Arc::new(Mutex::new(TokioTCPTransportState {
                 stream: Some(stream),
                 read_buf: Vec::with_capacity(8192),
@@ -554,7 +563,7 @@ impl TokioTCPServer {
             })),
             pyloop: pyloop.clone_ref(py),
             protocol: protocol.clone_ref(py),
-            extra: HashMap::new(),
+            extra,
             closing: false.into(),
             paused: false.into(),
             weof: false.into(),

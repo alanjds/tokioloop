@@ -40,6 +40,17 @@ from .utils import _can_use_pidfd, _HAS_IPv6, _interleave_addrinfos, _ipaddr_inf
 
 logger = logging.getLogger(__name__)
 
+
+class _DetachedSocketWrapper:
+    __slots__ = ['_addr']
+
+    def __init__(self, addr):
+        self._addr = addr
+
+    def getsockname(self):
+        return self._addr
+
+
 class TrackingThredingLocal(threading.local):
     def __init__(self):
         logger.info('Initializing[thread_id=%s] %r', threading.get_ident(), hex(id(self)))
@@ -578,7 +589,19 @@ class _BaseRustLoop:
         for sock in sockets:
             sock.setblocking(False)
             rsocks.append((sock.fileno(), sock.family))
+
+        # Create a list of detached socket wrappers with getsockname() support
+        # We need to keep the wrappers in a separate list since we pass sockets to Rust
+        socks_for_rust = []
+        for sock in sockets:
+            try:
+                socks_for_rust.append(_DetachedSocketWrapper(sock.getsockname()))
+            except OSError:
+                socks_for_rust.append(None)
             sock.detach()
+
+        # Pass wrappers to Rust (for _sockets attribute)
+        sockets = socks_for_rust
 
         if ssl:
             logger.debug('Creating SSL server')

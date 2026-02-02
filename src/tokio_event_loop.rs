@@ -788,7 +788,9 @@ impl TEventLoop {
         }
 
         // Create TokioServer with the TCP servers
-        let tokio_server = crate::server::TokioServer::tcp(pyself.clone_ref(py), socks.clone_ref(py), servers);
+        // The TokioTCPServer.from_fd() already creates proper socket objects
+        // so we can use the original socks parameter as-is
+        let tokio_server = crate::server::TokioServer::tcp(pyself.clone_ref(py), socks, servers);
 
         Py::new(py, tokio_server)
     }
