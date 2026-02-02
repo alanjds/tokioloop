@@ -33,6 +33,7 @@ def test_create_server_stream_bittype(loop):
 @pytest.mark.skipif(not _HAS_IPv6, reason='no IPv6')
 def test_create_server_ipv6(loop):
     logger.warning('Loop used on test: %s %r', id(loop), loop)
+
     async def main():
         srv = await asyncio.start_server(lambda: None, '::1', 0)
         try:
@@ -83,6 +84,7 @@ def test_tcp_server_recv_send(loop):
 
 def test_transport_get_extra_info(loop):
     """Test get_extra_info method with various key names."""
+
     # Create a simple protocol and connection
     class TestProtocol(BaseProto):
         def connection_made(self, transport):
@@ -92,36 +94,41 @@ def test_transport_get_extra_info(loop):
 
     async def main():
         async with await loop.create_server(lambda: proto, '127.0.0.1', 0) as server:
-            # Create a client and connect
-            reader, writer = await asyncio.open_connection('127.0.0.1', server.sockets[0].getsockname()[1])
-
-            # Wait for connection_made to be called
+            # Wait a bit for server to be ready
             await asyncio.sleep(0.1)
 
-            # Test sockname retrieval
-            sockname = proto.transport.get_extra_info('sockname')
-            assert sockname is not None
-            assert isinstance(sockname, tuple)
-            assert sockname[0] == '127.0.0.1'
+            # Create a client and connect to a random port
+            addr_info = server.sockets[0].getsockname()
+            if addr_info:
+                host, port = addr_info
+                reader, writer = await asyncio.open_connection(host, port)
 
-            # Test peername retrieval
-            peername = proto.transport.get_extra_info('peername')
-            assert peername is not None
-            assert isinstance(peername, tuple)
-            assert peername[0] == '127.0.0.1'
+                # Wait for connection_made to be called
+                await asyncio.sleep(0.1)
 
-            # Test socket retrieval
-            sock = proto.transport.get_extra_info('socket')
-            # assert sock is not None
+                # Test sockname retrieval
+                sockname = proto.transport.get_extra_info('sockname')
+                assert sockname is not None
+                assert isinstance(sockname, tuple)
+                assert sockname[0] == '127.0.0.1'
 
-            # Test with default parameter (should return default when key not found)
-            custom_default = {"custom": "value"}
-            result = proto.transport.get_extra_info('nonexistent_key', custom_default)
-            assert result == custom_default
+                # Test peername retrieval
+                peername = proto.transport.get_extra_info('peername')
+                assert peername is not None
+                assert isinstance(peername, tuple)
+                assert peername[0] == '127.0.0.1'
 
-            # Test socket reuse after closing
-            writer.close()
-            await writer.wait_closed()
+                # Test socket retrieval
+                sock = proto.transport.get_extra_info('socket')
+                # assert sock is not None
+
+                # Test with default parameter (should return default when key not found)
+                custom_default = {'custom': 'value'}
+                result = proto.transport.get_extra_info('nonexistent_key', custom_default)
+                assert result == custom_default
+
+                writer.close()
+                await writer.wait_closed()
 
     loop.run_until_complete(main())
 
