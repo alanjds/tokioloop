@@ -11,9 +11,11 @@ use tokio::{
     net::{TcpStream, TcpListener},
     io::{AsyncReadExt, AsyncWriteExt},
 };
+use socket2::{Domain, Type};
 
 use crate::{
     tokio_event_loop::TEventLoop,
+    py::sock,
 };
 
 /// Internal state management for tokio TCP connections
@@ -51,11 +53,11 @@ impl TokioTCPTransport {
     pub fn from_py(
         py: Python,
         event_loop: &Py<TEventLoop>,
-        sock: (i32, i32),
+        sock_tuple: (i32, i32),
         protocol_factory: Py<PyAny>,
     ) -> PyResult<Self> {
         log::trace!("TokioTCPTransport::from_py called");
-        let (fd, _family) = sock;
+        let (fd, _family) = sock_tuple;
 
         // Convert the socket file descriptor to a tokio TcpStream
         let socket = _try_socket2_conversion(fd, 0)?;
@@ -74,6 +76,30 @@ impl TokioTCPTransport {
         let protocol = protocol_factory.call0(py)?;
 
         let mut extra = HashMap::new();
+
+        log::debug!("TokioTCPTransport::from_py: About to create socket for fd {}", fd);
+        let socket_factory = match sock(py) {
+            Ok(sf) => sf,
+            Err(e) => {
+                log::error!("TokioTCPTransport::from_py: Failed to get socket factory: {}", e);
+                return Err(e);
+            }
+        };
+        let py_socket = match socket_factory.call1((
+            i32::from(Domain::IPV4),
+            i32::from(Type::STREAM),
+            0,
+            fd
+        )) {
+            Ok(ps) => ps,
+            Err(e) => {
+                log::error!("TokioTCPTransport::from_py: Failed to create Python socket: {}", e);
+                return Err(e);
+            }
+        };
+        log::debug!("TokioTCPTransport::from_py: Created Python socket for fd {}", fd);
+        extra.insert("socket".to_string(), py_socket.unbind());
+        log::debug!("TokioTCPTransport::from_py: Inserted socket into extra map, size: {}", extra.len());
 
         let state = Arc::new(Mutex::new(TokioTCPTransportState {
             stream: Some(tokio_stream),
@@ -335,11 +361,9 @@ impl TokioTCPTransport {
     fn get_extra_info(&self, py: Python, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match name {
             "socket" => {
-                // Return the actual stored socket object
-                if let Some(socket) = self.extra.get("socket") {
-                    Ok(socket.clone_ref(py))
-                } else {
-                    Ok(default.unwrap_or_else(|| py.None()))
+                match self.extra.get("socket") {
+                    Some(py_obj) => Ok(py_obj.clone_ref(py)),
+                    None => Ok(default.unwrap_or_else(|| py.None())),
                 }
             }
             "sockname" => {
@@ -545,6 +569,15 @@ impl TokioTCPServer {
         let fd = stream.as_raw_fd();
 
         let mut extra = HashMap::new();
+
+        let socket_factory = sock(py)?;
+        let py_socket = socket_factory.call1((
+            i32::from(Domain::IPV4),
+            i32::from(Type::STREAM),
+            0,
+            fd
+        ))?;
+        extra.insert("socket".to_string(), py_socket.unbind());
 
         let transport = TokioTCPTransport {
             fd: fd as usize,
