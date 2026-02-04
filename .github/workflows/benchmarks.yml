@@ -28,7 +28,7 @@ jobs:
     - name: benchmark
       working-directory: ./benchmarks
       run: |
-        python benchmarks.py raw stream proto
+        RUST_BACKTRACE=1 RUST_LOG=INFO python benchmarks.py raw stream proto
     - name: upload results
       uses: actions/upload-artifact@v6
       with:
