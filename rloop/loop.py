@@ -50,6 +50,21 @@ class _DetachedSocketWrapper:
     def getsockname(self):
         return self._addr
 
+    def get_extra_info(self, name, default=None):
+        # Return socket address for 'sockname' key
+        if name == 'sockname':
+            return self._addr
+        # Return self for 'socket' key: returns the wrapper object itself
+        if name == 'socket':
+            logger.warning('get_extra_info socket requested. Returning self: %r', self)
+            return self
+        return default
+
+    def setsockopt(self, *args, **kwargs):
+        logger.warning('Mocked setsockopt call for %r with args=%s kwargs=%s', self, args, kwargs)
+        # Mock setsockopt for benchmark compatibility
+        pass
+
 
 class TrackingThredingLocal(threading.local):
     def __init__(self):
@@ -1456,3 +1471,8 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     def _check_closed(self):
         if self._closed:
             raise RuntimeError('Event loop is closed')
+
+    def setsockopt(self, *args, **kwargs):
+        logger.warning('Mocked setsockopt called for %s with: args=%s kwargs=%s', self, args, kwargs)
+        # Mock setsockopt for benchmark compatibility
+        pass
