@@ -30,6 +30,7 @@ def server(loop, streams=False, proto=False):
     if proto:
         proc_cmd += ' --proto'
 
+    print('SERVER:', proc_cmd)
     proc = subprocess.Popen(proc_cmd, shell=True, preexec_fn=os.setsid)  # noqa: S602
     time.sleep(2)
     yield proc
@@ -51,6 +52,7 @@ def client(duration, concurrency, msgsize):
         '--output json',
     ]
     try:
+        print('CLIENT:', ' '.join(cmd_parts))
         proc = subprocess.run(  # noqa: S602
             ' '.join(cmd_parts),
             shell=True,
