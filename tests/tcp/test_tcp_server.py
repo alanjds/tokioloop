@@ -154,6 +154,7 @@ def test_raw_tcp_server(loop):
         state['server_ready'] = True
 
         try:
+            await asyncio.sleep(0.1)
             # Accept connection using loop.sock_accept()
             client, addr = await loop.sock_accept(sock)
             logger.info('Connection from %s', addr)
@@ -179,6 +180,9 @@ def test_raw_tcp_server(loop):
         # Wait for server to be ready
         while not state['server_ready']:
             pass
+
+        import time
+        time.sleep(0.5)
 
         client_sock = socket.socket()
         with client_sock:
