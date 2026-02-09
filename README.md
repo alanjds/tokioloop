@@ -188,35 +188,6 @@ python benchmarks/client.py --addr 127.0.0.1:25000 --duration 10
 - **Async task system**: Uses tokio task system for concurrent operations across threads
 - **Signal handling**: Via socket-based delivery mechanism
 - **Patched asyncio events**: Overrides `get_running_loop()` and `get_event_loop()` to track threads
-
-## Known Limitations
-
-### Platform Limitations
-- Windows not supported (Unix-only design)
-- Requires Python 3.11+
-- Requires Rust toolchain for building
-
-### TokioLoop Current Limitations
-- TCP transport I/O operations are not fully implemented
-- Limited error recovery and cleanup
-- No comprehensive performance benchmarks yet
-- Multi-threading support is functional but needs more testing
-
-## Future Plans
-
-### Short-term
-- Fix TCP server socket conversion issues
-- Implement full async I/O in transports
-- Complete UDP functionality for TokioLoop
-- Achieve test parity with RLoop
-- Improve multi-threading test coverage
-
-### Long-term
-- Remove RLoop (mio-based) implementation
-- Add comprehensive performance benchmarks
-- Production-ready stability
-- Potential Windows support
-
 ## License
 
 RLoop is released under the BSD License.
