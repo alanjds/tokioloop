@@ -73,14 +73,6 @@ asyncio.run(main())
 
 ## Technology Stack
 
-### Core Technologies
-- **Rust 2024 Edition** - Systems programming language for core implementation
-- **mio 1.0** - Cross-platform I/O multiplexing (RLoop)
-- **tokio 1.0** - Async runtime (TokioLoop)
-- **PyO3 0.26** - Python bindings with GIL-less operation
-- **papaya 0.2** - Lock-free concurrent data structures
-- **rustls 0.23** - Native Rust TLS implementation
-- **socket2 0.6** - Low-level socket operations
 
 ## Current Status
 
