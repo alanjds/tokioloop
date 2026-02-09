@@ -2,7 +2,7 @@
 
 TokioLoop is an [AsyncIO](https://docs.python.org/3/library/asyncio.html) selector event loop implemented in Rust. The project provides two implementations:
 
-- **RLoop**: mio-based implementation (single-threaded, fully functional)
+- **RLoop**: mio-based implementation (single-threaded, functional)
 - **TokioLoop**: tokio-based implementation (multi-threaded, in development)
 
 > **Warning**: TokioLoop is currently a work in progress and definitely not suited for *production usage*.<br/>
