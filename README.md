@@ -99,49 +99,6 @@ RLoop also doesn't implement the following methods:
 
 While the stdlib's event loop will use the actual delay of callbacks when `call_later` is used with negative numbers, RLoop will treat those as `call_soon`, and thus the effective order will follow the invocation order, not the delay.
 
-## Development
-
-### Building from Source
-
-```bash
-# Clone repository
-git clone https://github.com/alanjds/tokioloop
-cd tokioloop
-
-# Install development dependencies
-uv sync --group all
-
-# Build extension in development mode
-RUSTFLAGS=-Awarnings maturin develop
-```
-
-### Running Tests
-
-```bash
-# Run all tests
-pytest
-
-# Run specific test module
-pytest tests/tcp/
-
-# Run with debug logging
-RUST_LOG=debug pytest tests/
-
-# Run linting
-ruff check
-ruff format
-```
-
-### Running Benchmarks
-
-```bash
-# Terminal 1: Start the benchmark server
-python benchmarks/server.py --loop tokioloop --addr 127.0.0.1:25000
-
-# Terminal 2: Run the benchmark client
-python benchmarks/client.py --addr 127.0.0.1:25000 --duration 10
-```
-
 ## License
 
 RLoop is released under the BSD License.
