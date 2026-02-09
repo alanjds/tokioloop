@@ -380,7 +380,6 @@ System Layer (kernel I/O)
 - TCP server socket conversion from `std::TcpListener` to `tokio::net::TcpListener` fails
 - TCP transport I/O operations are not fully implemented
 - Limited error recovery and cleanup
-- No comprehensive performance benchmarks yet
 - Multi-threading support is functional but needs more testing
 
 ### Platform Limitations
