@@ -4,7 +4,7 @@
 
 **TokioLoop** is a high-performance AsyncIO event loop implementation in Rust, built on top of the **tokio** crate. It provides a drop-in replacement for Python's standard library event loop with significant performance improvements and **multi-threading support**.
 
-**Note:** The codebase currently contains references to `RLoop`, a mio-based implementation that served as a proof-of-concept. RLoop is single-threaded and will be removed in the future once TokioLoop achieves stability and feature parity.
+**Note:** The codebase currently contains references to `RLoop`, a mio-based implementation that served as a solid baseline. RLoop is single-threaded and will be removed from this codebase in the future once TokioLoop achieves stability and feature parity.
 
 ## Technology Stack
 
@@ -188,7 +188,7 @@ fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()>
 # After ANY Rust code changes:
 RUSTFLAGS=-Awarnings maturin develop
 
-# Run all tests (IMPORTANT: Use sandb313t venv)
+# Run all tests (IMPORTANT: Use an existing 313t virtualenv)
 source /home/alanjds/.virtualenvs/sandb313t/bin/activate && pytest
 
 # Run specific test module
@@ -250,7 +250,7 @@ pytest --timeout=5
 
 ## Current Implementation Status
 
-### TokioLoop Status (as of 2026-01-28)
+### TokioLoop Status (as of 2026-01-28)  (needs recheck)
 - **Event Loop**: ✅ Basic infrastructure functional
 - **Multi-threading**: ✅ Thread-local tracking, patched asyncio events
 - **Task Scheduling**: ✅ Immediate and delayed tasks working
@@ -372,6 +372,7 @@ System Layer (kernel I/O)
 3. Check that `initialize_runtime(loop_id)` is called correctly
 4. Look for thread ID mismatches in logs
 5. Ensure `Python::attach()` is called correctly in Rust code
+6. Ensure no Python object is dropped while detached from Python. It causes panics. 
 
 ## Known Limitations
 

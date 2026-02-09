@@ -24,7 +24,7 @@ TokioLoop is an AsyncIO selector event loop implemented in Rust on top of the to
 - **Platform Support**: Unix systems only (Linux, macOS)
 - **Version**: 0.2.0
 
-### Known Limitations
+### Known Limitations  (needs recheck)
 - Different behavior for `call_later` with negative delays
 - **TokioLoop TCP server implementation broken** - continuous "Invalid argument (os error 22)" errors
 - **TokioLoop TCP client implementation incomplete** - no real async I/O operations

@@ -8,7 +8,7 @@ This file contains distilled, actionable insights from the raw reflection log fo
 - **After Rust changes:** `RUSTFLAGS=-Awarnings maturin develop` - Required for Python tests to reflect changes
 - **Run tests:** `pytest tests/tcp/ -v` for TCP validation
 - **Debug logging:** `RUST_LOG=debug` for detailed Rust logging
-- **Specific test:** `pytest tests/tcp/test_tcp_server.py::test_raw_tcp_server -v -s --timeout=30`
+- **Specific test:** `pytest tests/tcp/test_tcp_server.py::test_raw_tcp_server -v -s --timeout=5`
 
 ### Mixed Language Projects
 - Rust + Python extensions require rebuild steps after Rust code changes
@@ -51,7 +51,8 @@ use tokio::io::unix::AsyncFd;
 let fd_dup = unsafe { libc::dup(fd as i32) };
 
 // Convert to std socket
-let std_socket = unsafe { std::net::TcpListener::from_raw_fd(fd_dup) };
+let socket = crate::utils::_try_socket2_conversion(fd, backlog)?;
+let std_socket: std::net::TcpListener = socket.into();
 
 // Wrap in AsyncFd for tokio monitoring
 let async_fd = AsyncFd::new(std_socket).unwrap();
@@ -66,6 +67,7 @@ Python::attach(|py| {
     let handle_obj = Py::new(py, handle).unwrap();
     let mut state = TEventLoopRunState{};
     let _ = handle_obj.run(py, &loop_handlers, &state);
+    drop(handle_obj); // prevent panics
 });
 ```
 
@@ -127,7 +129,7 @@ Python::attach(|py| {
 - ✅ Python-Rust bindings
 - ✅ Import tests (6/6 pass)
 
-### Broken Components
+### Broken Components (needs recheck)
 - ❌ TCP server functionality (socket conversion issues)
 - ❌ TCP client functionality (incomplete)
 - ❌ Real I/O operations (missing)

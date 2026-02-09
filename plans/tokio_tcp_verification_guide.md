@@ -423,7 +423,7 @@ Monitor memory usage during extended runs:
 
 ```bash
 # Start server
-python benchmarks/server.py --loop rloop --addr 127.0.0.1:25000 &
+python benchmarks/server.py --loop tokioloop --addr 127.0.0.1:25000 &
 SERVER_PID=$!
 
 # Monitor memory

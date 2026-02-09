@@ -27,7 +27,7 @@
 3. **Connection Loop**: Server enters error loop without successful accepts
 4. **Resource Management**: Potential fd ownership issues between std and tokio
 
-#### TokioTCPTransport Issues
+#### TokioTCPTransport Issues (needs recheck)
 1. **I/O Task Integration**: start_io_tasks() is a simplified stub
 2. **Actual I/O Operations**: No real async read/write operations implemented
 3. **Event Loop Integration**: Transport I/O not connected to tokio event loop
@@ -65,7 +65,7 @@ This error repeats continuously, indicating the tokio listener cannot properly a
 - Real network data flow
 - Connection lifecycle management
 
-### What's Missing
+### What's Missing (needs recheck)
 - Proper async read/write operations
 - tokio::select! integration for I/O events
 - Error recovery and cleanup
