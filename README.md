@@ -22,8 +22,6 @@ TokioLoop aims to provide a high-performance alternative to Python's standard li
 
 #### RLoop (mio-based)
 - **Architecture**: Single-threaded event loop based on mio
-- **Features**: Complete TCP, UDP, SSL/TLS support
-- **Performance**: Production-ready for basic operations
 - **Future**: Will be removed once TokioLoop achieves feature parity
 
 #### TokioLoop (tokio-based)
