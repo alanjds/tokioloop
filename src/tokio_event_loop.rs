@@ -6,7 +6,7 @@ use anyhow::Result;
 use pyo3::prelude::*;
 use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use std::sync::atomic::AtomicBool;
-use tokio::{runtime::Runtime, task::JoinHandle, net::UnixStream};
+use tokio::{runtime::Runtime, task::JoinHandle, net::UnixStream, io::unix::AsyncFd};
 use async_channel::{Sender, Receiver};
 
 use crate::{
@@ -647,8 +647,6 @@ impl TEventLoop {
     ) -> PyResult<crate::tokio_handles::TCBHandle> {
         log::debug!("TokioEventLoop::add_reader called for fd: {}", fd);
 
-        // For now, implement a simple version that schedules the callback
-        // In a full implementation, this would register the fd with tokio's interest system
         let context = context.unwrap_or_else(|| copy_context(py));
         let handle = TCBHandle::new(callback.clone_ref(py), args.clone_ref(py), context.clone_ref(py));
         let handle_obj = Py::new(py, handle)?;
@@ -659,8 +657,58 @@ impl TEventLoop {
             callbacks.insert(fd, (handle_obj.clone_ref(py).into(), py.None(), context.clone_ref(py)));
         }
 
-        // Schedule an immediate task to check readability
-        self.schedule_handle(handle_obj.clone_ref(py), None)?;
+        // Spawn a tokio task to wait for the fd to become readable
+        let runtime = self.get_runtime();
+        let fd_dup = unsafe { libc::dup(fd as i32) };
+        if fd_dup == -1 {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to duplicate file descriptor: {}", std::io::Error::last_os_error())
+            ));
+        }
+
+        let callback_py = callback.clone_ref(py);
+        let args_py = args.clone_ref(py);
+        let context_py = context.clone_ref(py);
+        let loop_handlers = LoopHandlers {
+            exc_handler: Arc::clone(&self.exc_handler),
+            exception_handler: Arc::clone(&self.exception_handler),
+        };
+
+        runtime.spawn(async move {
+            // Use AsyncFd to wait for readability without consuming the connection
+            let std_socket = unsafe { std::net::TcpListener::from_raw_fd(fd_dup) };
+            let async_fd = match AsyncFd::new(std_socket) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    log::error!("Failed to create AsyncFd: {}", e);
+                    return;
+                }
+            };
+
+            // Wait for readability without consuming
+            match async_fd.readable().await {
+                Ok(mut guard) => {
+                    // Clear readiness
+                    guard.clear_ready();
+
+                    // Socket is readable - schedule the callback
+                    log::debug!("Fd {} is readable, scheduling callback", fd);
+                    Python::attach(|py| {
+                        let handle = TCBHandle::new(
+                            callback_py.clone_ref(py),
+                            args_py.clone_ref(py),
+                            context_py.clone_ref(py),
+                        );
+                        let handle_obj = Py::new(py, handle).unwrap();
+                        let mut state = TEventLoopRunState{};
+                        let _ = handle_obj.run(py, &loop_handlers, &state);
+                    });
+                }
+                Err(e) => {
+                    log::error!("Error waiting for fd {} to become readable: {}", fd, e);
+                }
+            }
+        });
 
         // Return a new handle with the same parameters
         Ok(TCBHandle::new(callback, args, context))
