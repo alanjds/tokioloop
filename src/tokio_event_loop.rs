@@ -676,8 +676,7 @@ impl TEventLoop {
 
         runtime.spawn(async move {
             // Use AsyncFd to wait for readability without consuming the connection
-            let std_socket = unsafe { std::net::TcpListener::from_raw_fd(fd_dup) };
-            let async_fd = match AsyncFd::new(std_socket) {
+            let async_fd = match AsyncFd::new(fd_dup) {
                 Ok(fd) => fd,
                 Err(e) => {
                     log::error!("Failed to create AsyncFd: {}", e);
