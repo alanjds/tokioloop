@@ -9,6 +9,9 @@ PRINT = 0
 
 
 async def echo_server(loop, address, unix):
+    global PRINT
+    if PRINT:
+        print(f'Server starting: loop={loop} addr={address} unix={unix}')
     if unix:
         sock = socket(AF_UNIX, SOCK_STREAM)
     else:
@@ -18,7 +21,7 @@ async def echo_server(loop, address, unix):
     sock.listen(5)
     sock.setblocking(False)
     if PRINT:
-        print('Server listening at', address)
+        print(f'Server listening at {address}: {sock}')
     with sock:
         while True:
             client, addr = await loop.sock_accept(sock)
@@ -28,6 +31,7 @@ async def echo_server(loop, address, unix):
 
 
 async def echo_client(loop, client):
+    global PRINT
     try:
         client.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
     except (OSError, NameError):
@@ -44,6 +48,7 @@ async def echo_client(loop, client):
 
 
 async def echo_client_streams(reader, writer):
+    global PRINT
     sock = writer.get_extra_info('socket')
     try:
         sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
@@ -78,11 +83,17 @@ class EchoProtocol(asyncio.Protocol):
 
 
 def run(args):
+    global PRINT
     if args.loop == 'rloop':
         import rloop
 
         loop = rloop.new_event_loop()
         print('using RLoop')
+    elif args.loop == 'tokioloop':
+        import rloop
+
+        loop = rloop.new_tokio_event_loop()
+        print('using TokioLoop')
     elif args.loop == 'uvloop':
         import uvloop
 
@@ -96,8 +107,9 @@ def run(args):
     loop.set_debug(False)
 
     if args.print:
-        global PRINT
         PRINT = 1
+        if PRINT:
+            print('PRINT ENABLED!!')
 
     unix = False
     if args.addr.startswith('file:'):

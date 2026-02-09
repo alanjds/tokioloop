@@ -13,6 +13,11 @@ mod tcp;
 mod time;
 mod udp;
 mod utils;
+// Tokio-based modules
+pub mod tokio_event_loop;
+pub mod tokio_handles;
+pub mod tokio_tcp;
+pub mod tokio_udp;
 
 pub(crate) fn get_lib_version() -> &'static str {
     static LIB_VERSION: OnceLock<String> = OnceLock::new();
@@ -34,6 +39,11 @@ fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()> {
     handles::init_pymodule(module)?;
     server::init_pymodule(module)?;
     ssl::init_pymodule(module)?;
+    // Register Tokio modules
+    tokio_event_loop::init_pymodule(module)?;
+    tokio_handles::init_pymodule(module)?;
+    tokio_tcp::init_pymodule(module)?;
+    tokio_udp::init_pymodule(module)?;
 
     Ok(())
 }

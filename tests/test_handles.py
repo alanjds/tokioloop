@@ -1,15 +1,36 @@
 import threading
+from logging import getLogger
 
 import pytest
-from conftest import _namegetter
+
+
+logger = getLogger(__name__)
 
 
 def run_loop(loop):
     async def run():
+        logger.debug('Calling loop.stop()')
         loop.stop()
 
     loop.run_until_complete(run())
 
+
+def test_multiple_calls_to_run_until_complete(loop):
+    logger.info('First call to run_until_complete for loop: %r', loop)
+    run_loop(loop)
+    logger.info('First call: loop stopped: %r', loop)
+
+    logger.info('Second call to run_until_complete for loop: %r', loop)
+    run_loop(loop)
+    logger.info('Second call: loop stopped: %r', loop)
+
+    logger.info('Third call to run_until_complete for loop: %r', loop)
+    run_loop(loop)
+    logger.info('Third call: loop stopped: %r', loop)
+
+    logger.info('Forth call to run_until_complete for loop: %r', loop)
+    run_loop(loop)
+    logger.info('Forth call: loop stopped: %r', loop)
 
 def test_call_soon(loop):
     calls = []
@@ -65,7 +86,7 @@ def test_call_at(loop):
     loop.run_forever()
     dt = loop.time() - t0
 
-    if _namegetter(loop).startswith('uvloop'):
+    if loop.__class__.__module__.startswith('uvloop'):
         # uvloop may be a bit loose on delaying
         delay *= 0.9
 
