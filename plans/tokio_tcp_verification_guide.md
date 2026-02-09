@@ -152,39 +152,6 @@ echo "Hello TokioLoop" | nc 127.0.0.1 8888
 - Server prints: `Closing connection`
 - Netcat receives: `Hello TokioLoop`
 
-#### Protocol-Based Test
-
-Create `test_protocol.py`:
-
-```python
-import asyncio
-import rloop
-
-class EchoProtocol(asyncio.Protocol):
-    def connection_made(self, transport):
-        self.transport = transport
-        print("Connection made")
-
-    def data_received(self, data):
-        print(f"Data received: {data}")
-        self.transport.write(data)
-
-    def connection_lost(self, exc):
-        print("Connection lost")
-
-async def main():
-    loop = rloop.new_tokio_event_loop()
-    asyncio.set_event_loop(loop)
-
-    server = await loop.create_server(EchoProtocol, '127.0.0.1', 8889)
-
-    async with server:
-        await asyncio.sleep(30)  # Run for 30 seconds
-
-if __name__ == '__main__':
-    asyncio.run(main())
-```
-
 ---
 
 ### Method 3: Benchmark Testing
