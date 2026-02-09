@@ -86,18 +86,13 @@ asyncio.run(main())
 - **rustls 0.23** - Native Rust TLS implementation
 - **socket2 0.6** - Low-level socket operations
 
-### Python Integration
-- **Target Versions**: Python 3.11+ (free threading support)
-- **Package Name**: `rloop` (Python package)
-- **Extension Module**: `_rloop` (Rust compiled module)
-
 ## Current Status
 
 ### RLoop (mio-based)
-- **Event Loop**: Fully functional
+- **Event Loop**: Functional
 - **TCP**: All tests passing
 - **UDP**: Functional
-- **SSL/TLS**: Working
+- **SSL/TLS**: Working on TLS 1.2 only.
 - **Multi-threading**: Single-threaded only
 
 ### TokioLoop (tokio-based)
@@ -105,8 +100,7 @@ asyncio.run(main())
 - **Multi-threading**: Thread-local tracking, patched asyncio events
 - **Task Scheduling**: Immediate and delayed tasks working
 - **Signal Handling**: Working via socket-based delivery
-- **TCP Server**: Socket conversion fixed (using socket2)
-- **TCP Transport**: Incomplete - I/O operations are placeholders
+- **TCP**: Working for Asynctio Protocols and Streams
 - **UDP**: Partially implemented
 
 ## Differences from stdlib
