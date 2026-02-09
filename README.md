@@ -28,7 +28,6 @@ TokioLoop aims to provide a high-performance alternative to Python's standard li
 - **Status**: In development
 - **Architecture**: Multi-threaded event loop based on tokio
 - **Features**: Basic infrastructure functional, TCP implementation in progress
-- **Performance**: Targeting significant improvements over RLoop
 - **Future**: Primary implementation once stable
 
 ## Installation
