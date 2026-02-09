@@ -172,22 +172,6 @@ python benchmarks/server.py --loop rloop --addr 127.0.0.1:25000
 python benchmarks/client.py --addr 127.0.0.1:25000 --duration 10
 ```
 
-## Architecture
-
-### RLoop Architecture (mio-based)
-- **mio-based**: Uses mio for I/O multiplexing
-- **Poll-based**: Event-driven polling with adaptive timeouts
-- **Single-threaded**: Runs on a single thread only
-- **Token-based indexing**: Uses mio Token system for I/O handle lookup
-
-### TokioLoop Architecture (tokio-based)
-- **Multi-threaded**: Designed to span coroutines across many threads using tokio's runtime
-- **Thread-aware**: Supports Python's free threading model
-- **Thread-local loop tracking**: Each thread can have its own TokioLoop instance
-- **Runtime-per-thread**: Each TokioLoop initializes its own tokio runtime
-- **Async task system**: Uses tokio task system for concurrent operations across threads
-- **Signal handling**: Via socket-based delivery mechanism
-- **Patched asyncio events**: Overrides `get_running_loop()` and `get_event_loop()` to track threads
 ## License
 
 RLoop is released under the BSD License.
