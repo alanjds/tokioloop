@@ -400,7 +400,6 @@ System Layer (kernel I/O)
 - Remove RLoop (mio-based) implementation
 - Add comprehensive performance benchmarks
 - Production-ready stability
-- Potential Windows support
 
 ## Resources
 
