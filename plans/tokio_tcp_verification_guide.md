@@ -193,7 +193,7 @@ if __name__ == '__main__':
 
 **Start Server:**
 ```bash
-python benchmarks/server.py --loop rloop --addr 127.0.0.1:25000 --print
+python benchmarks/server.py --loop tokioloop --addr 127.0.0.1:25000 --print
 ```
 
 **Run Client:**
