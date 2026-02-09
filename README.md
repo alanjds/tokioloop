@@ -5,9 +5,8 @@ TokioLoop is an [AsyncIO](https://docs.python.org/3/library/asyncio.html) select
 - **RLoop**: mio-based implementation (single-threaded, fully functional)
 - **TokioLoop**: tokio-based implementation (multi-threaded, in development)
 
-> **Warning**: RLoop is currently a work in progress and definitely not suited for *production usage*.
-
-> **Note:** RLoop is available on Unix systems only (Linux and macOS).
+> **Warning**: TokioLoop is currently a work in progress and definitely not suited for *production usage*.<br/>
+> **Note:** TokioLoop is available on Unix systems only (Linux and macOS).
 
 ## Overview
 
@@ -59,16 +58,13 @@ loop = TokioLoop()
 asyncio.set_event_loop(loop)
 ```
 
-## Technology Stack
-
-
 ## Current Status
 
 ### RLoop (mio-based)
 - **Event Loop**: Functional
 - **TCP**: All tests passing
 - **UDP**: Functional
-- **SSL/TLS**: Working on TLS 1.2 only.
+- **SSL/TLS**: TLS 1.2 is functional.
 - **Multi-threading**: Single-threaded only
 
 ### TokioLoop (tokio-based)
@@ -81,12 +77,12 @@ asyncio.set_event_loop(loop)
 
 ## Differences from stdlib
 
-At current time, when compared with the stdlib's event loop, RLoop doesn't support the following features:
+At current time, when compared with the stdlib's event loop, TokioLoop doesn't support the following features:
 
 - Unix Domain Sockets
 - debugging
 
-RLoop also doesn't implement the following methods:
+TokioLoop also doesn't implement the following methods:
 
 - `loop.sendfile`
 - `loop.connect_accepted_socket`
@@ -97,11 +93,11 @@ RLoop also doesn't implement the following methods:
 
 ### `call_later` with negative delays
 
-While the stdlib's event loop will use the actual delay of callbacks when `call_later` is used with negative numbers, RLoop will treat those as `call_soon`, and thus the effective order will follow the invocation order, not the delay.
+While the stdlib's event loop will use the actual delay of callbacks when `call_later` is used with negative numbers, TokioLoop will treat those as `call_soon`, and thus the effective order will follow the invocation order, not the delay.
 
 ## License
 
-RLoop is released under the BSD License.
+TokioLoop is released under the BSD License.
 
 ## Resources
 
