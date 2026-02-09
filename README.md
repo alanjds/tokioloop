@@ -224,7 +224,5 @@ RLoop is released under the BSD License.
 ## Resources
 
 - **Repository**: https://github.com/alanjds/tokioloop
-- **Documentation**: See inline code documentation
-- **Implementation Guide**: `plans/tokio_tcp_verification_guide.md`
 - **Memory Bank**: `memory-bank/` directory for project context
 - **Progress Report**: `memory-bank/progress.md` for implementation status
