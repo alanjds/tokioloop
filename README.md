@@ -166,7 +166,7 @@ ruff format
 
 ```bash
 # Terminal 1: Start the benchmark server
-python benchmarks/server.py --loop rloop --addr 127.0.0.1:25000
+python benchmarks/server.py --loop tokioloop --addr 127.0.0.1:25000
 
 # Terminal 2: Run the benchmark client
 python benchmarks/client.py --addr 127.0.0.1:25000 --duration 10
