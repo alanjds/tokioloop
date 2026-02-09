@@ -57,12 +57,6 @@ from rloop import TokioLoop
 
 loop = TokioLoop()
 asyncio.set_event_loop(loop)
-
-# Your async code here
-async def main():
-    # ... async code ...
-
-asyncio.run(main())
 ```
 
 ## Technology Stack
