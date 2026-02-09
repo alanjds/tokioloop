@@ -1,6 +1,6 @@
-# RLoop
+# TokioLoop
 
-RLoop is an [AsyncIO](https://docs.python.org/3/library/asyncio.html) selector event loop implemented in Rust. The project provides two implementations:
+TokioLoop is an [AsyncIO](https://docs.python.org/3/library/asyncio.html) selector event loop implemented in Rust. The project provides two implementations:
 
 - **RLoop**: mio-based implementation (single-threaded, fully functional)
 - **TokioLoop**: tokio-based implementation (multi-threaded, in development)
@@ -11,7 +11,7 @@ RLoop is an [AsyncIO](https://docs.python.org/3/library/asyncio.html) selector e
 
 ## Overview
 
-RLoop aims to provide a high-performance alternative to Python's standard library event loop implementation. By implementing the core event loop logic in Rust, it leverages:
+TokioLoop aims to provide a high-performance alternative to Python's standard library event loop implementation. By implementing the core event loop logic in Rust, it leverages:
 
 - Zero-cost abstractions and memory safety
 - Efficient I/O multiplexing (mio or tokio)

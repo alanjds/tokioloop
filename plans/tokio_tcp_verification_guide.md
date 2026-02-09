@@ -321,7 +321,7 @@ Check that tests cover:
 lsof -i :25000
 
 # Kill any existing processes
-killall python
+killall <get the pid of who is using the port 25000>
 
 # Run tests again
 pytest -v tests/tcp/
