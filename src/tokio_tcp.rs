@@ -190,7 +190,7 @@ impl TokioTCPTransport {
         let mut fd: i32 = 0;
 
         // Main async logic block - cleanup runs after regardless of how this exits
-        let fd_result = async {
+        let fd = async {
             let mut read_buf = [0u8; 8192];
 
             // Extract the stream and split it for reading and writing
@@ -326,25 +326,25 @@ impl TokioTCPTransport {
         }.await;
 
         // Cleanup phase - ALWAYS executed after the main loop, regardless of exit path
-        log::trace!("io_processing_loop: Cleaning up Python objects for fd={}", fd_result);
+        log::trace!("io_processing_loop: Cleaning up Python objects for fd={}", fd);
 
         Python::attach(|py| {
-            if fd_result > 0 {
+            if fd > 0 {
                 let transport_ref = transport.borrow(py);
                 if !connection_lost_called {
-                    log::trace!("Calling connection_lost for fd={}", fd_result);
+                    log::trace!("Calling connection_lost for fd={}", fd);
                     let _ = transport_ref.call_connection_lost(py, None);
                 }
                 drop(transport_ref);
             } else {
-                log::trace!("Calling connection_lost for fd={} ? No.", fd_result);
+                log::trace!("Calling connection_lost for fd={} ? No.", fd);
             }
 
-            log::trace!("io_processing_loop: Cleanup complete for fd={}", fd_result);
+            log::trace!("io_processing_loop: Cleanup complete for fd={}", fd);
         });
 
         // Note: transport and protocol are dropped by the caller (start_io_task) with GIL held
-        fd_result  // Return fd from function
+        fd  // Return fd from function
     }
 
     #[inline]

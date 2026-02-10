@@ -246,13 +246,14 @@ impl TEventLoop {
             }
         };
 
-        log::debug!("Scheduling task: {:?}", task);
+        let task_kind = format!("{:?}", task);
+        log::trace!("Scheduling task: {:?}", task);
         match self.scheduler_tx.clone().try_send(task) {
             Ok(()) => {
-                log::debug!("Task sent successfully");
+                log::debug!("Task sent successfully: {task_kind}");
             }
             Err(_) => {
-                log::debug!("Failed to schedule task - channel closed, ignoring");
+                log::debug!("Failed to schedule task. Channel closed, ignoring {task_kind}");
                 return Err(anyhow::anyhow!("Failed to schedule task - loop stopping & channel closed"));
             }
         }
@@ -649,7 +650,7 @@ impl TEventLoop {
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
     ) -> PyResult<crate::tokio_handles::TCBHandle> {
-        log::debug!("TokioEventLoop::add_reader called for fd: {}", fd);
+        log::debug!("TokioEventLoop::add_reader called: fd={}", fd);
 
         let context = context.unwrap_or_else(|| copy_context(py));
         let handle = TCBHandle::new(callback.clone_ref(py), args.clone_ref(py), context.clone_ref(py));
@@ -658,7 +659,7 @@ impl TEventLoop {
         // Store the callback for later execution when fd becomes readable
         {
             let mut callbacks = self.io_callbacks.pin();
-            log::debug!("Storing reader callback for fd: {} in io_callbacks", fd);
+            log::trace!("Storing reader callback in io_callbacks: fd={}", fd);
             callbacks.insert(fd, (handle_obj.clone_ref(py).into(), py.None(), context.clone_ref(py)));
         }
 
@@ -702,7 +703,7 @@ impl TEventLoop {
                     guard.clear_ready();
 
                     // Socket is readable - schedule the callback
-                    log::debug!("Fd {} is readable, scheduling callback", fd);
+                    log::trace!("Scheduling read callback. fd={}", fd);
                     Python::attach(|py| {
                         let handle = TCBHandle::new(
                             callback_py.clone_ref(py),
@@ -765,12 +766,12 @@ impl TEventLoop {
     }
 
     fn remove_reader(&self, py: Python, fd: usize) -> bool {
-        log::debug!("TokioEventLoop::remove_reader called for fd: {}", fd);
+        log::trace!("TokioEventLoop::remove_reader called for fd: {}", fd);
 
         // Remove the reader callback
         let mut callbacks = self.io_callbacks.pin();
         if let Some((reader_cb, writer_cb, ctx)) = callbacks.remove(&fd) {
-            log::debug!("Removed reader callback for fd: {} from io_callbacks", fd);
+            log::trace!("Removed reader callback for fd: {} from io_callbacks", fd);
             // Only return true if there was a reader callback
             !reader_cb.is_none(py)
         } else {
@@ -832,7 +833,7 @@ impl TEventLoop {
         // This allows _tcp_stream_bound to distinguish between transports and raw sockets
         let rself = pyself.get();
         rself.tcp_transports.pin().insert(fd, transport_py.clone_ref(py).into_any());
-        log::debug!("Registered TCP transport for fd: {}", fd);
+        log::debug!("Registered TCP transport. fd={}", fd);
 
         // Return transport and protocol
         Ok((transport_py, protocol))
@@ -891,14 +892,18 @@ impl TEventLoop {
     }
 
     fn _tcp_stream_bound(&self, fd: usize) -> bool {
-        log::debug!("TokioEventLoop::_tcp_stream_bound called for fd: {}", fd);
+        log::debug!("TokioEventLoop::_tcp_stream_bound called. fd={}", fd);
 
         // Check if we have a TCP transport registered for this fd
         // This is separate from io_callbacks to allow raw socket operations
         let transports = self.tcp_transports.pin();
         let is_bound = transports.contains_key(&fd);
-        let status = if is_bound { "bound" } else { "not bound" };
-        log::debug!("Fd {} is {} to a TCP transport", fd, status);
+
+        if is_bound {
+            log::trace!("TCP -> Transport [fd={}]", fd);
+        } else {
+            log::trace!("TCP -> Raw [fd={}]", fd);
+        }
         is_bound
     }
 
