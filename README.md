@@ -8,16 +8,9 @@ TokioLoop is an [AsyncIO](https://docs.python.org/3/library/asyncio.html) select
 > **Warning**: TokioLoop is currently a work in progress and definitely not suited for *production usage*.<br/>
 > **Note:** TokioLoop is available on Unix systems only (Linux and macOS).
 
-## Overview
-
-TokioLoop aims to provide a high-performance alternative to Python's standard library event loop implementation. By implementing the core event loop logic in Rust, it leverages:
-
-- Zero-cost abstractions and memory safety
-- Efficient I/O multiplexing (mio or tokio)
-- Direct system calls without Python overhead
-- Optimized memory management and concurrency patterns
-
 ### Two Implementations
+
+The current codebase for now have _two_ event loops based on Rust:
 
 #### RLoop (mio-based)
 - **Architecture**: Single-threaded event loop based on mio
@@ -32,7 +25,9 @@ TokioLoop aims to provide a high-performance alternative to Python's standard li
 ## Installation
 
 ```bash
-pip install rloop
+git clone https://github.com/alanjds/tokioloop.git
+cd tokioloop
+maturin develop
 ```
 
 ## Usage
@@ -54,32 +49,17 @@ asyncio.set_event_loop(loop)
 import asyncio
 from rloop import TokioLoop
 
-loop = TokioLoop()
+asyncio.set_event_loop_policy(rloop.TokioLoopPolicy())
+loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 ```
-
-## Current Status
-
-### RLoop (mio-based)
-- **Event Loop**: Functional
-- **TCP**: All tests passing
-- **UDP**: Functional
-- **SSL/TLS**: TLS 1.2 is functional.
-- **Multi-threading**: Single-threaded only
-
-### TokioLoop (tokio-based)
-- **Event Loop**: Basic infrastructure functional
-- **Multi-threading**: Thread-local tracking, patched asyncio events
-- **Task Scheduling**: Immediate and delayed tasks working
-- **Signal Handling**: Working via socket-based delivery
-- **TCP**: Working for Asynctio Protocols and Streams
-- **UDP**: Partially implemented
 
 ## Differences from stdlib
 
 At current time, when compared with the stdlib's event loop, TokioLoop doesn't support the following features:
 
 - Unix Domain Sockets
+- SSL
 - debugging
 
 TokioLoop also doesn't implement the following methods:
