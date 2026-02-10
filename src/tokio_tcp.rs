@@ -36,7 +36,7 @@ pub(crate) struct TokioTCPTransportState {
 /// Main transport class implementing asyncio transport interface
 #[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct TokioTCPTransport {
-    fd: usize,
+    pub(crate) fd: usize,
     state: Arc<Mutex<TokioTCPTransportState>>,
     pyloop: Py<TEventLoop>,
     protocol: Py<PyAny>,
@@ -477,6 +477,17 @@ impl TokioTCPTransport {
 
         let mut state = self.state.lock().unwrap();
         state.closing = true;
+
+        // Remove the transport from tcp_transports map
+        // This allows the FD to be used for raw socket operations after the transport is closed
+        let fd = self.fd;
+        let pyloop = self.pyloop.clone_ref(py);
+        {
+            let loop_ref = pyloop.borrow(py);
+            let tcp_transports = loop_ref.tcp_transports.pin();
+            tcp_transports.remove(&fd);
+            log::debug!("Removed TCP transport for fd: {}", fd);
+        }
 
         // Don't call connection_lost immediately: let the I/O loop handle it
         // Allows for any pending data to be received

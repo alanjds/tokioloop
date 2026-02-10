@@ -121,6 +121,8 @@ pub struct TEventLoop {
     sig_handlers: Arc<papaya::HashMap<u8, Py<PyAny>>>,
     // I/O handling fields for future tokio integration
     io_callbacks: Arc<papaya::HashMap<usize, (Py<PyAny>, Py<PyAny>, Py<PyAny>)>>,
+    // Transport tracking fields - separate from io_callbacks to allow raw socket operations
+    pub(crate) tcp_transports: Arc<papaya::HashMap<usize, Py<PyAny>>>,
 }
 
 impl TEventLoop {
@@ -290,6 +292,8 @@ impl TEventLoop {
             sig_handlers: Arc::new(papaya::HashMap::new()),
             // I/O handling fields for future tokio integration
             io_callbacks: Arc::new(papaya::HashMap::new()),
+            // Transport tracking fields - separate from io_callbacks to allow raw socket operations
+            tcp_transports: Arc::new(papaya::HashMap::new()),
         })
     }
 
@@ -654,6 +658,7 @@ impl TEventLoop {
         // Store the callback for later execution when fd becomes readable
         {
             let mut callbacks = self.io_callbacks.pin();
+            log::debug!("Storing reader callback for fd: {} in io_callbacks", fd);
             callbacks.insert(fd, (handle_obj.clone_ref(py).into(), py.None(), context.clone_ref(py)));
         }
 
@@ -749,9 +754,11 @@ impl TEventLoop {
         // Remove the reader callback
         let mut callbacks = self.io_callbacks.pin();
         if let Some((reader_cb, writer_cb, ctx)) = callbacks.remove(&fd) {
+            log::debug!("Removed reader callback for fd: {} from io_callbacks", fd);
             // Only return true if there was a reader callback
             !reader_cb.is_none(py)
         } else {
+            log::debug!("No reader callback found for fd: {} in io_callbacks", fd);
             false
         }
     }
@@ -797,11 +804,19 @@ impl TEventLoop {
             protocol_factory,
         )?;
 
+        let fd = transport.fd;
+
         // Convert to Py<TokioTCPTransport> for the attach method
         let transport_py = Py::new(py, transport)?;
 
         // Attach protocol to transport
         let _ = crate::tokio_tcp::TokioTCPTransport::attach(&transport_py, py)?;
+
+        // Register the transport in tcp_transports map
+        // This allows _tcp_stream_bound to distinguish between transports and raw sockets
+        let rself = pyself.get();
+        rself.tcp_transports.pin().insert(fd, transport_py.clone_ref(py).into_any());
+        log::debug!("Registered TCP transport for fd: {}", fd);
 
         // Return transport and protocol
         Ok((transport_py, protocol))
@@ -862,17 +877,13 @@ impl TEventLoop {
     fn _tcp_stream_bound(&self, fd: usize) -> bool {
         log::debug!("TokioEventLoop::_tcp_stream_bound called for fd: {}", fd);
 
-        // Check if we have any I/O callbacks registered for this fd
-        let callbacks = self.io_callbacks.pin();
-        if let Some((reader_cb, writer_cb, _ctx)) = callbacks.get(&fd) {
-            // If we have callbacks registered, it's considered "bound"
-            // to the event loop system - use Python::attach to get a py context
-            Python::attach(|py| {
-                !(reader_cb.is_none(py)) || !(writer_cb.is_none(py))
-            })
-        } else {
-            false
-        }
+        // Check if we have a TCP transport registered for this fd
+        // This is separate from io_callbacks to allow raw socket operations
+        let transports = self.tcp_transports.pin();
+        let is_bound = transports.contains_key(&fd);
+        let status = if is_bound { "bound" } else { "not bound" };
+        log::debug!("Fd {} is {} to a TCP transport", fd, status);
+        is_bound
     }
 
     fn _udp_conn(
