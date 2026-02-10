@@ -173,6 +173,23 @@ fn _rloop(_py: Python, module: &Bound<PyModule>) -> PyResult<()>
 - **Mutex**: Protecting shared state where necessary
 - **RwLock**: For configuration values and exception handlers
 
+#### Python Object Lifecycle Management
+- **Option wrapping**: Python objects wrapped in `Option` for controlled cleanup
+- **Explicit drop**: Objects dropped within `Python::attach` blocks with GIL held
+- **Cleanup pattern**: Used in `start_io_task` to prevent PyO3 panic on task cancellation
+
+**Example Pattern**:
+```rust
+let mut transport_opt = Some(transport_clone);
+let mut protocol_opt = Some(protocol);
+
+// Cleanup runs after io_processing_loop completes
+Python::attach(|_py| {
+    drop(transport_opt.take());
+    drop(protocol_opt.take());
+});
+```
+
 ### Error Handling
 
 #### Rust to Python Bridge
@@ -250,13 +267,15 @@ pytest --timeout=5
 
 ## Current Implementation Status
 
-### TokioLoop Status (as of 2026-01-28)
+### TokioLoop Status (as of 2026-02-10)
 - **Event Loop**: ✅ Basic infrastructure functional
 - **Multi-threading**: ✅ Thread-local tracking, patched asyncio events
 - **Task Scheduling**: ✅ Immediate and delayed tasks working
 - **Signal Handling**: ✅ Working via socket-based delivery
-- **TCP Server**: ❌ Broken - socket conversion issues
-- **TCP Transport**: ❌ Incomplete - I/O operations are placeholders
+- **TCP Server**: ✅ Socket conversion fixed, accepting connections
+- **TCP Transport**: ✅ I/O operations implemented with PyO3 cleanup fix
+- **PyO3 Cleanup**: ✅ Fixed "Cannot drop pointer without thread being attached" panic
+- **Benchmarks**: ✅ stream and proto benchmarks working
 - **UDP**: ⚠️ Partially implemented
 
 ### RLoop Status (Legacy, to be removed)
