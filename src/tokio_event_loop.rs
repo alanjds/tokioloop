@@ -685,6 +685,12 @@ impl TEventLoop {
                 Ok(fd) => fd,
                 Err(e) => {
                     log::error!("Failed to create AsyncFd: {}", e);
+                    // Drop Python objects while attached to avoid panic
+                    Python::attach(|_py| {
+                        drop(callback_py);
+                        drop(args_py);
+                        drop(context_py);
+                    });
                     return;
                 }
             };
@@ -706,10 +712,20 @@ impl TEventLoop {
                         let handle_obj = Py::new(py, handle).unwrap();
                         let mut state = TEventLoopRunState{};
                         let _ = handle_obj.run(py, &loop_handlers, &state);
+                        // Explicitly drop Python objects while attached to avoid panic
+                        drop(callback_py);
+                        drop(args_py);
+                        drop(context_py);
                     });
                 }
                 Err(e) => {
                     log::error!("Error waiting for fd {} to become readable: {}", fd, e);
+                    // Drop Python objects while attached to avoid panic
+                    Python::attach(|_py| {
+                        drop(callback_py);
+                        drop(args_py);
+                        drop(context_py);
+                    });
                 }
             }
         });
