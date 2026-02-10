@@ -151,24 +151,24 @@ impl TokioTCPTransport {
         // Spawn the I/O processing task with proper cleanup on cancellation
         let state_clone = state.clone();
         let io_task = runtime.spawn(async move {
-            // Wrap Python objects in ManuallyDrop to prevent automatic cleanup
-            let mut transport = std::mem::ManuallyDrop::new(transport_clone);
-            let mut protocol = std::mem::ManuallyDrop::new(protocol);
+            // Wrap Python objects in Option for take() semantics
+            let mut transport_opt = Some(transport_clone);
+            let mut protocol_opt = Some(protocol);
 
-            // Run the main I/O loop
-            Self::io_processing_loop(
-                &mut transport,
-                state_clone,
-                &mut protocol
-            ).await;
+            // Run the main I/O loop with references
+            // Store fd value for cleanup logging
+            let fd: i32;
+            {
+                let transport_ref = transport_opt.as_ref().expect("transport should exist");
+                let protocol_ref = protocol_opt.as_ref().expect("protocol should exist");
+                fd = Self::io_processing_loop(transport_ref, state_clone, protocol_ref).await;
+            }
 
-            // Cleanup phase
-            log::trace!("start_io_task: Dropping Python objects while attached");
+            // Cleanup phase - ALWAYS runs regardless of exit path
+            log::trace!("TASK CLEANUP: Dropping Python objects for fd={}", fd);
             Python::attach(|_py| {
-                unsafe {
-                    std::mem::ManuallyDrop::drop(&mut transport);
-                    std::mem::ManuallyDrop::drop(&mut protocol);
-                }
+                drop(transport_opt.take());
+                drop(protocol_opt.take());
             });
         });
 
@@ -182,15 +182,15 @@ impl TokioTCPTransport {
     }
 
     async fn io_processing_loop(
-        transport: &mut std::mem::ManuallyDrop<Py<TokioTCPTransport>>,
+        transport: &Py<TokioTCPTransport>,
         state: Arc<Mutex<TokioTCPTransportState>>,
-        protocol: &mut std::mem::ManuallyDrop<Py<PyAny>>,
-    ) {
+        protocol: &Py<PyAny>,
+    ) -> i32 {
         let mut connection_lost_called = false;
         let mut fd: i32 = 0;
 
         // Main async logic block - cleanup runs after regardless of how this exits
-        let _main_result = async {
+        let fd_result = async {
             let mut read_buf = [0u8; 8192];
 
             // Extract the stream and split it for reading and writing
@@ -201,7 +201,7 @@ impl TokioTCPTransport {
 
             let Some(stream) = stream_opt else {
                 log::error!("No stream available for I/O processing");
-                return;
+                return 0;
             };
 
             // For logs
@@ -322,27 +322,29 @@ impl TokioTCPTransport {
                     break;
                 }
             }
+            fd  // Return fd from async block
         }.await;
 
-        // Cleanup phase
-        log::trace!("io_processing_loop: Cleaning up Python objects for fd={}", fd);
+        // Cleanup phase - ALWAYS executed after the main loop, regardless of exit path
+        log::trace!("io_processing_loop: Cleaning up Python objects for fd={}", fd_result);
 
         Python::attach(|py| {
-            if fd > 0 {
+            if fd_result > 0 {
                 let transport_ref = transport.borrow(py);
                 if !connection_lost_called {
-                    log::trace!("Calling connection_lost for fd={}", fd);
+                    log::trace!("Calling connection_lost for fd={}", fd_result);
                     let _ = transport_ref.call_connection_lost(py, None);
                 }
                 drop(transport_ref);
             } else {
-                log::trace!("Calling connection_lost for fd={} ? No.", fd);
+                log::trace!("Calling connection_lost for fd={} ? No.", fd_result);
             }
 
-            log::trace!("io_processing_loop: Cleanup complete for fd={}", fd);
+            log::trace!("io_processing_loop: Cleanup complete for fd={}", fd_result);
         });
 
         // Note: transport and protocol are dropped by the caller (start_io_task) with GIL held
+        fd_result  // Return fd from function
     }
 
     #[inline]
