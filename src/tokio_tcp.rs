@@ -148,10 +148,28 @@ impl TokioTCPTransport {
 
         let runtime = pyloop.borrow(py).get_runtime();
 
-        // Spawn the I/O processing task
+        // Spawn the I/O processing task with proper cleanup on cancellation
         let state_clone = state.clone();
         let io_task = runtime.spawn(async move {
-            Self::io_processing_loop(transport_clone, state_clone, protocol).await;
+            // Wrap Python objects in ManuallyDrop to prevent automatic cleanup
+            let mut transport = std::mem::ManuallyDrop::new(transport_clone);
+            let mut protocol = std::mem::ManuallyDrop::new(protocol);
+
+            // Run the main I/O loop
+            Self::io_processing_loop(
+                &mut transport,
+                state_clone,
+                &mut protocol
+            ).await;
+
+            // Cleanup phase
+            log::trace!("start_io_task: Dropping Python objects while attached");
+            Python::attach(|_py| {
+                unsafe {
+                    std::mem::ManuallyDrop::drop(&mut transport);
+                    std::mem::ManuallyDrop::drop(&mut protocol);
+                }
+            });
         });
 
         // Store the task handle
@@ -164,159 +182,167 @@ impl TokioTCPTransport {
     }
 
     async fn io_processing_loop(
-        transport: Py<TokioTCPTransport>,
+        transport: &mut std::mem::ManuallyDrop<Py<TokioTCPTransport>>,
         state: Arc<Mutex<TokioTCPTransportState>>,
-        protocol: Py<PyAny>,
+        protocol: &mut std::mem::ManuallyDrop<Py<PyAny>>,
     ) {
-        let mut read_buf = [0u8; 8192];
-
-        // Extract the stream and split it for reading and writing
-        let stream_opt = {
-            let mut state_lock = state.lock().unwrap();
-            std::mem::take(&mut state_lock.stream)
-        };
-
-        let Some(stream) = stream_opt else {
-            log::error!("No stream available for I/O processing");
-            return;
-        };
-
-        // For logs
-        let fd = stream.as_raw_fd();
-
-        let (mut reader, mut writer) = tokio::io::split(stream);
-
         let mut connection_lost_called = false;
+        let mut fd: i32 = 0;
 
-        loop {
-            // Check if we should stop
-            let (is_closing, is_paused, read_eof) = {
-                let state_lock = state.lock().unwrap();
-                (state_lock.closing, state_lock.paused, state_lock.read_eof)
+        // Main async logic block - cleanup runs after regardless of how this exits
+        let _main_result = async {
+            let mut read_buf = [0u8; 8192];
+
+            // Extract the stream and split it for reading and writing
+            let stream_opt = {
+                let mut state_lock = state.lock().unwrap();
+                std::mem::take(&mut state_lock.stream)
             };
 
-            if is_closing {
-                log::trace!("TCP connection is_closing. Exiting the loop [fd={}]", fd);
-                break;
-            }
+            let Some(stream) = stream_opt else {
+                log::error!("No stream available for I/O processing");
+                return;
+            };
 
-            // If paused, just wait then recheck (loop)
-            if is_paused {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            }
+            // For logs
+            fd = stream.as_raw_fd() as i32;
 
-            tokio::select! {
-                // Handle reading: only if we have not received EOF yet
-                result = reader.read(&mut read_buf), if !read_eof => {
-                    match result {
-                        Ok(0) => {
-                            // EOF received
-                            log::trace!("TCP connection EOF received [fd={}]", fd);
-                            {
-                                let mut state_lock = state.lock().unwrap();
-                                state_lock.read_eof = true;
-                            }
-                            Python::attach(|py| {
-                                let _ = protocol.call_method0(py, pyo3::intern!(py, "eof_received"));
-                            });
-                        }
-                        Ok(n) => {
-                            // Data received, forward to protocol
-                            let data = read_buf[..n].to_vec();
-                            Python::attach(|py| {
-                                let _ = protocol.call_method1(
-                                    py,
-                                    pyo3::intern!(py, "data_received"),
-                                    (PyBytes::new(py, &data),)
-                                );
-                            });
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // No data available, continue
-                        }
-                        Err(e) => {
-                            log::error!("TCP read error: [fd={}] {}", fd, e);
-                            break;
-                        }
-                    }
+            let (mut reader, mut writer) = tokio::io::split(stream);
+
+            loop {
+                // Check if we should stop
+                let (is_closing, is_paused, read_eof) = {
+                    let state_lock = state.lock().unwrap();
+                    (state_lock.closing, state_lock.paused, state_lock.read_eof)
+                };
+
+                if is_closing {
+                    log::trace!("TCP connection is_closing. Exiting the loop [fd={}]", fd);
+                    break;
                 }
 
-                _ = async {
-                    // Writing & shutdown should be handled with both locked
-                    let (write_data, should_shutdown_now) = {
-                        let mut state_lock = state.lock().unwrap();
-                        let write_data = state_lock.write_buf.pop_front();
-                        let should_shutdown = state_lock.weof
-                            && state_lock.write_buf.is_empty()
-                            && !state_lock.write_shutdown_done;
-                        (write_data, should_shutdown)
-                    };
+                // If paused, just wait then recheck (loop)
+                if is_paused {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    continue;
+                }
 
-                    // Handle writing first
-                    if let Some(data) = write_data {
-                        if let Err(e) = writer.write_all(&data).await {
-                            log::error!("TCP write error: [fd={}] {}", fd, e);
-                        } else {
-                            log::trace!("TCP wrote {} bytes [fd={}]", data.len(), fd);
-                            if let Err(e) = writer.flush().await {
-                                log::error!("TCP flush error: [fd={}] {}", fd, e);
+                tokio::select! {
+                    // Handle reading: only if we have not received EOF yet
+                    result = reader.read(&mut read_buf), if !read_eof => {
+                        match result {
+                            Ok(0) => {
+                                // EOF received
+                                log::trace!("TCP connection EOF received [fd={}]", fd);
+                                {
+                                    let mut state_lock = state.lock().unwrap();
+                                    state_lock.read_eof = true;
+                                }
+                                Python::attach(|py| {
+                                    let _ = protocol.call_method0(py, pyo3::intern!(py, "eof_received"));
+                                });
+                            }
+                            Ok(n) => {
+                                // Data received, forward to protocol
+                                let data = read_buf[..n].to_vec();
+                                Python::attach(|py| {
+                                    let _ = protocol.call_method1(
+                                        py,
+                                        pyo3::intern!(py, "data_received"),
+                                        (PyBytes::new(py, &data),)
+                                    );
+                                });
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                // No data available, continue
+                            }
+                            Err(e) => {
+                                log::error!("TCP read error: [fd={}] {}", fd, e);
+                                break;
                             }
                         }
                     }
 
-                    // Shutdown only with empty buffer
-                    if should_shutdown_now {
-                        log::trace!("TCP writer shutdown starting [fd={}]", fd);
-                        if let Err(e) = writer.shutdown().await {
-                            log::debug!("TCP writer shutdown error (may be expected): [fd={}] {}", fd, e);
+                    _ = async {
+                        // Writing & shutdown should be handled with both locked
+                        let (write_data, should_shutdown_now) = {
+                            let mut state_lock = state.lock().unwrap();
+                            let write_data = state_lock.write_buf.pop_front();
+                            let should_shutdown = state_lock.weof
+                                && state_lock.write_buf.is_empty()
+                                && !state_lock.write_shutdown_done;
+                            (write_data, should_shutdown)
+                        };
+
+                        // Handle writing first
+                        if let Some(data) = write_data {
+                            if let Err(e) = writer.write_all(&data).await {
+                                log::error!("TCP write error: [fd={}] {}", fd, e);
+                            } else {
+                                log::trace!("TCP wrote {} bytes [fd={}]", data.len(), fd);
+                                if let Err(e) = writer.flush().await {
+                                    log::error!("TCP flush error: [fd={}] {}", fd, e);
+                                }
+                            }
                         }
 
-                        let mut state_lock = state.lock().unwrap();
-                        state_lock.write_shutdown_done = true;
-                        log::debug!("TCP writer shutdown completed [fd={}]", fd);
-                    }
-                }, if {
+                        // Shutdown only with empty buffer
+                        if should_shutdown_now {
+                            log::trace!("TCP writer shutdown starting [fd={}]", fd);
+                            if let Err(e) = writer.shutdown().await {
+                                log::debug!("TCP writer shutdown error (may be expected): [fd={}] {}", fd, e);
+                            }
+
+                            let mut state_lock = state.lock().unwrap();
+                            state_lock.write_shutdown_done = true;
+                            log::debug!("TCP writer shutdown completed [fd={}]", fd);
+                        }
+                    }, if {
+                        let state_lock = state.lock().unwrap();
+                        !state_lock.write_buf.is_empty() ||
+                        (state_lock.weof && !state_lock.write_shutdown_done)
+                    } => {}
+
+                    // Prevent a busy loop
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+
+                // Graceful shutdown only after everything else. May never occur
+                let should_exit = {
                     let state_lock = state.lock().unwrap();
-                    !state_lock.write_buf.is_empty() ||
-                    (state_lock.weof && !state_lock.write_shutdown_done)
-                } => {}
+                    (state_lock.read_eof && state_lock.write_buf.is_empty())
+                    // ^-- Exit when client closes without server doing write_eof()
+                        || (state_lock.read_eof
+                            && state_lock.write_shutdown_done
+                            && state_lock.write_buf.is_empty())
+                };
 
-                // Prevent a busy loop
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                if should_exit {
+                    log::trace!("TCP connection gracefully closed (read EOF + no pending writes) [fd={}]", fd);
+                    break;
+                }
             }
+        }.await;
 
-            // Graceful shutdown only after everything else. May never occur
-            let should_exit = {
-                let state_lock = state.lock().unwrap();
-                (state_lock.read_eof && state_lock.write_buf.is_empty())
-                // ^-- Exit when client closes without server doing write_eof()
-                    || (state_lock.read_eof
-                        && state_lock.write_shutdown_done
-                        && state_lock.write_buf.is_empty())
-            };
+        // Cleanup phase
+        log::trace!("io_processing_loop: Cleaning up Python objects for fd={}", fd);
 
-            if should_exit {
-                log::trace!("TCP connection gracefully closed (read EOF + no pending writes) [fd={}]", fd);
-                break;
-            }
-        }
-
-        log::trace!("Prepare to call connection_lost on TCP [fd={}]", fd);
         Python::attach(|py| {
-            let transport_ref = transport.borrow(py);
-
-            if !connection_lost_called {
-                connection_lost_called = true;
-                transport_ref.call_connection_lost(py, None);
-                log::debug!("Called connection_lost on TCP [fd={}]", fd);
+            if fd > 0 {
+                let transport_ref = transport.borrow(py);
+                if !connection_lost_called {
+                    log::trace!("Calling connection_lost for fd={}", fd);
+                    let _ = transport_ref.call_connection_lost(py, None);
+                }
+                drop(transport_ref);
             } else {
-                log::debug!("connection_lost already called, skipping [fd={}]", fd);
+                log::trace!("Calling connection_lost for fd={} ? No.", fd);
             }
-            // Explicitly drop transport_ref while still attached to Python
-            // to avoid panic when Py<T> tries to decrement refcount
-            drop(transport_ref);
+
+            log::trace!("io_processing_loop: Cleanup complete for fd={}", fd);
         });
+
+        // Note: transport and protocol are dropped by the caller (start_io_task) with GIL held
     }
 
     #[inline]
