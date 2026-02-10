@@ -47,7 +47,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 async-channel = "2.1"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.178"
+libc = "0.2.180"
 
 [build-dependencies]
 pyo3-build-config = "=0.27"
