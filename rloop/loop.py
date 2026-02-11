@@ -1409,7 +1409,14 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
 
         loop_id = id(self)
         logger.debug('Initializing TokioLoop.runtime with id=%s', loop_id)
-        self.initialize_runtime(loop_id)
+        try:
+            gil_enabled = sys._is_gil_enabled()
+        except AttributeError:
+            gil_enabled = True  # Default to True for older Python versions
+
+        runtime_mode = 'single' if gil_enabled else 'multi'
+        logger.debug('TokioLoop runtime mode for: %s (GIL enabled: %s)', runtime_mode, gil_enabled)
+        self.initialize_runtime(loop_id, runtime_mode)
 
         self._exc_handler = _exception_handler
         # TODO: Initialize tokio-specific components

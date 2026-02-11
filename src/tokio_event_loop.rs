@@ -104,6 +104,7 @@ impl LoopHandlers {
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub struct TEventLoop {
     runtime: OnceLock<Arc<Runtime>>,
+    runtime_mode: OnceLock<String>,
     scheduler_tx: Sender<ScheduledTask>,
     scheduler_rx: Receiver<ScheduledTask>,
     counter_ready: atomic::AtomicUsize,
@@ -266,6 +267,13 @@ impl TEventLoop {
             .clone();
         runtime
     }
+
+    pub fn get_runtime_mode(&self) -> String {
+        let runtime = self.runtime_mode.get()
+            .expect("Runtime not initialized - call initialize_runtime first")
+            .clone();
+        runtime
+    }
 }
 
 #[pymethods]
@@ -277,6 +285,7 @@ impl TEventLoop {
 
         Ok(Self {
             runtime: OnceLock::new(),  // Will be initialized later
+            runtime_mode: OnceLock::new(),  // Will be initialized later
             scheduler_tx,
             scheduler_rx,
             counter_ready: atomic::AtomicUsize::new(0),
@@ -298,29 +307,52 @@ impl TEventLoop {
         })
     }
 
-    fn initialize_runtime(&self, py: Python, loop_id: usize) -> PyResult<()> {
+    fn initialize_runtime(&self, py: Python, loop_id: usize, runtime_mode: &str) -> PyResult<()> {
         use tokio::runtime::Builder;
 
         let loop_id_clone = loop_id;
 
-        // Create custom runtime with automatic thread registration
-        let runtime = Builder::new_multi_thread()
-            .thread_name(format!("tokio-worker-{}", loop_id))
-            .on_thread_start(move || {
-                // This runs exactly once when each tokio worker thread starts
-                Python::attach(|py| -> PyResult<()> {
-                    let rloop_mod = py.import("rloop.loop")?;
-                    let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
-                    register_fn.call1((loop_id_clone,))?;
-                    log::trace!("Registered tokio thread with loop_id: {}", loop_id_clone);
-                    Ok(())
-                }).expect("Failed to register tokio thread");
-            })
-            .enable_all()
-            .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to create Tokio runtime: {}", e)))?;
+        // Choose runtime based on mode (GIL-enabled = single thread, free-threading = multi thread)
+        let runtime: tokio::runtime::Runtime = if runtime_mode == "single" {
+            log::info!("Creating single-threaded tokio runtime (GIL enabled mode)");
+            let local_runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to create single-threaded Tokio runtime: {}", e)
+                ))?;
+            // The current is the thread. Lets register it right now.
+            Python::attach(|py| -> PyResult<()> {
+                let rloop_mod = py.import("rloop.loop")?;
+                let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
+                register_fn.call1((loop_id_clone,))?;
+                log::trace!("Registered tokio thread with loop_id: {}", loop_id_clone);
+                Ok(())
+            }).expect("Failed to register tokio thread");
+            local_runtime
+        } else {
+            log::info!("Creating multi-threaded tokio runtime (free-threading mode)");
+            Builder::new_multi_thread()
+                .thread_name(format!("tokio-worker-{}", loop_id))
+                .on_thread_start(move || {
+                    // This runs exactly once when each tokio worker thread starts
+                    Python::attach(|py| -> PyResult<()> {
+                        let rloop_mod = py.import("rloop.loop")?;
+                        let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
+                        register_fn.call1((loop_id_clone,))?;
+                        log::trace!("Registered tokio thread with loop_id: {}", loop_id_clone);
+                        Ok(())
+                    }).expect("Failed to register tokio thread");
+                })
+                .enable_all()
+                .build()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("Failed to create multi-threaded Tokio runtime: {}", e)
+                ))?
+        };
 
-        // Use interior mutability to modify runtime field
+        // Use interior mutability to modify runtime fields
+        let _ = self.runtime_mode.set(runtime_mode.into());
         self.runtime.set(Arc::new(runtime))
             .map_err(|_| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "Runtime already initialized"
@@ -373,6 +405,7 @@ impl TEventLoop {
 
     fn _run(&self, py: Python) -> PyResult<()> {
         let runtime = self.get_runtime();
+        let runtime_mode = self.get_runtime_mode();
 
         // Create LoopHandlers for use in the async task
         let loop_handlers = LoopHandlers {
@@ -536,7 +569,7 @@ impl TEventLoop {
                                     // Execute Python callback in GIL
                                     log::trace!("PyO3: attaching Python to run the task");
 
-                                    rt.spawn_blocking(move || {
+                                    let run_handle = move || {
                                         Python::attach(|py|{
                                             log::debug!("Executing handle in tokio context");
                                             // Execute the handle with proper context
@@ -544,14 +577,18 @@ impl TEventLoop {
                                             log::debug!("Handle execution completed");
                                             // to avoid panic when Py<T> tries to decrement refcount
                                             drop(handle);
-                                        })
-                                    });
-                                } else {
-                                    rt.spawn_blocking(move || {
-                                        Python::attach(|_py|{
-                                            // to avoid panic when Py<T> tries to decrement refcount
-                                            drop(handle);
                                         });
+                                    };
+
+                                    if runtime_mode == "single" {
+                                        run_handle(); // GIL enabled.
+                                    } else {
+                                        rt.spawn_blocking(run_handle); // No GIL.
+                                    }
+                                } else {
+                                    Python::attach(|_py|{
+                                        // to avoid panic when Py<T> tries to decrement refcount
+                                        drop(handle);
                                     });
                                 }
                             } else {
