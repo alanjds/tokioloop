@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import datetime
 import json
 import multiprocessing
@@ -8,6 +9,9 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 WD = Path(__file__).resolve().parent
@@ -31,10 +35,13 @@ def server(loop, streams=False, proto=False):
         proc_cmd += ' --proto'
 
     print('SERVER:', proc_cmd)
-    proc = subprocess.Popen(proc_cmd, shell=True, preexec_fn=os.setsid)  # noqa: S602
-    time.sleep(2)
-    yield proc
-    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    try:
+        proc = subprocess.Popen(proc_cmd, shell=True, preexec_fn=os.setsid)  # noqa: S602
+        time.sleep(2)
+        yield proc
+    finally:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        print('Server gone.')
 
 
 def client(duration, concurrency, msgsize):
@@ -63,6 +70,7 @@ def client(duration, concurrency, msgsize):
         return data
     except Exception as e:
         print(f'WARN: got exception {e} while loading client data')
+        logger.error('Error', exc_info=True)
         return {}
 
 
