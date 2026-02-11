@@ -527,6 +527,7 @@ impl TEventLoop {
                         handle = current_handles_rx.recv() => {
                             if let Some(handle) = handle {
                                 log::trace!("Task received to run");
+                                let rt = tokio::runtime::Handle::current();
                                 if !handle.cancelled() {
                                     // Clone handlers for this handle execution
                                     let handlers = loop_handlers.clone();
@@ -534,18 +535,23 @@ impl TEventLoop {
 
                                     // Execute Python callback in GIL
                                     log::trace!("PyO3: attaching Python to run the task");
-                                    Python::attach(|py|{
-                                        log::debug!("Executing handle in tokio context");
-                                        // Execute the handle with proper context
-                                        let _ = handle.run(py, &handlers, &state);
-                                        log::debug!("Handle execution completed");
-                                        // to avoid panic when Py<T> tries to decrement refcount
-                                        drop(handle);
-                                    })
+
+                                    rt.spawn_blocking(move || {
+                                        Python::attach(|py|{
+                                            log::debug!("Executing handle in tokio context");
+                                            // Execute the handle with proper context
+                                            let _ = handle.run(py, &handlers, &state);
+                                            log::debug!("Handle execution completed");
+                                            // to avoid panic when Py<T> tries to decrement refcount
+                                            drop(handle);
+                                        })
+                                    });
                                 } else {
-                                    Python::attach(|_py|{
-                                        // to avoid panic when Py<T> tries to decrement refcount
-                                        drop(handle);
+                                    rt.spawn_blocking(move || {
+                                        Python::attach(|_py|{
+                                            // to avoid panic when Py<T> tries to decrement refcount
+                                            drop(handle);
+                                        });
                                     });
                                 }
                             } else {
