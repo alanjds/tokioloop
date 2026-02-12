@@ -276,6 +276,27 @@ impl TEventLoop {
     }
 }
 
+/// Macro to execute Python code with proper handling for GIL vs free-threading modes
+/// `runtime_mode` "single" (GIL enabled) executes directly
+/// `runtime_mode` "multi" (free-threading) uses spawn_blocking
+macro_rules! python_spawn {
+    ($mode:expr, $runtime:expr, $body:block) => {
+        if $mode == "single" {
+            $body
+        } else {
+            $runtime.spawn_blocking(move || $body);
+        }
+    };
+    ($mode:expr, $body:block) => {
+        let _runtime = tokio::runtime::Handle::current();
+        if $mode == "single" {
+            $body
+        } else {
+            $_runtime.spawn_blocking(move || $body);
+        }
+    };
+}
+
 #[pymethods]
 impl TEventLoop {
     #[new]
@@ -569,7 +590,7 @@ impl TEventLoop {
                                     // Execute Python callback in GIL
                                     log::trace!("PyO3: attaching Python to run the task");
 
-                                    let run_handle = move || {
+                                    python_spawn!(runtime_mode, rt, {
                                         Python::attach(|py|{
                                             log::debug!("Executing handle in tokio context");
                                             // Execute the handle with proper context
@@ -578,17 +599,13 @@ impl TEventLoop {
                                             // to avoid panic when Py<T> tries to decrement refcount
                                             drop(handle);
                                         });
-                                    };
-
-                                    if runtime_mode == "single" {
-                                        run_handle(); // GIL enabled.
-                                    } else {
-                                        rt.spawn_blocking(run_handle); // No GIL.
-                                    }
+                                    });
                                 } else {
-                                    Python::attach(|_py|{
-                                        // to avoid panic when Py<T> tries to decrement refcount
-                                        drop(handle);
+                                    python_spawn!(runtime_mode, rt, {
+                                        Python::attach(|_py|{
+                                            // to avoid panic when Py<T> tries to decrement refcount
+                                            drop(handle);
+                                        });
                                     });
                                 }
                             } else {
@@ -722,18 +739,24 @@ impl TEventLoop {
             exc_handler: Arc::clone(&self.exc_handler),
             exception_handler: Arc::clone(&self.exception_handler),
         };
+        let runtime_mode = self.get_runtime_mode();
 
         runtime.spawn(async move {
+            // Get tokio runtime handle for spawn_blocking
+            let rt = tokio::runtime::Handle::current();
+
             // Use AsyncFd to wait for readability without consuming the connection
             let async_fd = match AsyncFd::new(fd_dup) {
                 Ok(fd) => fd,
                 Err(e) => {
                     log::error!("Failed to create AsyncFd: {}", e);
                     // Drop Python objects while attached to avoid panic
-                    Python::attach(|_py| {
-                        drop(callback_py);
-                        drop(args_py);
-                        drop(context_py);
+                    python_spawn!(runtime_mode, rt, {
+                        Python::attach(|_py| {
+                            drop(callback_py);
+                            drop(args_py);
+                            drop(context_py);
+                        });
                     });
                     return;
                 }
@@ -747,28 +770,32 @@ impl TEventLoop {
 
                     // Socket is readable - schedule the callback
                     log::trace!("Scheduling read callback. fd={}", fd);
-                    Python::attach(|py| {
-                        let handle = TCBHandle::new(
-                            callback_py.clone_ref(py),
-                            args_py.clone_ref(py),
-                            context_py.clone_ref(py),
-                        );
-                        let handle_obj = Py::new(py, handle).unwrap();
-                        let mut state = TEventLoopRunState{};
-                        let _ = handle_obj.run(py, &loop_handlers, &state);
-                        // Explicitly drop Python objects while attached to avoid panic
-                        drop(callback_py);
-                        drop(args_py);
-                        drop(context_py);
+                    python_spawn!(runtime_mode, rt, {
+                        Python::attach(|py| {
+                            let handle = TCBHandle::new(
+                                callback_py.clone_ref(py),
+                                args_py.clone_ref(py),
+                                context_py.clone_ref(py),
+                            );
+                            let handle_obj = Py::new(py, handle).unwrap();
+                            let mut state = TEventLoopRunState{};
+                            let _ = handle_obj.run(py, &loop_handlers, &state);
+                            // Explicitly drop Python objects while attached to avoid panic
+                            drop(callback_py);
+                            drop(args_py);
+                            drop(context_py);
+                        });
                     });
                 }
                 Err(e) => {
                     log::error!("Error waiting for fd {} to become readable: {}", fd, e);
                     // Drop Python objects while attached to avoid panic
-                    Python::attach(|_py| {
-                        drop(callback_py);
-                        drop(args_py);
-                        drop(context_py);
+                    python_spawn!(runtime_mode, rt, {
+                        Python::attach(|_py| {
+                            drop(callback_py);
+                            drop(args_py);
+                            drop(context_py);
+                        });
                     });
                 }
             }
@@ -985,8 +1012,11 @@ impl TEventLoop {
         let signal_socket_tx = self.signal_socket_tx.clone();
         let sig_listening = self.sig_listening.clone();
         let stopping_clone = self.stopping.clone();
+        let runtime_mode = self.runtime_mode.get().map(|s| s.as_str()).unwrap_or("single").to_string();
 
         runtime.spawn(async move {
+            // Get tokio runtime handle for spawn_blocking
+            let rt = tokio::runtime::Handle::current();
             // Duplicate file descriptors before converting to UnixStream to avoid IO safety violations
             let fd_r_dup = unsafe { libc::dup(fd_r as i32) };
             let fd_w_dup = unsafe { libc::dup(fd_w as i32) };
@@ -1055,22 +1085,25 @@ impl TEventLoop {
                     Ok(n) if n > 0 => {
                         log::debug!("Received signals: {} signals", n);
                         // Process signals received from Python
-                        Python::attach(|py| {
-                            match py.check_signals() {
-                                Ok(()) => {
-                                    log::debug!("PyO3 signals processed successfully");
-                                }
-                                Err(e) => {
-                                    log::warn!("Signal processing failed: {:?}", e);
-                                    // Check if this is a critical signal that should stop the loop
-                                    if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) ||
-                                       e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
-                                                log::info!("Critical signal received, stopping event loop");
-                                                stopping_clone.store(true, atomic::Ordering::Release);
-                                            }
+                        let stopping_for_signal = stopping_clone.clone();
+                        python_spawn!(runtime_mode, rt, {
+                            Python::attach(|py| {
+                                match py.check_signals() {
+                                    Ok(()) => {
+                                        log::debug!("PyO3 signals processed successfully");
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Signal processing failed: {:?}", e);
+                                        // Check if this is a critical signal that should stop the loop
+                                        if e.is_instance_of::<pyo3::exceptions::PyKeyboardInterrupt>(py) ||
+                                           e.is_instance_of::<pyo3::exceptions::PySystemExit>(py) {
+                                                    log::info!("Critical signal received, stopping event loop");
+                                                    stopping_for_signal.store(true, atomic::Ordering::Release);
                                         }
+                                    }
                                 }
                             });
+                        });
 
                         // Trace individual signals from the buffer
                         for i in 0..n {
