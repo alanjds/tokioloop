@@ -48,6 +48,8 @@ pub(crate) struct TokioTCPTransport {
     weof: AtomicBool,
     #[pyo3(get)]
     lfd: Option<usize>,
+    // Cached Py method
+    data_received: Py<PyAny>,
 }
 
 impl TokioTCPTransport {
@@ -75,6 +77,9 @@ impl TokioTCPTransport {
         let peer_addr = tokio_stream.peer_addr().ok();
 
         let protocol = protocol_factory.call0(py)?;
+
+        // Cache the data_received method for performance
+        let data_received = protocol.bind(py).getattr("data_received")?;
 
         let mut extra = HashMap::new();
 
@@ -126,6 +131,7 @@ impl TokioTCPTransport {
             paused: false.into(),
             weof: false.into(),
             lfd: None,
+            data_received: data_received.unbind(),
         };
 
         Ok(transport)
@@ -148,6 +154,7 @@ impl TokioTCPTransport {
         let protocol = transport.borrow(py).protocol.clone_ref(py);
         let pyloop = transport.borrow(py).pyloop.clone_ref(py);
         let state = transport.borrow(py).state.clone();
+        let py_data_received = transport.borrow(py).data_received.clone_ref(py);
         let fd = transport.borrow(py).fd as i32;
 
         let runtime = pyloop.borrow(py).get_runtime();
@@ -164,7 +171,7 @@ impl TokioTCPTransport {
             {
                 let transport_ref = transport_opt.as_ref().expect("transport should exist");
                 let protocol_ref = protocol_opt.as_ref().expect("protocol should exist");
-                let _ = Self::io_processing_loop(transport_ref, state_clone, protocol_ref, fd).await;
+                let _ = Self::io_processing_loop(transport_ref, state_clone, protocol_ref, py_data_received, fd).await;
             }
 
             // Cleanup phase - ALWAYS runs regardless of exit path
@@ -188,9 +195,12 @@ impl TokioTCPTransport {
         transport: &Py<TokioTCPTransport>,
         state: Arc<Mutex<TokioTCPTransportState>>,
         protocol: &Py<PyAny>,
+        py_data_received: Py<PyAny>,
         fd: i32,
     ) -> i32 {
         log::debug!("io_processing_loop started for fd={}", fd);
+
+        let py_data_received_arc: Arc<Py<PyAny>> = Arc::new(py_data_received);
         let mut connection_lost_called = false;
         let mut fd: i32 = 0;
 
@@ -250,12 +260,10 @@ impl TokioTCPTransport {
                             Ok(n) => {
                                 // Data received, forward to protocol
                                 let data = read_buf[..n].to_vec();
+                                let py_method = py_data_received_arc.clone();
                                 Python::attach(|py| {
-                                    let _ = protocol.call_method1(
-                                        py,
-                                        pyo3::intern!(py, "data_received"),
-                                        (PyBytes::new(py, &data),)
-                                    );
+                                    let py_bytes = PyBytes::new(py, &data);
+                                    let _ = py_method.call1(py, (py_bytes,));
                                 });
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -607,6 +615,7 @@ impl TokioTCPServer {
         protocol_factory: Py<PyAny>,
     ) -> PyResult<Py<TokioTCPTransport>> {
         let protocol = protocol_factory.call0(py)?;
+        let data_received = protocol.bind(py).getattr("data_received")?;
 
         let local_addr = stream.local_addr().ok();
         let peer_addr = stream.peer_addr().ok();
@@ -645,6 +654,7 @@ impl TokioTCPServer {
             paused: false.into(),
             weof: false.into(),
             lfd: None,
+            data_received: data_received.unbind()
         };
 
         let pytransport = Py::new(py, transport)?;
