@@ -40,7 +40,8 @@ def server(loop, streams=False, proto=False):
         time.sleep(2)
         yield proc
     finally:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        if hasattr(proc, 'pid'):
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         print('Server gone.')
 
 
