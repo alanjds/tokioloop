@@ -18,16 +18,18 @@ macro_rules! python_spawn {
     ($mode:expr, $runtime:expr, $body:block) => {
         if $mode == "single" {
             $body
+            $runtime.spawn(async {})
         } else {
-            $runtime.spawn_blocking(move || $body);
+            $runtime.spawn_blocking(move || $body)
         }
     };
     ($mode:expr, $body:block) => {
         let _runtime = tokio::runtime::Handle::current();
         if $mode == "single" {
             $body
+            $_runtime.spawn(async {})
         } else {
-            $_runtime.spawn_blocking(move || $body);
+            $_runtime.spawn_blocking(move || $body)
         }
     };
 }

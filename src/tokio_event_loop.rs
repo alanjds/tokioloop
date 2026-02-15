@@ -571,7 +571,7 @@ impl TEventLoop {
                                     // Execute Python callback in GIL
                                     log::trace!("PyO3: attaching Python to run the task");
 
-                                    python_spawn!(runtime_mode, rt, {
+                                    let _ = python_spawn!(runtime_mode, rt, {
                                         Python::attach(|py|{
                                             log::debug!("Executing handle in tokio context");
                                             // Execute the handle with proper context
@@ -582,7 +582,7 @@ impl TEventLoop {
                                         });
                                     });
                                 } else {
-                                    python_spawn!(runtime_mode, rt, {
+                                    let _ = python_spawn!(runtime_mode, rt, {
                                         Python::attach(|_py|{
                                             // to avoid panic when Py<T> tries to decrement refcount
                                             drop(handle);
@@ -732,7 +732,7 @@ impl TEventLoop {
                 Err(e) => {
                     log::error!("Failed to create AsyncFd: {}", e);
                     // Drop Python objects while attached to avoid panic
-                    python_spawn!(runtime_mode, rt, {
+                    let _ = python_spawn!(runtime_mode, rt, {
                         Python::attach(|_py| {
                             drop(callback_py);
                             drop(args_py);
@@ -751,7 +751,7 @@ impl TEventLoop {
 
                     // Socket is readable - schedule the callback
                     log::trace!("Scheduling read callback. fd={}", fd);
-                    python_spawn!(runtime_mode, rt, {
+                    let _ = python_spawn!(runtime_mode, rt, {
                         Python::attach(|py| {
                             let handle = TCBHandle::new(
                                 callback_py.clone_ref(py),
