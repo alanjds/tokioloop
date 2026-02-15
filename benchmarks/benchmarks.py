@@ -160,7 +160,8 @@ def run():
                     'pyver': f'{pyver.major}.{pyver.minor}',
                     'results': results,
                     'rloop': _rloop_version(),
-                }
+                },
+                indent=2,
             )
         )
 
