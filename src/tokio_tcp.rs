@@ -159,6 +159,7 @@ impl TokioTCPTransport {
         let fd = transport.borrow(py).fd as i32;
 
         let runtime = pyloop.borrow(py).get_runtime();
+        let runtime_mode = pyloop.borrow(py).get_runtime_mode();
 
         // Spawn the I/O processing task with proper cleanup on cancellation
         let state_clone = state.clone();
@@ -172,7 +173,14 @@ impl TokioTCPTransport {
             {
                 let transport_ref = transport_opt.as_ref().expect("transport should exist");
                 let protocol_ref = protocol_opt.as_ref().expect("protocol should exist");
-                let _ = Self::io_processing_loop(transport_ref, state_clone, protocol_ref, py_data_received, fd).await;
+                let _ = Self::io_processing_loop(
+                    transport_ref,
+                    state_clone,
+                    protocol_ref,
+                    py_data_received,
+                    fd,
+                    runtime_mode.clone(),
+                ).await;
             }
 
             // Cleanup phase - ALWAYS runs regardless of exit path
@@ -198,6 +206,7 @@ impl TokioTCPTransport {
         protocol: &Py<PyAny>,
         py_data_received: Py<PyAny>,
         fd: i32,
+        runtime_mode: String,
     ) -> i32 {
         log::debug!("io_processing_loop started for fd={}", fd);
 
@@ -208,6 +217,7 @@ impl TokioTCPTransport {
         // Main async logic block - cleanup runs after regardless of how this exits
         let fd = async {
             let mut read_buf = [0u8; 8192];
+            let rt = tokio::runtime::Handle::current();
 
             // Extract the stream and split it for reading and writing
             let stream_opt = {
@@ -260,12 +270,15 @@ impl TokioTCPTransport {
                             }
                             Ok(n) => {
                                 // Data received, forward to protocol
-                                let data = Bytes::copy_from_slice(&read_buf[..n]);
+                                // let data = Bytes::copy_from_slice(&read_buf[..n]);
+                                let data = read_buf[..n].to_vec();
                                 let py_method = py_data_received_arc.clone();
-                                Python::attach(|py| {
-                                    let py_bytes = PyBytes::from(data);
-                                    let _ = py_method.call1(py, (py_bytes,));
-                                });
+                                let py_bytes = PyBytes::from(data);
+                                let _ = python_spawn!(runtime_mode, rt, {
+                                    Python::attach(|py| {
+                                        let _ = py_method.call1(py, (py_bytes,));
+                                    });
+                                }).await;
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 // No data available, continue
