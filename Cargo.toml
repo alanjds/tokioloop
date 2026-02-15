@@ -45,6 +45,8 @@ tokio = { version = "1.0", features = ["full"] }
 tokio-rustls = "0.24"
 tokio-util = { version = "0.7", features = ["codec"] }
 async-channel = "2.1"
+bytes = "1.10"
+pyo3-bytes = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.178"

@@ -4,9 +4,10 @@ use std::{
 };
 
 use anyhow::Result;
+use bytes::Bytes;
 use pyo3::{ffi::c_str, prelude::*};
-use pyo3::types::PyBytes;
 use pyo3::IntoPyObjectExt;
+use pyo3_bytes::PyBytes;
 use tokio::{
     net::{TcpStream, TcpListener},
     io::{AsyncReadExt, AsyncWriteExt},
@@ -259,10 +260,10 @@ impl TokioTCPTransport {
                             }
                             Ok(n) => {
                                 // Data received, forward to protocol
-                                let data = read_buf[..n].to_vec();
+                                let data = Bytes::copy_from_slice(&read_buf[..n]);
                                 let py_method = py_data_received_arc.clone();
                                 Python::attach(|py| {
-                                    let py_bytes = PyBytes::new(py, &data);
+                                    let py_bytes = PyBytes::from(data);
                                     let _ = py_method.call1(py, (py_bytes,));
                                 });
                             }

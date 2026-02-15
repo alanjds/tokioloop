@@ -530,6 +530,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pyo3-bytes"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37248130b5b50c06a3bd2ed0a4e763aff9bf3104991c656bc27c303df0889460"
+dependencies = [
+ "bytes",
+ "pyo3",
+]
+
+[[package]]
 name = "pyo3-ffi"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -659,6 +669,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "bytes",
  "env_logger",
  "libc",
  "log",
@@ -666,6 +677,7 @@ dependencies = [
  "papaya",
  "pyo3",
  "pyo3-build-config",
+ "pyo3-bytes",
  "rcgen",
  "rustls 0.23.36",
  "rustls-pemfile",
