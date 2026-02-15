@@ -132,6 +132,7 @@ impl TokioTCPTransport {
     }
 
     pub fn attach(transport: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
+        log::trace!("TokioTCPTransport::attach called");
         let rself = transport.borrow(py);
 
         // Start the I/O processing task
@@ -142,10 +143,12 @@ impl TokioTCPTransport {
     }
 
     fn start_io_task(transport: &Py<Self>, py: Python) -> PyResult<()> {
+        log::trace!("TokioTCPTransport::start_io_task called");
         let transport_clone = transport.clone_ref(py);
         let protocol = transport.borrow(py).protocol.clone_ref(py);
         let pyloop = transport.borrow(py).pyloop.clone_ref(py);
         let state = transport.borrow(py).state.clone();
+        let fd = transport.borrow(py).fd as i32;
 
         let runtime = pyloop.borrow(py).get_runtime();
 
@@ -158,11 +161,10 @@ impl TokioTCPTransport {
 
             // Run the main I/O loop with references
             // Store fd value for cleanup logging
-            let fd: i32;
             {
                 let transport_ref = transport_opt.as_ref().expect("transport should exist");
                 let protocol_ref = protocol_opt.as_ref().expect("protocol should exist");
-                fd = Self::io_processing_loop(transport_ref, state_clone, protocol_ref).await;
+                let _ = Self::io_processing_loop(transport_ref, state_clone, protocol_ref, fd).await;
             }
 
             // Cleanup phase - ALWAYS runs regardless of exit path
@@ -186,7 +188,9 @@ impl TokioTCPTransport {
         transport: &Py<TokioTCPTransport>,
         state: Arc<Mutex<TokioTCPTransportState>>,
         protocol: &Py<PyAny>,
+        fd: i32,
     ) -> i32 {
+        log::debug!("io_processing_loop started for fd={}", fd);
         let mut connection_lost_called = false;
         let mut fd: i32 = 0;
 
