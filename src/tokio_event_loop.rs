@@ -15,6 +15,7 @@ use crate::{
     log::{LogExc, log_exc_to_py_ctx},
     server::TokioServer,
     tokio_tcp::{TokioTCPServer, TokioTCPServerRef},
+    utils::python_spawn,
 };
 use pyo3::IntoPyObjectExt;
 use socket2::Socket;
@@ -276,26 +277,6 @@ impl TEventLoop {
     }
 }
 
-/// Macro to execute Python code with proper handling for GIL vs free-threading modes
-/// `runtime_mode` "single" (GIL enabled) executes directly
-/// `runtime_mode` "multi" (free-threading) uses spawn_blocking
-macro_rules! python_spawn {
-    ($mode:expr, $runtime:expr, $body:block) => {
-        if $mode == "single" {
-            $body
-        } else {
-            $runtime.spawn_blocking(move || $body);
-        }
-    };
-    ($mode:expr, $body:block) => {
-        let _runtime = tokio::runtime::Handle::current();
-        if $mode == "single" {
-            $body
-        } else {
-            $_runtime.spawn_blocking(move || $body);
-        }
-    };
-}
 
 #[pymethods]
 impl TEventLoop {

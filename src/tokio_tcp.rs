@@ -16,6 +16,7 @@ use socket2::{Domain, Type};
 use crate::{
     tokio_event_loop::TEventLoop,
     py::sock,
+    utils::python_spawn,
 };
 
 /// Internal state management for tokio TCP connections

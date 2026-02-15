@@ -11,6 +11,29 @@ macro_rules! syscall {
 
 pub(crate) use syscall;
 
+/// Macro to execute Python code with proper handling for GIL vs free-threading modes
+/// `runtime_mode` "single" (GIL enabled) executes directly
+/// `runtime_mode` "multi" (free-threading) uses spawn_blocking
+macro_rules! python_spawn {
+    ($mode:expr, $runtime:expr, $body:block) => {
+        if $mode == "single" {
+            $body
+        } else {
+            $runtime.spawn_blocking(move || $body);
+        }
+    };
+    ($mode:expr, $body:block) => {
+        let _runtime = tokio::runtime::Handle::current();
+        if $mode == "single" {
+            $body
+        } else {
+            $_runtime.spawn_blocking(move || $body);
+        }
+    };
+}
+
+pub(crate) use python_spawn;
+
 use anyhow::Result;
 use pyo3::prelude::*;
 
