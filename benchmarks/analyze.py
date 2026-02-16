@@ -3,14 +3,15 @@
 Benchmark Results Analyzer for TokioLoop
 
 Usage:
-    python analyze_results.py [results_file.json]
+    python analyze.py
 
-If no file is specified, uses results/data.json
+Loads and analyzes results from results/baseline.json and results/data.json
 """
 
 import json
-import sys
 from pathlib import Path
+
+import click
 
 
 def format_rps(rps):
@@ -25,17 +26,17 @@ def format_percent(pct):
 
 def print_header(title, width=80):
     """Print a formatted header."""
-    print()
-    print('-' * width)
-    print(f'# {title}')
-    print('-' * width)
+    click.echo()
+    click.echo('-' * width)
+    click.echo(f'# {title}')
+    click.echo('-' * width)
 
 
 def print_subheader(title, width=80):
     """Print a formatted subheader."""
-    print()
-    print(f'## {title}')
-    print('-' * width)
+    click.echo()
+    click.echo(f'## {title}')
+    click.echo('-' * width)
 
 
 def analyze_benchmark_type(results, benchmark_name, width=80):
@@ -56,8 +57,8 @@ def analyze_benchmark_type(results, benchmark_name, width=80):
 
     # Table header
     header = f'{"Event Loop":<15} {"1KB RPS":>12} {"10KB RPS":>12} {"100KB RPS":>12} {"Latency(ms)":>12} {"vs asyncio":>12} {"vs rloop":>12}'
-    print(header)
-    print('-' * width)
+    click.echo(header)
+    click.echo('-' * width)
 
     rows = []
     for loop in ['asyncio', 'uvloop', 'rloop', 'tokioloop']:
@@ -85,7 +86,7 @@ def analyze_benchmark_type(results, benchmark_name, width=80):
             }
             rows.append(row)
 
-            print(
+            click.echo(
                 f'{loop:<10} {format_rps(r1k):>12} {format_rps(r10k):>12} {format_rps(r100k):>12} '
                 f'{latency:>12.3f} {format_percent(vs_asyncio):>12} {format_percent(vs_rloop):>12}'
             )
@@ -112,20 +113,20 @@ def print_tokio_summary(rows_by_benchmark, width=80):
             avg_tokio = (tokioloop['r1k'] + tokioloop['r10k'] + tokioloop['r100k']) / 3
             avg_rloop = (rloop['r1k'] + rloop['r10k'] + rloop['r100k']) / 3
 
-            print(f'\n{benchmark_name.upper()}:')
-            print(
+            click.echo(f'\n{benchmark_name.upper()}:')
+            click.echo(
                 f'  1KB:   {format_rps(tokioloop["r1k"]):>10} RPS ({format_percent(tokioloop["r1k"] / rloop["r1k"] * 100)} of rloop)  '
                 f'Target: {format_rps(rloop["r1k"] * 0.8):>10} RPS'
             )
-            print(
+            click.echo(
                 f'  10KB:  {format_rps(tokioloop["r10k"]):>10} RPS ({format_percent(tokioloop["r10k"] / rloop["r10k"] * 100)} of rloop)  '
                 f'Target: {format_rps(rloop["r10k"] * 0.8):>10} RPS'
             )
-            print(
+            click.echo(
                 f'  100KB: {format_rps(tokioloop["r100k"]):>10} RPS ({format_percent(tokioloop["r100k"] / rloop["r100k"] * 100)} of rloop)  '
                 f'Target: {format_rps(rloop["r100k"] * 0.8):>10} RPS'
             )
-            print(
+            click.echo(
                 f'  Latency: {tokioloop["latency"]:>8.3f} ms  ({tokioloop["latency"] / rloop["latency"]:.1f}x vs rloop)'
             )
 
@@ -134,7 +135,7 @@ def print_tokio_summary(rows_by_benchmark, width=80):
             count += 1
 
     if count > 0:
-        print(
+        click.echo(
             f'\n  Overall Average: {format_rps(total_rps / count):>10} RPS ({format_percent(total_rps / total_rloop_rps * 100)} of rloop)'
         )
 
@@ -151,8 +152,8 @@ def load_and_merge_results():
         with open(baseline_path) as f:
             baseline_data = json.load(f)
     else:
-        print(f'Warning: Baseline file not found: {baseline_path}')
-        print('Run: python benchmarks.py --baseline')
+        click.echo(f'Warning: Baseline file not found: {baseline_path}', err=True)
+        click.echo('Run: python benchmarks.py --baseline', err=True)
 
     # Load current data (tokioloop)
     current_data = {}
@@ -160,8 +161,8 @@ def load_and_merge_results():
         with open(data_path) as f:
             current_data = json.load(f)
     else:
-        print(f'Warning: Data file not found: {data_path}')
-        print('Run: python benchmarks.py')
+        click.echo(f'Warning: Data file not found: {data_path}', err=True)
+        click.echo('Run: python benchmarks.py', err=True)
 
     # Merge results: baseline loops + tokioloop
     merged_results = {}
@@ -190,41 +191,50 @@ def load_and_merge_results():
     return merged_results, metadata
 
 
-def main():
-    """Main analysis function."""
+@click.command()
+@click.option(
+    '--width',
+    type=int,
+    default=80,
+    show_default=True,
+    help='Output width for the report',
+)
+def main(width):
+    """Analyze TokioLoop benchmark results.
+
+    Loads and analyzes results from results/baseline.json and results/data.json
+    """
     # Load and merge results from baseline.json and data.json
     results, data = load_and_merge_results()
 
     if not results:
-        print('Error: No benchmark data found!')
-        print('Run baseline: python benchmarks.py --baseline')
-        print('Run current: python benchmarks.py')
-        sys.exit(1)
+        raise click.ClickException(
+            'No benchmark data found!\nRun baseline: python benchmarks.py --baseline\nRun current: python benchmarks.py'
+        )
 
     # Print header
-    print_header('TOKIOLOOP BENCHMARK ANALYSIS REPORT', 80)
-    print(f'Python: {data.get("pyver", "unknown")}')
-    print(f'CPU: {data.get("cpu", "unknown")} cores')
-    print(f'Run at: {data.get("run_at", "unknown")}')
-    print(f'rloop version: {data.get("rloop", "unknown")}')
+    print_header('TOKIOLOOP BENCHMARK ANALYSIS REPORT', width)
+    click.echo(f'Python: {data.get("pyver", "unknown")}')
+    click.echo(f'CPU: {data.get("cpu", "unknown")} cores')
+    click.echo(f'Run at: {data.get("run_at", "unknown")}')
+    click.echo(f'rloop version: {data.get("rloop", "unknown")}')
 
     # Analyze each benchmark type
     rows_by_benchmark = {}
     for benchmark_name in ['raw', 'proto', 'stream', 'concurrency']:
-        rows = analyze_benchmark_type(results, benchmark_name, 80)
+        rows = analyze_benchmark_type(results, benchmark_name, width)
         if rows:
             rows_by_benchmark[benchmark_name] = rows
 
     if not rows_by_benchmark:
-        print('\n❌ No benchmark data found in results file!')
-        sys.exit(1)
+        raise click.ClickException('No benchmark data found in results file!')
 
     # Print summaries
-    print_tokio_summary(rows_by_benchmark, 80)
+    print_tokio_summary(rows_by_benchmark, width)
 
     # Footer
-    print()
-    print('=' * 80)
+    click.echo()
+    click.echo('=' * width)
 
 
 if __name__ == '__main__':
