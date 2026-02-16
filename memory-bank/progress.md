@@ -26,7 +26,7 @@
 
 **Root Cause**: Python objects (`transport` and `protocol`) were being dropped by Rust's destructor without holding the GIL (Global Interpreter Lock).
 
-**Solution**: 
+**Solution**:
 - Wrapped Python objects in `Option<Py<T>>` for controlled cleanup
 - Moved cleanup code to run after `io_processing_loop` completes
 - Single `Python::attach` block drops all objects with GIL held
@@ -52,7 +52,7 @@ Python::attach(|_py| {
 });
 ```
 
-**Impact**: 
+**Impact**:
 - ✅ No more panics during TCP operations
 - ✅ Benchmarks run to completion
 - ✅ All TCP tests pass
@@ -194,8 +194,48 @@ Python::attach(|_py| {
 - Production-ready stability
 - Comprehensive test coverage
 
+## Performance Analysis (2026-02-15)
+
+### Socket Operation Pipeline Analysis
+
+**Discovery**: Three distinct socket operation modes with unexpected performance characteristics.
+
+**Three Modes:**
+1. **Raw Sockets** (sock_recv/sock_sendall): Uses Python socket operations directly
+2. **Stream Transport** (asyncio.start_server): Uses tokio native I/O with reader/writer
+3. **Proto Transport** (loop.create_server): Uses tokio native I/O with Protocol interface
+
+**Performance Paradox:**
+- **Expected**: Raw sockets slowest (multiple transitions, Python ops), Stream/Proto fastest (tokio native I/O)
+- **Actual**: Raw sockets FASTEST, Stream/Proto SLOWEST
+- **Root Cause**: Stream/Proto implementations have critical inefficiencies
+
+**Identified Bottlenecks in Stream/Proto:**
+1. Excessive GIL acquisition in io_processing_loop (every packet)
+2. Mutex contention on TokioTCPTransportState
+3. Busy loop with 1ms sleep in io_ingestion_loop
+4. Inefficient buffer management (VecDeque<Vec<u8>>)
+5. No batching of operations
+6. tokio::select! overhead evaluating all branches
+7. Multiple Python::attach calls per iteration
+8. Channel overhead (mpsc::unbounded_channel)
+
+**Key Insight:**
+- Raw sockets use Python's efficient socket operations directly
+- Stream/Proto add Rust overhead without providing benefits
+- The "optimization" of using tokio native I/O is actually a de-optimization
+- Need to profile and fix Stream/Proto implementation bottlenecks
+
+**Next Steps:**
+1. Profile Stream/Proto implementation to identify specific bottlenecks
+2. Compare with Raw socket implementation to understand what makes it faster
+3. Consider simplifying Stream/Proto to reduce overhead
+4. Benchmark each component of the pipeline to isolate issues
+
 ## Summary
 
 **Major Achievement**: TokioLoop TCP implementation is now fully functional! The PyO3 cleanup panic that blocked all TCP operations has been resolved using a safe `Option` + explicit cleanup pattern. All 6 TCP tests pass, and both stream and proto benchmarks complete successfully.
 
 The implementation uses a clean pattern: wrap Python objects in `Option`, pass references to the async I/O loop, then explicitly `take()` and drop them within a `Python::attach` block to ensure the GIL is held during cleanup.
+
+**Current Challenge**: Performance analysis reveals that Stream and Proto transports are significantly slower than Raw sockets, despite using tokio native I/O. This indicates critical inefficiencies in the Stream/Proto implementation that need to be addressed through profiling and optimization.

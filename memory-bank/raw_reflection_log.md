@@ -270,3 +270,76 @@ Improvements_Identified_For_Consolidation:
 - Lock-free design patterns: Atomic flags and lock-free queues for high-performance async I/O
 - Batching strategies: Balancing latency vs throughput in async systems
 - Benchmark-driven optimization: Using quantitative measurements to guide optimization priorities
+
+---
+Date: 2026-02-15
+TaskRef: "Socket operation pipeline analysis - Raw vs Stream vs Proto throughput differences"
+
+Learnings:
+- Three distinct socket operation modes in TokioLoop with different performance characteristics
+- Raw sockets (sock_recv/sock_sendall) currently have BEST throughput despite theoretical disadvantages
+- Stream and Proto transports have WORSE throughput despite using tokio native I/O
+- This indicates Stream/Proto implementations have critical inefficiencies
+
+Pipeline_Analysis:
+
+1. Raw_Sockets_Path:
+   Python: loop.sock_accept() → loop.sock_recv() → loop.sock_sendall()
+   Rust: add_reader() → AsyncFd::readable() → python_spawn!() → Python socket operations
+   Characteristics: Multiple Python-Rust transitions per operation, Python socket ops, callback registration overhead
+
+2. Stream_Transport_Path:
+   Python: asyncio.start_server() → reader.readline() → writer.write()
+   Rust: TokioTCPServer::start_listening() → TokioTCPTransport::from_py() → io_ingestion_loop() → io_processing_loop()
+   Characteristics: Single Rust task per connection, tokio native I/O, channel-based callbacks, no Python socket ops
+
+3. Proto_Transport_Path:
+   Python: loop.create_server() → Protocol.connection_made() → Protocol.data_received()
+   Rust: Identical to Stream transport (same TokioTCPTransport implementation)
+   Characteristics: Same as Stream, only Python interface differs
+
+Performance_Paradox:
+- Raw sockets should be slowest due to: multiple transitions, Python socket ops, callback overhead
+- Stream/Proto should be fastest due to: tokio native I/O, minimal Python interaction
+- Reality: Raw is FASTEST, Stream/Proto are SLOWEST
+- Conclusion: Stream/Proto implementations have critical inefficiencies
+
+Potential_Inefficiencies_in_Stream_Proto:
+1. Excessive GIL acquisition in io_processing_loop (every packet)
+2. Mutex contention on TokioTCPTransportState
+3. Busy loop with 1ms sleep in io_ingestion_loop
+4. Inefficient buffer management (VecDeque<Vec<u8>>)
+5. No batching of operations
+6. tokio::select! overhead evaluating all branches
+7. Multiple Python::attach calls per iteration
+8. Channel overhead (mpsc::unbounded_channel)
+
+Key_Insight:
+- Raw sockets use Python's efficient socket operations directly
+- Stream/Proto add Rust overhead without providing benefits
+- The "optimization" of using tokio native I/O is actually a de-optimization
+- Need to profile and fix Stream/Proto implementation bottlenecks
+
+Difficulties:
+- Understanding why theoretically better implementation performs worse
+- Identifying specific bottlenecks in Stream/Proto pipeline
+- Balancing between Rust efficiency and Python integration
+- Need to maintain asyncio API compatibility while optimizing
+
+Successes:
+- Successfully mapped all three socket operation pipelines
+- Identified performance paradox that needs investigation
+- Established clear comparison points between implementations
+- Documented function call flows for future optimization work
+
+Next_Steps:
+- Profile Stream/Proto implementation to identify specific bottlenecks
+- Compare with Raw socket implementation to understand what makes it faster
+- Consider simplifying Stream/Proto to reduce overhead
+- Benchmark each component of the pipeline to isolate issues
+
+Improvements_Identified_For_Consolidation:
+- Socket operation pipelines: Three distinct modes with different performance characteristics
+- Performance paradox: Theoretical advantages don't match actual performance
+- Pipeline analysis: Documenting complete function call flows for each mode
+- Bottleneck identification: Need to profile Stream/Proto implementations
