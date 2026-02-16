@@ -23,22 +23,22 @@ def format_percent(pct):
     return f'{pct:.1f}%'
 
 
-def print_header(title, width=100):
+def print_header(title, width=80):
     """Print a formatted header."""
     print()
-    print('=' * width)
-    print(title.center(width))
-    print('=' * width)
-
-
-def print_subheader(title, width=100):
-    """Print a formatted subheader."""
-    print()
-    print(title)
+    print('-' * width)
+    print(f'# {title}')
     print('-' * width)
 
 
-def analyze_benchmark_type(results, benchmark_name, width=100):
+def print_subheader(title, width=80):
+    """Print a formatted subheader."""
+    print()
+    print(f'## {title}')
+    print('-' * width)
+
+
+def analyze_benchmark_type(results, benchmark_name, width=80):
     """Analyze a single benchmark type (raw, proto, stream)."""
     if benchmark_name not in results:
         return None
@@ -86,14 +86,14 @@ def analyze_benchmark_type(results, benchmark_name, width=100):
             rows.append(row)
 
             print(
-                f'{loop:<15} {format_rps(r1k):>12} {format_rps(r10k):>12} {format_rps(r100k):>12} '
+                f'{loop:<10} {format_rps(r1k):>12} {format_rps(r10k):>12} {format_rps(r100k):>12} '
                 f'{latency:>12.3f} {format_percent(vs_asyncio):>12} {format_percent(vs_rloop):>12}'
             )
 
     return rows
 
 
-def print_tokio_summary(rows_by_benchmark, width=100):
+def print_tokio_summary(rows_by_benchmark, width=80):
     """Print TokioLoop specific summary."""
     print_subheader('TOKIOLOOP PERFORMANCE SUMMARY', width)
 
@@ -139,27 +139,70 @@ def print_tokio_summary(rows_by_benchmark, width=100):
         )
 
 
+def load_and_merge_results():
+    """Load baseline.json and data.json, merging results from both."""
+    results_dir = Path(__file__).parent / 'results'
+    baseline_path = results_dir / 'baseline.json'
+    data_path = results_dir / 'data.json'
+
+    # Load baseline data (asyncio, rloop, uvloop)
+    baseline_data = {}
+    if baseline_path.exists():
+        with open(baseline_path) as f:
+            baseline_data = json.load(f)
+    else:
+        print(f'Warning: Baseline file not found: {baseline_path}')
+        print('Run: python benchmarks.py --baseline')
+
+    # Load current data (tokioloop)
+    current_data = {}
+    if data_path.exists():
+        with open(data_path) as f:
+            current_data = json.load(f)
+    else:
+        print(f'Warning: Data file not found: {data_path}')
+        print('Run: python benchmarks.py')
+
+    # Merge results: baseline loops + tokioloop
+    merged_results = {}
+    baseline_results = baseline_data.get('results', {})
+    current_results = current_data.get('results', {})
+
+    all_benchmarks = set(baseline_results.keys()) | set(current_results.keys())
+
+    for benchmark_name in all_benchmarks:
+        merged_results[benchmark_name] = {}
+
+        # Add baseline loops (asyncio, rloop, uvloop)
+        if benchmark_name in baseline_results:
+            for loop in ['asyncio', 'rloop', 'uvloop']:
+                if loop in baseline_results[benchmark_name]:
+                    merged_results[benchmark_name][loop] = baseline_results[benchmark_name][loop]
+
+        # Add tokioloop from current data
+        if benchmark_name in current_results:
+            if 'tokioloop' in current_results[benchmark_name]:
+                merged_results[benchmark_name]['tokioloop'] = current_results[benchmark_name]['tokioloop']
+
+    # Use metadata from current data if available, otherwise from baseline
+    metadata = current_data if current_data else baseline_data
+
+    return merged_results, metadata
+
+
 def main():
     """Main analysis function."""
-    # Get results file path
-    if len(sys.argv) > 1:
-        results_path = Path(sys.argv[1])
-    else:
-        results_path = Path(__file__).parent / 'results' / 'data.json'
+    # Load and merge results from baseline.json and data.json
+    results, data = load_and_merge_results()
 
-    if not results_path.exists():
-        print(f'Error: Results file not found: {results_path}')
-        print('Run benchmarks first: python benchmarks.py')
+    if not results:
+        print('Error: No benchmark data found!')
+        print('Run baseline: python benchmarks.py --baseline')
+        print('Run current: python benchmarks.py')
         sys.exit(1)
 
-    # Load results
-    with open(results_path) as f:
-        data = json.load(f)
-
-    results = data.get('results', {})
-
     # Print header
-    print_header('TOKIOLOOP BENCHMARK ANALYSIS REPORT', 100)
+    print_header('TOKIOLOOP BENCHMARK ANALYSIS REPORT', 80)
     print(f'Python: {data.get("pyver", "unknown")}')
     print(f'CPU: {data.get("cpu", "unknown")} cores')
     print(f'Run at: {data.get("run_at", "unknown")}')
@@ -168,7 +211,7 @@ def main():
     # Analyze each benchmark type
     rows_by_benchmark = {}
     for benchmark_name in ['raw', 'proto', 'stream', 'concurrency']:
-        rows = analyze_benchmark_type(results, benchmark_name, 100)
+        rows = analyze_benchmark_type(results, benchmark_name, 80)
         if rows:
             rows_by_benchmark[benchmark_name] = rows
 
@@ -177,13 +220,11 @@ def main():
         sys.exit(1)
 
     # Print summaries
-    print_tokio_summary(rows_by_benchmark, 100)
+    print_tokio_summary(rows_by_benchmark, 80)
 
     # Footer
     print()
-    print('=' * 100)
-    print('Analysis complete. Review the results above.')
-    print('=' * 100)
+    print('=' * 80)
 
 
 if __name__ == '__main__':

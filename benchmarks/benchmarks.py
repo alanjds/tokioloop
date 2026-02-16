@@ -16,7 +16,9 @@ logger = logging.getLogger(__name__)
 
 WD = Path(__file__).resolve().parent
 CPU = multiprocessing.cpu_count()
-LOOPS = ['asyncio', 'rloop', 'tokioloop', 'uvloop']
+ALL_LOOPS = ['asyncio', 'rloop', 'tokioloop', 'uvloop']
+BASELINE_LOOPS = ['asyncio', 'rloop', 'uvloop']
+TOKIOLOOP_ONLY = ['tokioloop']
 MSGS = [1024, 1024 * 10, 1024 * 100]
 CONCURRENCIES = sorted({1, max(CPU / 2, 1), max(CPU - 1, 1)})
 
@@ -96,33 +98,33 @@ def benchmark(msgs=None, concurrencies=None):
     return results
 
 
-def raw():
+def raw(loops):
     results = {}
-    for loop in LOOPS:
+    for loop in loops:
         with server(loop):
             results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
     return results
 
 
-def stream():
+def stream(loops):
     results = {}
-    for loop in LOOPS:
+    for loop in loops:
         with server(loop, streams=True):
             results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
     return results
 
 
-def proto():
+def proto(loops):
     results = {}
-    for loop in LOOPS:
+    for loop in loops:
         with server(loop, proto=True):
             results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
     return results
 
 
-def concurrency():
+def concurrency(loops):
     results = {}
-    for loop in LOOPS:
+    for loop in loops:
         with server(loop):
             results[loop] = benchmark(msgs=[1024], concurrencies=CONCURRENCIES[1:])
     return results
@@ -138,19 +140,36 @@ def run():
     all_benchmarks = {
         'raw': raw,
         'stream': stream,
+        'streams': stream,  # accept as a typo
         'proto': proto,
         'concurrency': concurrency,
     }
-    inp_benchmarks = sys.argv[1:] or ['raw']
+
+    # Parse arguments manually
+    args = sys.argv[1:]
+    baseline_mode = '--baseline' in args
+    if baseline_mode:
+        args.remove('--baseline')
+
+    inp_benchmarks = args or ['raw']
     run_benchmarks = set(inp_benchmarks) & set(all_benchmarks.keys())
+
+    # Determine which loops to run based on --baseline flag
+    if baseline_mode:
+        loops = BASELINE_LOOPS
+        output_file = WD / 'results' / 'baseline.json'
+    else:
+        loops = TOKIOLOOP_ONLY
+        output_file = WD / 'results' / 'data.json'
 
     now = datetime.datetime.utcnow()
     results = {}
     for benchmark_key in run_benchmarks:
         runner = all_benchmarks[benchmark_key]
-        results[benchmark_key] = runner()
+        results[benchmark_key] = runner(loops)
 
-    with open('results/data.json', 'w') as f:
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_file, 'w') as f:
         pyver = sys.version_info
         f.write(
             json.dumps(
@@ -164,6 +183,8 @@ def run():
                 indent=2,
             )
         )
+
+    print(f'Results saved to {output_file}')
 
 
 if __name__ == '__main__':
