@@ -25,7 +25,7 @@ CONCURRENCIES = sorted({1, max(CPU / 2, 1), max(CPU - 1, 1)})
 
 
 @contextmanager
-def server(loop, streams=False, proto=False):
+def server(loop, streams=False, proto=False, gil=None):
     exc_prefix = os.environ.get('BENCHMARK_EXC_PREFIX')
     py = 'python'
     if exc_prefix:
@@ -37,10 +37,17 @@ def server(loop, streams=False, proto=False):
     if proto:
         proc_cmd += ' --proto'
 
-    click.echo(f'SERVER: {proc_cmd}')
+    # Prepare environment with PYTHON_GIL if specified
+    env = os.environ.copy()
+    if gil is not None:
+        env['PYTHON_GIL'] = str(gil)
+        click.echo(f'SERVER: PYTHON_GIL={gil} {proc_cmd}')
+    else:
+        click.echo(f'SERVER: {proc_cmd}')
+
     proc = None
     try:
-        proc = subprocess.Popen(proc_cmd, shell=True, preexec_fn=os.setsid)  # noqa: S602
+        proc = subprocess.Popen(proc_cmd, shell=True, preexec_fn=os.setsid, env=env)  # noqa: S602
         time.sleep(2)
         yield proc
     finally:
@@ -99,35 +106,82 @@ def benchmark(msgs=None, concurrencies=None):
     return results
 
 
-def raw(loops):
+def run_benchmark_for_loop(loop, benchmark_fn, gil_modes):
+    """Run benchmark for a single loop, handling GIL modes for tokioloop."""
+    if loop == 'tokioloop' and gil_modes:
+        # Run tokioloop with each GIL mode
+        results = {}
+        for gil in gil_modes:
+            gil_label = 'gil' if gil == 1 else 'nogil'
+            result = benchmark_fn(loop, gil)
+            results[f'tokioloop:{gil_label}'] = result
+        return results
+    else:
+        # Run other loops normally (no GIL mode)
+        return benchmark_fn(loop, None)
+
+
+def raw(loops, gil_modes=None):
     results = {}
     for loop in loops:
-        with server(loop):
-            results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
+
+        def benchmark_fn(l, g):
+            with server(l, gil=g):
+                return benchmark(concurrencies=[CONCURRENCIES[0]])
+
+        loop_results = run_benchmark_for_loop(loop, benchmark_fn, gil_modes)
+        if isinstance(loop_results, dict):
+            results.update(loop_results)
+        else:
+            results[loop] = loop_results
     return results
 
 
-def stream(loops):
+def stream(loops, gil_modes=None):
     results = {}
     for loop in loops:
-        with server(loop, streams=True):
-            results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
+
+        def benchmark_fn(l, g):
+            with server(l, streams=True, gil=g):
+                return benchmark(concurrencies=[CONCURRENCIES[0]])
+
+        loop_results = run_benchmark_for_loop(loop, benchmark_fn, gil_modes)
+        if isinstance(loop_results, dict):
+            results.update(loop_results)
+        else:
+            results[loop] = loop_results
     return results
 
 
-def proto(loops):
+def proto(loops, gil_modes=None):
     results = {}
     for loop in loops:
-        with server(loop, proto=True):
-            results[loop] = benchmark(concurrencies=[CONCURRENCIES[0]])
+
+        def benchmark_fn(l, g):
+            with server(l, proto=True, gil=g):
+                return benchmark(concurrencies=[CONCURRENCIES[0]])
+
+        loop_results = run_benchmark_for_loop(loop, benchmark_fn, gil_modes)
+        if isinstance(loop_results, dict):
+            results.update(loop_results)
+        else:
+            results[loop] = loop_results
     return results
 
 
-def concurrency(loops):
+def concurrency(loops, gil_modes=None):
     results = {}
     for loop in loops:
-        with server(loop):
-            results[loop] = benchmark(msgs=[1024], concurrencies=CONCURRENCIES[1:])
+
+        def benchmark_fn(l, g):
+            with server(l, gil=g):
+                return benchmark(msgs=[1024], concurrencies=CONCURRENCIES[1:])
+
+        loop_results = run_benchmark_for_loop(loop, benchmark_fn, gil_modes)
+        if isinstance(loop_results, dict):
+            results.update(loop_results)
+        else:
+            results[loop] = loop_results
     return results
 
 
@@ -152,12 +206,17 @@ BENCHMARKS = {
     is_flag=True,
     help='Run baseline benchmarks (asyncio, rloop, uvloop) and save to baseline.json',
 )
+@click.option(
+    '--gil',
+    type=click.Choice(['0', '1']),
+    help='GIL mode for tokioloop: 0 (nogil), 1 (gil), or omit for both (default)',
+)
 @click.argument(
     'benchmarks',
     nargs=-1,
     type=click.Choice(list(BENCHMARKS.keys()), case_sensitive=False),
 )
-def main(baseline, benchmarks):
+def main(baseline, gil, benchmarks):
     """Run TokioLoop benchmarks.
 
     BENCHMARKS: One or more of: raw, stream, proto, concurrency (default: raw)
@@ -168,15 +227,26 @@ def main(baseline, benchmarks):
     if baseline:
         loops = BASELINE_LOOPS
         output_file = WD / 'results' / 'baseline.json'
+        if gil is not None:
+            click.echo('Warning: --gil is ignored when running baseline benchmarks', err=True)
+            gil = None
     else:
         loops = TOKIOLOOP_ONLY
         output_file = WD / 'results' / 'data.json'
+
+    # Determine GIL modes to test
+    if gil is None:
+        # Default: run both GIL modes
+        gil_modes = [0, 1]
+    else:
+        # Run specific GIL mode
+        gil_modes = [int(gil)]
 
     now = datetime.datetime.utcnow()
     results = {}
     for benchmark_key in run_benchmarks:
         runner = BENCHMARKS[benchmark_key]
-        results[benchmark_key] = runner(loops)
+        results[benchmark_key] = runner(loops, gil_modes)
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, 'w') as f:

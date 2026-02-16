@@ -61,7 +61,9 @@ def analyze_benchmark_type(results, benchmark_name, width=80):
     click.echo('-' * width)
 
     rows = []
-    for loop in ['asyncio', 'uvloop', 'rloop', 'tokioloop']:
+    # Include tokioloop:gil and tokioloop:nogil variants
+    all_loops = ['asyncio', 'uvloop', 'rloop', 'tokioloop:gil', 'tokioloop:nogil']
+    for loop in all_loops:
         if loop in bench_data:
             data = bench_data[loop]
             if '1' not in data:
@@ -106,7 +108,10 @@ def print_tokio_summary(rows_by_benchmark, width=80):
         if not rows:
             continue
 
-        tokioloop = next((r for r in rows if r['loop'] == 'tokioloop'), None)
+        # Prefer tokioloop:nogil, fallback to tokioloop:gil
+        tokioloop = next((r for r in rows if r['loop'] == 'tokioloop:nogil'), None)
+        if tokioloop is None:
+            tokioloop = next((r for r in rows if r['loop'] == 'tokioloop:gil'), None)
         rloop = next((r for r in rows if r['loop'] == 'rloop'), None)
 
         if tokioloop and rloop:
@@ -180,10 +185,11 @@ def load_and_merge_results():
                 if loop in baseline_results[benchmark_name]:
                     merged_results[benchmark_name][loop] = baseline_results[benchmark_name][loop]
 
-        # Add tokioloop from current data
+        # Add tokioloop variants from current data
         if benchmark_name in current_results:
-            if 'tokioloop' in current_results[benchmark_name]:
-                merged_results[benchmark_name]['tokioloop'] = current_results[benchmark_name]['tokioloop']
+            for loop_variant in ['tokioloop:gil', 'tokioloop:nogil']:
+                if loop_variant in current_results[benchmark_name]:
+                    merged_results[benchmark_name][loop_variant] = current_results[benchmark_name][loop_variant]
 
     # Use metadata from current data if available, otherwise from baseline
     metadata = current_data if current_data else baseline_data
