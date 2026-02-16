@@ -56,42 +56,64 @@ def analyze_benchmark_type(results, benchmark_name, width=80):
     print_subheader(f'{benchmark_name.upper()} BENCHMARK', width)
 
     # Table header
-    header = f'{"Event Loop":<15} {"1KB RPS":>12} {"10KB RPS":>12} {"100KB RPS":>12} {"Latency(ms)":>12} {"vs asyncio":>12} {"vs rloop":>12}'
+    header = f'{"Event Loop":<20} {"1KB RPS":>12} {"10KB RPS":>12} {"100KB RPS":>12} {"Latency(ms)":>12} {"vs asyncio":>12} {"vs prev/rloop":>14}'
     click.echo(header)
     click.echo('-' * width)
 
     rows = []
-    # Include tokioloop:gil and tokioloop:nogil variants
-    all_loops = ['asyncio', 'uvloop', 'rloop', 'tokioloop:gil', 'tokioloop:nogil']
+    all_loops = [
+        'asyncio',
+        'uvloop',
+        'rloop',
+        'tokioloop:gil:prev',
+        'tokioloop:gil',
+        'tokioloop:nogil:prev',
+        'tokioloop:nogil',
+    ]
+
     for loop in all_loops:
-        if loop in bench_data:
-            data = bench_data[loop]
-            if '1' not in data:
-                continue
+        if loop not in bench_data:
+            continue
 
-            r1k = data['1'].get('1024', {}).get('rps', 0)
-            r10k = data['1'].get('10240', {}).get('rps', 0)
-            r100k = data['1'].get('102400', {}).get('rps', 0)
-            latency = data['1'].get('1024', {}).get('latency_mean', 0)
+        data = bench_data[loop]
+        if '1' not in data:
+            continue
 
-            vs_asyncio = (r1k / asyncio_1k * 100) if asyncio_1k > 0 else 0
-            vs_rloop = (r1k / rloop_1k * 100) if rloop_1k > 0 else 0
+        r1k = data['1'].get('1024', {}).get('rps', 0)
+        r10k = data['1'].get('10240', {}).get('rps', 0)
+        r100k = data['1'].get('102400', {}).get('rps', 0)
+        latency = data['1'].get('1024', {}).get('latency_mean', 0)
 
-            row = {
-                'loop': loop,
-                'r1k': r1k,
-                'r10k': r10k,
-                'r100k': r100k,
-                'latency': latency,
-                'vs_asyncio': vs_asyncio,
-                'vs_rloop': vs_rloop,
-            }
-            rows.append(row)
+        vs_asyncio = (r1k / asyncio_1k * 100) if asyncio_1k > 0 else 0
 
-            click.echo(
-                f'{loop:<10} {format_rps(r1k):>12} {format_rps(r10k):>12} {format_rps(r100k):>12} '
-                f'{latency:>12.3f} {format_percent(vs_asyncio):>12} {format_percent(vs_rloop):>12}'
-            )
+        # Determine comparison for second column
+        # Compare with :prev version if exists, otherwise compare with rloop
+        if ':prev' in loop:
+            vs_prev_rloop = (r1k / rloop_1k * 100) if rloop_1k > 0 else 0
+        else:
+            prev_loop = f'{loop}:prev'
+            if prev_loop in bench_data:
+                prev_data = bench_data[prev_loop]
+                prev_1k = prev_data['1'].get('1024', {}).get('rps', 0)
+                vs_prev_rloop = (r1k / prev_1k * 100) if prev_1k > 0 else 0
+            else:
+                vs_prev_rloop = (r1k / rloop_1k * 100) if rloop_1k > 0 else 0
+
+        row = {
+            'loop': loop.strip(),
+            'r1k': r1k,
+            'r10k': r10k,
+            'r100k': r100k,
+            'latency': latency,
+            'vs_asyncio': vs_asyncio,
+            'vs_prev_rloop': vs_prev_rloop,
+        }
+        rows.append(row)
+
+        click.echo(
+            f'{loop:<20} {format_rps(r1k):>12} {format_rps(r10k):>12} {format_rps(r100k):>12} '
+            f'{latency:>12.3f} {format_percent(vs_asyncio):>12} {format_percent(vs_prev_rloop):>14}'
+        )
 
     return rows
 
@@ -146,9 +168,10 @@ def print_tokio_summary(rows_by_benchmark, width=80):
 
 
 def load_and_merge_results():
-    """Load baseline.json and data.json, merging results from both."""
+    """Load baseline.json, prev.json and data.json, merging results from all."""
     results_dir = Path(__file__).parent / 'results'
     baseline_path = results_dir / 'baseline.json'
+    prev_path = results_dir / 'prev.json'
     data_path = results_dir / 'data.json'
 
     # Load baseline data (asyncio, rloop, uvloop)
@@ -160,6 +183,12 @@ def load_and_merge_results():
         click.echo(f'Warning: Baseline file not found: {baseline_path}', err=True)
         click.echo('Run: python benchmarks.py --baseline', err=True)
 
+    # Load previous run data
+    prev_data = {}
+    if prev_path.exists():
+        with open(prev_path) as f:
+            prev_data = json.load(f)
+
     # Load current data (tokioloop)
     current_data = {}
     if data_path.exists():
@@ -169,12 +198,13 @@ def load_and_merge_results():
         click.echo(f'Warning: Data file not found: {data_path}', err=True)
         click.echo('Run: python benchmarks.py', err=True)
 
-    # Merge results: baseline loops + tokioloop
+    # Merge results: baseline loops + previous results + tokioloop
     merged_results = {}
     baseline_results = baseline_data.get('results', {})
+    prev_results = prev_data.get('results', {})
     current_results = current_data.get('results', {})
 
-    all_benchmarks = set(baseline_results.keys()) | set(current_results.keys())
+    all_benchmarks = set(baseline_results.keys()) | set(prev_results.keys()) | set(current_results.keys())
 
     for benchmark_name in all_benchmarks:
         merged_results[benchmark_name] = {}
@@ -185,7 +215,14 @@ def load_and_merge_results():
                 if loop in baseline_results[benchmark_name]:
                     merged_results[benchmark_name][loop] = baseline_results[benchmark_name][loop]
 
-        # Add tokioloop variants from current data
+        # Add prev data with :prev suffix
+        if benchmark_name in prev_results:
+            for loop_variant in ['tokioloop:gil', 'tokioloop:nogil']:
+                if loop_variant in prev_results[benchmark_name]:
+                    prev_loop_name = f'{loop_variant}:prev'
+                    merged_results[benchmark_name][prev_loop_name] = prev_results[benchmark_name][loop_variant]
+
+        # Add current tokioloop variants
         if benchmark_name in current_results:
             for loop_variant in ['tokioloop:gil', 'tokioloop:nogil']:
                 if loop_variant in current_results[benchmark_name]:
@@ -201,7 +238,7 @@ def load_and_merge_results():
 @click.option(
     '--width',
     type=int,
-    default=80,
+    default=100,
     show_default=True,
     help='Output width for the report',
 )

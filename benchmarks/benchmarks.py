@@ -249,6 +249,13 @@ def main(baseline, gil, benchmarks):
         results[benchmark_key] = runner(loops, gil_modes)
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Move existing data.json to prev.json if it exists
+    if not baseline and output_file.exists():
+        prev_file = WD / 'results' / 'prev.json'
+        click.echo(f'Moving existing {output_file.name} to {prev_file.name}')
+        output_file.replace(prev_file)
+
     with open(output_file, 'w') as f:
         pyver = sys.version_info
         f.write(
