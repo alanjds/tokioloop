@@ -25,7 +25,7 @@ CONCURRENCIES = sorted({1, max(CPU / 2, 1), max(CPU - 1, 1)})
 
 
 @contextmanager
-def server(loop, streams=False, proto=False, gil=None):
+def server(loop, streams=False, proto=False, gil=None, profile_prefix=None):
     exc_prefix = os.environ.get('BENCHMARK_EXC_PREFIX')
     py = 'python'
     if exc_prefix:
@@ -39,11 +39,20 @@ def server(loop, streams=False, proto=False, gil=None):
 
     # Prepare environment with PYTHON_GIL if specified
     env = os.environ.copy()
+    env_print = []
     if gil is not None:
         env['PYTHON_GIL'] = str(gil)
-        click.echo(f'SERVER: PYTHON_GIL={gil} {proc_cmd}')
-    else:
-        click.echo(f'SERVER: {proc_cmd}')
+        env_print.append(f'PYTHON_GIL={gil}')
+    if profile_prefix:
+        env['PYTHONPERFSUPPORT'] = '1'
+        env_print.append('PYTHONPERFSUPPORT=1')
+        if gil == 1:
+            profile_prefix += f'_{loop}_gil.json'
+        else:
+            profile_prefix += f'_{loop}_nogil.json'
+        proc_cmd = f'samply record --save-only --no-open -o {profile_prefix}.gz {proc_cmd}'
+
+    click.echo(f'SERVER: {" ".join(env_print)} {proc_cmd}')
 
     proc = None
     try:
@@ -121,12 +130,16 @@ def run_benchmark_for_loop(loop, benchmark_fn, gil_modes):
         return benchmark_fn(loop, None)
 
 
-def raw(loops, gil_modes=None):
+def raw(loops, gil_modes=None, profile_prefix=None):
     results = {}
     for loop in loops:
 
         def benchmark_fn(l, g):
-            with server(l, gil=g):
+            nonlocal profile_prefix
+            if profile_prefix:
+                profile_prefix += '_raw'
+
+            with server(l, gil=g, profile_prefix=profile_prefix):
                 return benchmark(concurrencies=[CONCURRENCIES[0]])
 
         loop_results = run_benchmark_for_loop(loop, benchmark_fn, gil_modes)
@@ -137,12 +150,16 @@ def raw(loops, gil_modes=None):
     return results
 
 
-def stream(loops, gil_modes=None):
+def stream(loops, gil_modes=None, profile_prefix=None):
     results = {}
     for loop in loops:
 
         def benchmark_fn(l, g):
-            with server(l, streams=True, gil=g):
+            nonlocal profile_prefix
+            if profile_prefix:
+                profile_prefix += '_stream'
+
+            with server(l, streams=True, gil=g, profile_prefix=profile_prefix):
                 return benchmark(concurrencies=[CONCURRENCIES[0]])
 
         loop_results = run_benchmark_for_loop(loop, benchmark_fn, gil_modes)
@@ -153,12 +170,16 @@ def stream(loops, gil_modes=None):
     return results
 
 
-def proto(loops, gil_modes=None):
+def proto(loops, gil_modes=None, profile_prefix=None):
     results = {}
     for loop in loops:
 
         def benchmark_fn(l, g):
-            with server(l, proto=True, gil=g):
+            nonlocal profile_prefix
+            if profile_prefix:
+                profile_prefix += '_proto'
+
+            with server(l, proto=True, gil=g, profile_prefix=profile_prefix):
                 return benchmark(concurrencies=[CONCURRENCIES[0]])
 
         loop_results = run_benchmark_for_loop(loop, benchmark_fn, gil_modes)
@@ -169,12 +190,16 @@ def proto(loops, gil_modes=None):
     return results
 
 
-def concurrency(loops, gil_modes=None):
+def concurrency(loops, gil_modes=None, profile_prefix=None):
     results = {}
     for loop in loops:
 
         def benchmark_fn(l, g):
-            with server(l, gil=g):
+            nonlocal profile_prefix
+            if profile_prefix:
+                profile_prefix += '_concurrency'
+
+            with server(l, gil=g, profile_prefix=profile_prefix):
                 return benchmark(msgs=[1024], concurrencies=CONCURRENCIES[1:])
 
         loop_results = run_benchmark_for_loop(loop, benchmark_fn, gil_modes)
@@ -211,12 +236,17 @@ BENCHMARKS = {
     type=click.Choice(['0', '1']),
     help='GIL mode for tokioloop: 0 (nogil), 1 (gil), or omit for both (default)',
 )
+@click.option(
+    '--profile',
+    is_flag=True,
+    help='Profile with samply. Saves to perf/ folder.',
+)
 @click.argument(
     'benchmarks',
     nargs=-1,
     type=click.Choice(list(BENCHMARKS.keys()), case_sensitive=False),
 )
-def main(baseline, gil, benchmarks):
+def main(baseline, gil, benchmarks, profile=False):
     """Run TokioLoop benchmarks.
 
     BENCHMARKS: One or more of: raw, stream, proto, concurrency (default: raw)
@@ -244,34 +274,47 @@ def main(baseline, gil, benchmarks):
 
     now = datetime.datetime.utcnow()
     results = {}
+
+    if profile:
+        # Create profile prefix with timestamp
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        perf_dir = WD / 'perf'
+        perf_dir.mkdir(parents=True, exist_ok=True)
+        profile_prefix = str(perf_dir / f'profile_{timestamp}')
+    else:
+        profile_prefix = None
+
     for benchmark_key in run_benchmarks:
         runner = BENCHMARKS[benchmark_key]
-        results[benchmark_key] = runner(loops, gil_modes)
+        results[benchmark_key] = runner(loops, gil_modes, profile_prefix)
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Move existing data.json to prev.json if it exists
-    if not baseline and output_file.exists():
+    if not baseline and not profile and output_file.exists():
         prev_file = WD / 'results' / 'prev.json'
         click.echo(f'Moving existing {output_file.name} to {prev_file.name}')
         output_file.replace(prev_file)
 
-    with open(output_file, 'w') as f:
-        pyver = sys.version_info
-        f.write(
-            json.dumps(
-                {
-                    'cpu': CPU,
-                    'run_at': int(now.timestamp()),
-                    'pyver': f'{pyver.major}.{pyver.minor}',
-                    'results': results,
-                    'rloop': _rloop_version(),
-                },
-                indent=2,
+    if profile:
+        click.echo(f'Profiles saved to {perf_dir}/profile_{timestamp}_*.json')
+    else:
+        with open(output_file, 'w') as f:
+            pyver = sys.version_info
+            f.write(
+                json.dumps(
+                    {
+                        'cpu': CPU,
+                        'run_at': int(now.timestamp()),
+                        'pyver': f'{pyver.major}.{pyver.minor}',
+                        'results': results,
+                        'rloop': _rloop_version(),
+                    },
+                    indent=2,
+                )
             )
-        )
 
-    click.echo(f'Results saved to {output_file}')
+        click.echo(f'Results saved to {output_file}')
 
 
 if __name__ == '__main__':
