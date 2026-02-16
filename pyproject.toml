@@ -42,6 +42,9 @@ dependencies = [
 build = [
     'maturin~=1.8',
 ]
+dev = [
+    'click~=8.0',
+]
 lint = [
     'ruff~=0.11',
 ]
@@ -55,6 +58,7 @@ test = [
 
 all = [
     { include-group = 'build' },
+    { include-group = 'dev' },
     { include-group = 'lint' },
     { include-group = 'test' },
 ]

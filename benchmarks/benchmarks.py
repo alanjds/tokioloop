@@ -10,6 +10,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 import logging
+import click
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +37,16 @@ def server(loop, streams=False, proto=False):
     if proto:
         proc_cmd += ' --proto'
 
-    print('SERVER:', proc_cmd)
+    click.echo(f'SERVER: {proc_cmd}')
+    proc = None
     try:
         proc = subprocess.Popen(proc_cmd, shell=True, preexec_fn=os.setsid)  # noqa: S602
         time.sleep(2)
         yield proc
     finally:
-        if hasattr(proc, 'pid'):
+        if proc is not None and hasattr(proc, 'pid'):
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        print('Server gone.')
+        click.echo('Server gone.')
 
 
 def client(duration, concurrency, msgsize):
@@ -62,7 +64,7 @@ def client(duration, concurrency, msgsize):
         '--output json',
     ]
     try:
-        print('CLIENT:', ' '.join(cmd_parts))
+        click.echo(f'CLIENT: {" ".join(cmd_parts)}')
         proc = subprocess.run(  # noqa: S602
             ' '.join(cmd_parts),
             shell=True,
@@ -72,8 +74,7 @@ def client(duration, concurrency, msgsize):
         data = json.loads(proc.stdout.decode('utf8'))
         return data
     except Exception as e:
-        print(f'WARN: got exception {e} while loading client data')
-        logger.error('Error', exc_info=True)
+        click.echo(f'WARN: got exception {e} while loading client data', err=True)
         return {}
 
 
@@ -136,26 +137,35 @@ def _rloop_version():
     return rloop.__version__
 
 
-def run():
-    all_benchmarks = {
-        'raw': raw,
-        'stream': stream,
-        'streams': stream,  # accept as a typo
-        'proto': proto,
-        'concurrency': concurrency,
-    }
+BENCHMARKS = {
+    'raw': raw,
+    'stream': stream,
+    'streams': stream,  # accept as a typo
+    'proto': proto,
+    'concurrency': concurrency,
+}
 
-    # Parse arguments manually
-    args = sys.argv[1:]
-    baseline_mode = '--baseline' in args
-    if baseline_mode:
-        args.remove('--baseline')
 
-    inp_benchmarks = args or ['raw']
-    run_benchmarks = set(inp_benchmarks) & set(all_benchmarks.keys())
+@click.command()
+@click.option(
+    '--baseline',
+    is_flag=True,
+    help='Run baseline benchmarks (asyncio, rloop, uvloop) and save to baseline.json',
+)
+@click.argument(
+    'benchmarks',
+    nargs=-1,
+    type=click.Choice(list(BENCHMARKS.keys()), case_sensitive=False),
+)
+def main(baseline, benchmarks):
+    """Run TokioLoop benchmarks.
+
+    BENCHMARKS: One or more of: raw, stream, proto, concurrency (default: raw)
+    """
+    run_benchmarks = set(benchmarks) if benchmarks else {'raw'}
 
     # Determine which loops to run based on --baseline flag
-    if baseline_mode:
+    if baseline:
         loops = BASELINE_LOOPS
         output_file = WD / 'results' / 'baseline.json'
     else:
@@ -165,7 +175,7 @@ def run():
     now = datetime.datetime.utcnow()
     results = {}
     for benchmark_key in run_benchmarks:
-        runner = all_benchmarks[benchmark_key]
+        runner = BENCHMARKS[benchmark_key]
         results[benchmark_key] = runner(loops)
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -184,8 +194,8 @@ def run():
             )
         )
 
-    print(f'Results saved to {output_file}')
+    click.echo(f'Results saved to {output_file}')
 
 
 if __name__ == '__main__':
-    run()
+    main()
