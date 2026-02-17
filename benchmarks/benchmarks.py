@@ -9,6 +9,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+import psutil
 import logging
 import click
 
@@ -50,17 +51,20 @@ def server(loop, streams=False, proto=False, gil=None, profile_prefix=None):
             profile_prefix += f'_{loop}_gil.json'
         else:
             profile_prefix += f'_{loop}_nogil.json'
-        proc_cmd = f'samply record --save-only --no-open -o {profile_prefix}.gz {proc_cmd}'
+        proc_perf_cmd = f'samply record -v --no-open --save-only -o {profile_prefix}.gz'
 
     click.echo(f'SERVER: {" ".join(env_print)} {proc_cmd}')
 
     proc = None
     try:
         proc = subprocess.Popen(proc_cmd, shell=True, preexec_fn=os.setsid, env=env)  # noqa: S602
+        if profile_prefix:
+            proc_perf = subprocess.Popen(proc_perf_cmd + f' --pid {proc.pid}', shell=True, env=env)  # noqa: S602
         time.sleep(2)
         yield proc
     finally:
         if proc is not None and hasattr(proc, 'pid'):
+            click.echo('Sending SIGTERM to server')
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         click.echo('Server gone.')
 
