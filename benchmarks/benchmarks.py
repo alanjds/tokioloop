@@ -167,7 +167,7 @@ def stream(loops, gil_modes=None, profile_prefix=None):
 
         def benchmark_fn(l, g):
             nonlocal profile_prefix
-            profile_prefix_ = f'{profile_prefix}_raw' if profile_prefix else None
+            profile_prefix_ = f'{profile_prefix}_stream' if profile_prefix else None
 
             with server(l, streams=True, gil=g, profile_prefix=profile_prefix_):
                 return benchmark(concurrencies=[CONCURRENCIES[0]])
@@ -186,7 +186,7 @@ def proto(loops, gil_modes=None, profile_prefix=None):
 
         def benchmark_fn(l, g):
             nonlocal profile_prefix
-            profile_prefix_ = f'{profile_prefix}_raw' if profile_prefix else None
+            profile_prefix_ = f'{profile_prefix}_proto' if profile_prefix else None
 
             with server(l, proto=True, gil=g, profile_prefix=profile_prefix_):
                 return benchmark(concurrencies=[CONCURRENCIES[0]])
@@ -205,7 +205,7 @@ def concurrency(loops, gil_modes=None, profile_prefix=None):
 
         def benchmark_fn(l, g):
             nonlocal profile_prefix
-            profile_prefix_ = f'{profile_prefix}_raw' if profile_prefix else None
+            profile_prefix_ = f'{profile_prefix}_concurrency' if profile_prefix else None
 
             with server(l, gil=g, profile_prefix=profile_prefix_):
                 return benchmark(msgs=[1024], concurrencies=CONCURRENCIES[1:])
