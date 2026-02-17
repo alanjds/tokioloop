@@ -57,15 +57,23 @@ def server(loop, streams=False, proto=False, gil=None, profile_prefix=None):
 
     proc = None
     try:
-        proc = subprocess.Popen(proc_cmd, shell=True, preexec_fn=os.setsid, env=env)  # noqa: S602
         if profile_prefix:
-            proc_perf = subprocess.Popen(proc_perf_cmd + f' --pid {proc.pid}', shell=True, env=env)  # noqa: S602
+            proc_cmd = f'{proc_perf_cmd} -- {proc_cmd}'
+
+        proc = subprocess.Popen(proc_cmd, shell=True, preexec_fn=os.setsid, env=env)  # noqa: S602
+
         time.sleep(2)
         yield proc
     finally:
         if proc is not None and hasattr(proc, 'pid'):
-            click.echo('Sending SIGTERM to server')
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            click.echo('Sending SIGINT to server')
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            try:
+                proc.wait(5)
+            except Exception as err:
+                print('ERROR:', err)
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+
         click.echo('Server gone.')
 
 
