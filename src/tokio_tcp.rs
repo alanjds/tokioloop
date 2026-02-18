@@ -9,7 +9,7 @@ use pyo3::types::PyBytes;
 use pyo3::IntoPyObjectExt;
 use tokio::{
     net::{TcpStream, TcpListener},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
 };
 use socket2::{Domain, Type};
 
@@ -213,6 +213,8 @@ impl TokioTCPTransport {
             fd = stream.as_raw_fd() as i32;
 
             let (mut reader, mut writer) = tokio::io::split(stream);
+            // Use BufWriter for automatic write buffering/batching
+            let mut writer = BufWriter::new(writer);
 
             loop {
                 // Check if we should stop
@@ -285,9 +287,8 @@ impl TokioTCPTransport {
                                 log::error!("TCP write error: [fd={}] {}", fd, e);
                             } else {
                                 log::trace!("TCP wrote {} bytes [fd={}]", data.len(), fd);
-                                if let Err(e) = writer.flush().await {
-                                    log::error!("TCP flush error: [fd={}] {}", fd, e);
-                                }
+                                // BufWriter handles buffering automatically - no need to flush after every write
+                                // Only flush when write buffer is empty (during shutdown)
                             }
                         }
 
@@ -308,8 +309,8 @@ impl TokioTCPTransport {
                         (state_lock.weof && !state_lock.write_shutdown_done)
                     } => {}
 
-                    // Prevent a busy loop
-                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                    // Prevent a busy loop - use yield_now instead of 1ms sleep
+                    _ = tokio::task::yield_now() => {}
                 }
 
                 // Graceful shutdown only after everything else. May never occur
