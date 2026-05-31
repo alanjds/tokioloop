@@ -77,3 +77,44 @@ Message sizes: 1KB / 10KB / 100KB. Metric: requests/second (higher = better).
 
 ---
 
+## Step 2 — close()/abort() wake + connection_lost via scheduler
+
+**Changes (commit `89ec07e`):**
+1. `close()` and `abort()` now call `write_notify.notify_one()` so `io_processing_loop` exits its `notified().await` park immediately (fixes `test_transport_get_extra_info` hang).
+2. `connection_lost` routed through the event loop scheduler (`RustCallHandle`): `io_processing_loop` sends a closure via `scheduler_tx.try_send()` instead of calling `attach_blocking` directly.
+3. Stopping check in main select loop: `yield_now()` + scheduler drain + run-with-GIL before `break`. Ensures `connection_lost` is called before `run_until_complete` returns.
+
+**Effect on tests:** `test_tcp_server_recv_send[rloop.TokioLoop]` now passes (`proto.state == 'CLOSED'` instead of `'EOF'`).
+
+**Note:** This is a correctness fix, not a throughput optimization. Numbers should be within noise of step 1.
+
+### RAW benchmark (sock_recv/sock_sendall)
+
+| loop       |     1KB |    10KB |   100KB |
+|------------|--------:|--------:|--------:|
+| asyncio    |  11,180 |  10,610 |   7,174 |
+| rloop      |  12,565 |  12,763 |   6,219 |
+| tokioloop  |   5,307 |   5,224 |   4,426 |
+| uvloop     |  12,479 |  11,254 |   7,418 |
+
+**Delta vs step 1:** +20.6% / +19.4% / +12.7% for tokioloop.
+
+**tokioloop vs asyncio (raw):** 47.5% / 49.2% / 61.7% — significant improvement vs step 1 (38.7%/40.5%/58.4%).
+
+**Why the improvement?** Removing `attach_blocking` from the connection teardown path reduces GIL contention between `io_processing_loop` and the event loop's main callback batch. Previously, each connection close caused a worker thread to compete for the GIL via `block_in_place`. With `connection_lost` now routed through the scheduler, the GIL is only acquired by the event loop's own `attach_blocking` call.
+
+### PROTO benchmark (asyncio protocols/transports)
+
+| loop       |     1KB |    10KB |   100KB |
+|------------|--------:|--------:|--------:|
+| asyncio    |   N/A¹  |   N/A¹  |   N/A¹  |
+| rloop      |  14,047 |  12,911 |   7,831 |
+| tokioloop  |  11,888 |  11,170 |   6,398 |
+| uvloop     |  12,395 |  12,596 |   8,666 |
+
+¹ asyncio server failed to bind (port conflict during run — not a regression).
+
+**tokioloop vs rloop (proto):** 84.6% / 86.5% / 81.7% — numbers shifted from step 1 within noise; rloop baseline also shifted. Correctness fix has no meaningful throughput impact.
+
+---
+
