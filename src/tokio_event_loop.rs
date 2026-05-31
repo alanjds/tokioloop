@@ -635,7 +635,7 @@ impl TEventLoop {
                                     Ok(p) => p,
                                     Err(_) => break,
                                 };
-                                let handle = attach_blocking(|py| {
+                                let handle = Python::attach(|py| {
                                     let locked = entry_task.lock().map_err(|_| {
                                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("entry_task lock poisoned")
                                     })?;
@@ -746,7 +746,7 @@ impl TEventLoop {
                                     Ok(p) => p,
                                     Err(_) => break,
                                 };
-                                let handle = attach_blocking(|py| {
+                                let handle = Python::attach(|py| {
                                     let locked = entry_task.lock().map_err(|_| {
                                         PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("entry_task lock poisoned")
                                     })?;
