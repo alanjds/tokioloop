@@ -9,7 +9,6 @@ use anyhow::Result;
 use pyo3::prelude::*;
 use std::sync::atomic::AtomicBool;
 use tokio::{runtime::Runtime, task::JoinHandle, net::UnixStream};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -105,8 +104,8 @@ impl LoopHandlers {
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub struct TEventLoop {
     runtime: OnceLock<Arc<Runtime>>,
-    scheduler_tx: mpsc::UnboundedSender<ScheduledTask>,
-    scheduler_rx: Mutex<Option<mpsc::UnboundedReceiver<ScheduledTask>>>,
+    scheduler_tx: async_channel::Sender<ScheduledTask>,
+    scheduler_rx: async_channel::Receiver<ScheduledTask>,
     counter_ready: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
     stopping: Arc<atomic::AtomicBool>,
@@ -247,7 +246,7 @@ impl TEventLoop {
         };
 
         log::debug!("Scheduling task: {:?}", task);
-        if self.scheduler_tx.send(task).is_err() {
+        if self.scheduler_tx.try_send(task).is_err() {
             log::debug!("Failed to schedule task - channel closed, ignoring");
             return Err(anyhow::anyhow!("Failed to schedule task - loop stopping & channel closed"));
         }
@@ -267,13 +266,13 @@ impl TEventLoop {
 impl TEventLoop {
     #[new]
     fn new(py: Python) -> PyResult<Self> {
-        let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel::<ScheduledTask>();
+        let (scheduler_tx, scheduler_rx) = async_channel::unbounded::<ScheduledTask>();
         let (signal_socket_tx, signal_socket_rx) = async_channel::unbounded::<u8>();
 
         Ok(Self {
             runtime: OnceLock::new(),
             scheduler_tx,
-            scheduler_rx: Mutex::new(Some(scheduler_rx)),
+            scheduler_rx,
             counter_ready: atomic::AtomicUsize::new(0),
             closed: atomic::AtomicBool::new(false),
             stopping: Arc::new(atomic::AtomicBool::new(false)),
@@ -371,14 +370,7 @@ impl TEventLoop {
             exception_handler: Arc::clone(&self.exception_handler),
         };
 
-        // Extract receiver — can only be taken once per loop instance
-        let scheduler_rx = self.scheduler_rx
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "_run() called while already running"
-            ))?;
+        let scheduler_rx = self.scheduler_rx.clone();
 
         let stopping_clone = Arc::clone(&self.stopping);
         let epoch = self.epoch;
@@ -398,7 +390,7 @@ impl TEventLoop {
                         // Drain all immediately available scheduled tasks in one shot
                         task = scheduler_rx.recv() => {
                             match task {
-                                Some(ScheduledTask::Immediate { handle }) => {
+                                Ok(ScheduledTask::Immediate { handle }) => {
                                     log::trace!("Received: Immediate task");
                                     current_handles.push_back(handle);
                                     // Greedily drain any additional tasks already in the channel
@@ -409,7 +401,7 @@ impl TEventLoop {
                                         }
                                     }
                                 }
-                                Some(ScheduledTask::Delayed { timer }) => {
+                                Ok(ScheduledTask::Delayed { timer }) => {
                                     log::trace!("Received: Delayed task");
                                     delayed_tasks.push(timer);
                                     while let Ok(extra) = scheduler_rx.try_recv() {
@@ -419,7 +411,7 @@ impl TEventLoop {
                                         }
                                     }
                                 }
-                                None => {
+                                Err(_) => {
                                     log::debug!("Scheduler channel closed");
                                     break;
                                 }
@@ -662,7 +654,7 @@ impl TEventLoop {
                                             inner: Box::new(h),
                                             _permit: permit,
                                         });
-                                        if scheduler_tx.send(ScheduledTask::Immediate { handle: wrapped }).is_err() {
+                                        if scheduler_tx.try_send(ScheduledTask::Immediate { handle: wrapped }).is_err() {
                                             log::debug!("add_reader: scheduler closed for fd {}", fd);
                                             break;
                                         }
@@ -773,7 +765,7 @@ impl TEventLoop {
                                             inner: Box::new(h),
                                             _permit: permit,
                                         });
-                                        if scheduler_tx.send(ScheduledTask::Immediate { handle: wrapped }).is_err() {
+                                        if scheduler_tx.try_send(ScheduledTask::Immediate { handle: wrapped }).is_err() {
                                             log::debug!("add_writer: scheduler closed for fd {}", fd);
                                             break;
                                         }
