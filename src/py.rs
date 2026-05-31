@@ -1,6 +1,26 @@
 use pyo3::{prelude::*, sync::PyOnceLock};
 use std::convert::Into;
 
+/// Acquire the GIL in a way that is safe to call from a tokio async task.
+///
+/// Regular `Python::attach()` on a tokio worker thread can trigger Python GC, which may
+/// drop `Arc<Runtime>` objects and panic ("Cannot drop a runtime in a context where blocking
+/// is not allowed"). Wrapping in `block_in_place` switches the thread to blocking mode,
+/// where runtime drops are permitted.
+///
+/// Falls back to plain `Python::attach` when not inside a tokio async context.
+#[inline]
+pub(crate) fn attach_blocking<F, R>(f: F) -> R
+where
+    F: FnOnce(Python) -> R,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| Python::attach(f))
+    } else {
+        Python::attach(f)
+    }
+}
+
 static ASYNCIO: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static ASYNCIO_PROTO_BUF: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 static SOCKET: PyOnceLock<Py<PyAny>> = PyOnceLock::new();

@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque}, net::SocketAddr, os::fd::{AsRawFd, FromRawFd}, sync::{atomic::{self, AtomicBool}, Arc, Mutex},
-    time::{Duration},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -9,13 +9,17 @@ use pyo3::types::PyBytes;
 use pyo3::IntoPyObjectExt;
 use tokio::{
     net::{TcpStream, TcpListener},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
+    sync::Notify,
 };
 use socket2::{Domain, Type};
 
+use async_channel;
+
 use crate::{
-    tokio_event_loop::TEventLoop,
-    py::sock,
+    tokio_event_loop::{TEventLoop, ScheduledTask},
+    tokio_handles::{RustCallHandle, TBoxedHandle},
+    py::{sock, attach_blocking},
 };
 
 /// Internal state management for tokio TCP connections
@@ -45,6 +49,10 @@ pub(crate) struct TokioTCPTransport {
     closing: AtomicBool,
     paused: AtomicBool,
     weof: AtomicBool,
+    // Wakes the I/O task immediately when resume_reading() is called
+    resume_notify: Arc<Notify>,
+    // Wakes the I/O task when write() or write_eof() adds data
+    write_notify: Arc<Notify>,
     #[pyo3(get)]
     lfd: Option<usize>,
 }
@@ -124,6 +132,8 @@ impl TokioTCPTransport {
             closing: false.into(),
             paused: false.into(),
             weof: false.into(),
+            resume_notify: Arc::new(Notify::new()),
+            write_notify: Arc::new(Notify::new()),
             lfd: None,
         };
 
@@ -131,13 +141,17 @@ impl TokioTCPTransport {
     }
 
     pub fn attach(transport: &Py<Self>, py: Python) -> PyResult<Py<PyAny>> {
-        let rself = transport.borrow(py);
+        let protocol = transport.borrow(py).protocol.clone_ref(py);
 
-        // Start the I/O processing task
+        // Call connection_made FIRST: protocol may call write()/write_eof() here,
+        // populating write_buf before io_processing_loop starts so it sees all
+        // pending writes on its very first select! iteration.
+        protocol.call_method1(py, pyo3::intern!(py, "connection_made"), (transport.clone_ref(py),))?;
+
+        // THEN start io_processing_loop (write_buf already populated)
         Self::start_io_task(transport, py)?;
 
-        rself.protocol.call_method1(py, pyo3::intern!(py, "connection_made"), (transport.clone_ref(py),))?;
-        Ok(rself.protocol.clone_ref(py))
+        Ok(protocol)
     }
 
     fn start_io_task(transport: &Py<Self>, py: Python) -> PyResult<()> {
@@ -145,16 +159,17 @@ impl TokioTCPTransport {
         let protocol = transport.borrow(py).protocol.clone_ref(py);
         let pyloop = transport.borrow(py).pyloop.clone_ref(py);
         let state = transport.borrow(py).state.clone();
+        let resume_notify = transport.borrow(py).resume_notify.clone();
+        let write_notify = transport.borrow(py).write_notify.clone();
 
         let runtime = pyloop.borrow(py).get_runtime();
+        let scheduler_tx = pyloop.borrow(py).scheduler_tx.clone();
 
-        // Spawn the I/O processing task
         let state_clone = state.clone();
         let io_task = runtime.spawn(async move {
-            Self::io_processing_loop(transport_clone, state_clone, protocol).await;
+            Self::io_processing_loop(transport_clone, state_clone, protocol, resume_notify, write_notify, scheduler_tx).await;
         });
 
-        // Store the task handle
         {
             let mut state_lock = state.lock().unwrap();
             state_lock.io_task = Some(io_task);
@@ -167,10 +182,13 @@ impl TokioTCPTransport {
         transport: Py<TokioTCPTransport>,
         state: Arc<Mutex<TokioTCPTransportState>>,
         protocol: Py<PyAny>,
+        resume_notify: Arc<Notify>,
+        write_notify: Arc<Notify>,
+        scheduler_tx: async_channel::Sender<ScheduledTask>,
     ) {
-        let mut read_buf = [0u8; 8192];
+        // 64KB read buffer — 8x fewer syscalls for large messages vs 8KB
+        let mut read_buf = [0u8; 65536];
 
-        // Extract the stream and split it for reading and writing
         let stream_opt = {
             let mut state_lock = state.lock().unwrap();
             std::mem::take(&mut state_lock.stream)
@@ -181,15 +199,14 @@ impl TokioTCPTransport {
             return;
         };
 
-        // For logs
         let fd = stream.as_raw_fd();
-
-        let (mut reader, mut writer) = tokio::io::split(stream);
+        let (mut reader, raw_writer) = tokio::io::split(stream);
+        // BufWriter batches small writes into 8KB chunks, eliminating per-write flush overhead
+        let mut writer = BufWriter::new(raw_writer);
 
         let mut connection_lost_called = false;
 
         loop {
-            // Check if we should stop
             let (is_closing, is_paused, read_eof) = {
                 let state_lock = state.lock().unwrap();
                 (state_lock.closing, state_lock.paused, state_lock.read_eof)
@@ -200,18 +217,16 @@ impl TokioTCPTransport {
                 break;
             }
 
-            // If paused, just wait then recheck (loop)
+            // Park the task (zero CPU) until resume_reading() wakes us
             if is_paused {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                resume_notify.notified().await;
                 continue;
             }
 
             tokio::select! {
-                // Handle reading: only if we have not received EOF yet
                 result = reader.read(&mut read_buf), if !read_eof => {
                     match result {
                         Ok(0) => {
-                            // EOF received
                             log::trace!("TCP connection EOF received [fd={}]", fd);
                             {
                                 let mut state_lock = state.lock().unwrap();
@@ -222,7 +237,6 @@ impl TokioTCPTransport {
                             });
                         }
                         Ok(n) => {
-                            // Data received, forward to protocol
                             let data = read_buf[..n].to_vec();
                             Python::attach(|py| {
                                 let _ = protocol.call_method1(
@@ -232,9 +246,7 @@ impl TokioTCPTransport {
                                 );
                             });
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // No data available, continue
-                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                         Err(e) => {
                             log::error!("TCP read error: [fd={}] {}", fd, e);
                             break;
@@ -243,7 +255,17 @@ impl TokioTCPTransport {
                 }
 
                 _ = async {
-                    // Writing & shutdown should be handled with both locked
+                    // Park until there's something to write — handles writes arriving after
+                    // the previous select! iteration started with an empty write_buf.
+                    let has_work = {
+                        let s = state.lock().unwrap();
+                        !s.write_buf.is_empty() || (s.weof && !s.write_shutdown_done)
+                    };
+                    if !has_work {
+                        write_notify.notified().await;
+                        return;
+                    }
+
                     let (write_data, should_shutdown_now) = {
                         let mut state_lock = state.lock().unwrap();
                         let write_data = state_lock.write_buf.pop_front();
@@ -253,70 +275,67 @@ impl TokioTCPTransport {
                         (write_data, should_shutdown)
                     };
 
-                    // Handle writing first
                     if let Some(data) = write_data {
                         if let Err(e) = writer.write_all(&data).await {
                             log::error!("TCP write error: [fd={}] {}", fd, e);
                         } else {
-                            log::trace!("TCP wrote {} bytes [fd={}]", data.len(), fd);
-                            if let Err(e) = writer.flush().await {
-                                log::error!("TCP flush error: [fd={}] {}", fd, e);
+                            // Flush BufWriter when write_buf is now empty so small messages
+                            // are delivered promptly instead of sitting in the 8KB buffer.
+                            if !should_shutdown_now {
+                                let buf_empty = state.lock().unwrap().write_buf.is_empty();
+                                if buf_empty {
+                                    let _ = writer.flush().await;
+                                }
                             }
                         }
                     }
 
-                    // Shutdown only with empty buffer
                     if should_shutdown_now {
                         log::trace!("TCP writer shutdown starting [fd={}]", fd);
+                        if let Err(e) = writer.flush().await {
+                            log::debug!("TCP flush before shutdown error: [fd={}] {}", fd, e);
+                        }
                         if let Err(e) = writer.shutdown().await {
                             log::debug!("TCP writer shutdown error (may be expected): [fd={}] {}", fd, e);
                         }
-
                         let mut state_lock = state.lock().unwrap();
                         state_lock.write_shutdown_done = true;
                         log::debug!("TCP writer shutdown completed [fd={}]", fd);
                     }
-                }, if {
-                    let state_lock = state.lock().unwrap();
-                    !state_lock.write_buf.is_empty() ||
-                    (state_lock.weof && !state_lock.write_shutdown_done)
                 } => {}
-
-                // Prevent a busy loop
-                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                // No default arm — tokio parks the task when both arms are inactive (zero CPU)
             }
 
-            // Graceful shutdown only after everything else. May never occur
             let should_exit = {
                 let state_lock = state.lock().unwrap();
                 (state_lock.read_eof && state_lock.write_buf.is_empty())
-                // ^-- Exit when client closes without server doing write_eof()
                     || (state_lock.read_eof
                         && state_lock.write_shutdown_done
                         && state_lock.write_buf.is_empty())
             };
 
             if should_exit {
-                log::trace!("TCP connection gracefully closed (read EOF + no pending writes) [fd={}]", fd);
+                log::trace!("TCP connection gracefully closed [fd={}]", fd);
                 break;
             }
         }
 
-        log::trace!("Prepare to call connection_lost on TCP [fd={}]", fd);
-        Python::attach(|py| {
-            let transport_ref = transport.borrow(py);
+        log::trace!("Scheduling connection_lost on TCP [fd={}]", fd);
 
+        // Route connection_lost through the event loop scheduler so the main loop
+        // runs it before run_until_complete returns (in the teardown drain phase).
+        // Py<T> objects are dropped inside the closure with the GIL held — safe.
+        let handle: TBoxedHandle = Box::new(RustCallHandle::new(move |py: Python| {
+            let transport_ref = transport.borrow(py);
             if !connection_lost_called {
-                connection_lost_called = true;
                 transport_ref.call_connection_lost(py, None);
                 log::debug!("Called connection_lost on TCP [fd={}]", fd);
-            } else {
-                log::debug!("connection_lost already called, skipping [fd={}]", fd);
             }
-            // Explicitly drop transport_ref while still attached to Python
-            // to avoid panic when Py<T> tries to decrement refcount
             drop(transport_ref);
-        });
+            drop(transport);
+            drop(protocol);
+        }));
+        let _ = scheduler_tx.try_send(ScheduledTask::Immediate { handle });
     }
 
     #[inline]
@@ -418,6 +437,7 @@ impl TokioTCPTransport {
             let mut state = self.state.lock().unwrap();
             state.write_buf.push_back(bytes);
         }
+        self.write_notify.notify_one();
 
         Ok(())
     }
@@ -439,6 +459,8 @@ impl TokioTCPTransport {
             // Set EOF flag - actual shutdown will happen when write buffer is empty
             let mut state = self.state.lock().unwrap();
             state.weof = true;
+            drop(state);
+            self.write_notify.notify_one();
         }
 
         Ok(())
@@ -467,6 +489,9 @@ impl TokioTCPTransport {
         if self.paused.compare_exchange(true, false, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_ok() {
             let mut state = self.state.lock().unwrap();
             state.paused = false;
+            drop(state);
+            // Wake the I/O task immediately instead of waiting for the 10ms sleep
+            self.resume_notify.notify_one();
         }
     }
 
@@ -477,9 +502,10 @@ impl TokioTCPTransport {
 
         let mut state = self.state.lock().unwrap();
         state.closing = true;
-
-        // Don't call connection_lost immediately: let the I/O loop handle it
-        // Allows for any pending data to be received
+        drop(state);
+        // Wake io_processing_loop: it may be parked in write_notify.notified().await.
+        // After notified() returns, the outer loop re-checks is_closing and breaks.
+        self.write_notify.notify_one();
     }
 
     fn abort(&self, py: Python) {
@@ -488,6 +514,8 @@ impl TokioTCPTransport {
             let mut state = self.state.lock().unwrap();
             state.closing = true;
             state.write_buf.clear();
+            drop(state);
+            self.write_notify.notify_one();
         }
     }
 
@@ -600,6 +628,8 @@ impl TokioTCPServer {
             closing: false.into(),
             paused: false.into(),
             weof: false.into(),
+            resume_notify: Arc::new(Notify::new()),
+            write_notify: Arc::new(Notify::new()),
             lfd: None,
         };
 
@@ -682,7 +712,7 @@ impl TokioTCPServer {
                     Ok((stream, addr)) => {
                         log::debug!("TokioTCPServer: New connection accepted from client on {}", addr);
 
-                        Python::attach(|py| {
+                        attach_blocking(|py| {
                             let transport = TokioTCPServer::create_transport_from_stream(
                                 py,
                                 &pyloop,
@@ -720,6 +750,13 @@ impl TokioTCPServer {
             }
 
             log::debug!("TokioTCPServer: Listener loop stopped");
+
+            // Drop Py<T> captures via attach_blocking (block_in_place) so GC-triggered
+            // runtime drops don't panic on the worker thread.
+            attach_blocking(|_py| {
+                drop(protocol_factory);
+                drop(pyloop);
+            });
         });
 
         Ok(())
