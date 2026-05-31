@@ -14,8 +14,11 @@ use tokio::{
 };
 use socket2::{Domain, Type};
 
+use async_channel;
+
 use crate::{
-    tokio_event_loop::TEventLoop,
+    tokio_event_loop::{TEventLoop, ScheduledTask},
+    tokio_handles::{RustCallHandle, TBoxedHandle},
     py::{sock, attach_blocking},
 };
 
@@ -160,10 +163,11 @@ impl TokioTCPTransport {
         let write_notify = transport.borrow(py).write_notify.clone();
 
         let runtime = pyloop.borrow(py).get_runtime();
+        let scheduler_tx = pyloop.borrow(py).scheduler_tx.clone();
 
         let state_clone = state.clone();
         let io_task = runtime.spawn(async move {
-            Self::io_processing_loop(transport_clone, state_clone, protocol, resume_notify, write_notify).await;
+            Self::io_processing_loop(transport_clone, state_clone, protocol, resume_notify, write_notify, scheduler_tx).await;
         });
 
         {
@@ -180,6 +184,7 @@ impl TokioTCPTransport {
         protocol: Py<PyAny>,
         resume_notify: Arc<Notify>,
         write_notify: Arc<Notify>,
+        scheduler_tx: async_channel::Sender<ScheduledTask>,
     ) {
         // 64KB read buffer — 8x fewer syscalls for large messages vs 8KB
         let mut read_buf = [0u8; 65536];
@@ -315,22 +320,22 @@ impl TokioTCPTransport {
             }
         }
 
-        log::trace!("Prepare to call connection_lost on TCP [fd={}]", fd);
+        log::trace!("Scheduling connection_lost on TCP [fd={}]", fd);
 
-        // attach_blocking uses block_in_place so GC-triggered runtime drops don't panic.
-        attach_blocking(|py| {
+        // Route connection_lost through the event loop scheduler so the main loop
+        // runs it before run_until_complete returns (in the teardown drain phase).
+        // Py<T> objects are dropped inside the closure with the GIL held — safe.
+        let handle: TBoxedHandle = Box::new(RustCallHandle::new(move |py: Python| {
             let transport_ref = transport.borrow(py);
             if !connection_lost_called {
-                connection_lost_called = true;
                 transport_ref.call_connection_lost(py, None);
                 log::debug!("Called connection_lost on TCP [fd={}]", fd);
             }
             drop(transport_ref);
-            // Drop Py<T> parameters here with GIL + blocking mode active.
-            // This is safe: block_in_place allows runtime drops if GC triggers one.
             drop(transport);
             drop(protocol);
-        });
+        }));
+        let _ = scheduler_tx.try_send(ScheduledTask::Immediate { handle });
     }
 
     #[inline]
@@ -497,9 +502,10 @@ impl TokioTCPTransport {
 
         let mut state = self.state.lock().unwrap();
         state.closing = true;
-
-        // Don't call connection_lost immediately: let the I/O loop handle it
-        // Allows for any pending data to be received
+        drop(state);
+        // Wake io_processing_loop: it may be parked in write_notify.notified().await.
+        // After notified() returns, the outer loop re-checks is_closing and breaks.
+        self.write_notify.notify_one();
     }
 
     fn abort(&self, py: Python) {
@@ -508,6 +514,8 @@ impl TokioTCPTransport {
             let mut state = self.state.lock().unwrap();
             state.closing = true;
             state.write_buf.clear();
+            drop(state);
+            self.write_notify.notify_one();
         }
     }
 

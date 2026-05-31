@@ -60,7 +60,7 @@ impl Ord for TokioTimer {
     }
 }
 
-enum ScheduledTask {
+pub(crate) enum ScheduledTask {
     Immediate { handle: TBoxedHandle },
     Delayed { timer: TokioTimer },
 }
@@ -104,7 +104,7 @@ impl LoopHandlers {
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub struct TEventLoop {
     runtime: OnceLock<Arc<Runtime>>,
-    scheduler_tx: async_channel::Sender<ScheduledTask>,
+    pub(crate) scheduler_tx: async_channel::Sender<ScheduledTask>,
     scheduler_rx: async_channel::Receiver<ScheduledTask>,
     counter_ready: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
@@ -481,6 +481,25 @@ impl TEventLoop {
                     }
 
                     if stopping_clone.load(atomic::Ordering::Acquire) {
+                        // Yield once so io_processing_loop tasks can schedule their
+                        // teardown callbacks (e.g. connection_lost) before we exit.
+                        tokio::task::yield_now().await;
+                        // Drain any callbacks that arrived during teardown.
+                        while let Ok(ScheduledTask::Immediate { handle }) = scheduler_rx.try_recv() {
+                            current_handles.push_back(handle);
+                        }
+                        if !current_handles.is_empty() {
+                            let handlers = loop_handlers.clone();
+                            let state = TEventLoopRunState {};
+                            attach_blocking(|py| {
+                                while let Some(handle) = current_handles.pop_front() {
+                                    if !handle.cancelled() {
+                                        let _ = handle.run(py, &handlers, &state);
+                                    }
+                                    drop(handle);
+                                }
+                            });
+                        }
                         break;
                     }
                 }
