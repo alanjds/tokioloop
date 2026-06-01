@@ -1165,25 +1165,28 @@ impl TEventLoop {
     ) -> PyResult<()> {
         let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
 
-        // Fast path: use FIONREAD to check available bytes without allocating a
-        // full nbytes buffer.  Avoids a large wasted allocation on every EAGAIN.
-        let mut avail: libc::c_int = 0;
-        if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail as *mut libc::c_int) } == 0
-            && avail > 0
-        {
-            let read_size = (avail as usize).min(nbytes);
-            let mut buf = vec![0u8; read_size];
-            let n = unsafe {
-                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, libc::MSG_DONTWAIT)
-            };
-            if n >= 0 {
-                buf.truncate(n as usize);
-                let data = pyo3::types::PyBytes::new(py, &buf);
-                fut.call_method1(py, "set_result", (data,))?;
-                return Ok(());
-            }
-            // EAGAIN or error — fall through to worker
+        // Fast path: attempt recv immediately while we hold the GIL.
+        // Data is often already in the kernel buffer (pipelined requests, loopback),
+        // so this avoids the worker channel round-trip entirely.
+        let mut buf = vec![0u8; nbytes];
+        let n = unsafe {
+            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
+        };
+        if n > 0 {
+            buf.truncate(n as usize);
+            let data = pyo3::types::PyBytes::new(py, &buf);
+            fut.call_method1(py, "set_result", (data,))?;
+            return Ok(());
+        } else if n == 0 {
+            fut.call_method1(py, "set_result", (pyo3::types::PyBytes::new(py, b""),))?;
+            return Ok(());
         }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::WouldBlock {
+            fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),))?;
+            return Ok(());
+        }
+        // EAGAIN: data not yet available — hand off to the persistent worker.
 
         // Forward request to the persistent worker for this fd.
         // The worker owns the AsyncFd (epoll registration stays alive between calls).
@@ -1357,70 +1360,33 @@ async fn sock_reader_task(
     while let Ok(msg) = rx.recv().await {
         let SockRecvMsg::Recv { nbytes, fut } = msg;
 
-        // Strategy: allocate the receive buffer only AFTER we know data is available,
-        // sized exactly to min(FIONREAD, nbytes).  This avoids allocating a large
-        // buffer (e.g. 100KB) when the kernel hasn't delivered data yet, or when TCP
-        // fragments a large message into smaller segments.
-        let result: Result<Vec<u8>, std::io::Error> = 'recv: {
-            // Fast path: check whether data is already buffered (no wait needed).
-            let mut avail: libc::c_int = 0;
-            if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) } == 0 && avail > 0 {
-                let alloc_n = (avail as usize).min(nbytes);
-                let mut buf = vec![0u8; alloc_n];
-                let n = unsafe {
-                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, alloc_n, libc::MSG_DONTWAIT)
-                };
-                if n >= 0 {
-                    buf.truncate(n as usize);
-                    break 'recv Ok(buf);
-                }
-                let e = std::io::Error::last_os_error();
-                if e.kind() != std::io::ErrorKind::WouldBlock {
-                    break 'recv Err(e);
-                }
-                // Spurious FIONREAD: fall through to wait path.
+        // Allocate once and attempt recv immediately — data may have arrived while
+        // the message was in the channel (avoids a redundant readable().await wait).
+        let mut buf = vec![0u8; nbytes];
+        let outcome: Result<Vec<u8>, std::io::Error> = loop {
+            let n = unsafe {
+                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
+            };
+            if n >= 0 {
+                buf.truncate(n as usize);
+                break Ok(buf);
             }
-
-            // Slow path: wait for readability, then FIONREAD + allocate + recv.
-            // No buffer is allocated while waiting — prevents large idle allocations.
-            loop {
-                match async_fd.readable().await {
-                    Err(e) => break 'recv Err(e),
-                    Ok(mut guard) => {
-                        guard.clear_ready();
-                        drop(guard);
-                    }
-                }
-                // Data should be available now; size the buffer precisely.
-                let mut avail: libc::c_int = 0;
-                let alloc_n = if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) } == 0
-                    && avail > 0
-                {
-                    (avail as usize).min(nbytes)
-                } else {
-                    nbytes // FIONREAD unavailable: fallback to requested size
-                };
-                let mut buf = vec![0u8; alloc_n];
-                let n = unsafe {
-                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, alloc_n, libc::MSG_DONTWAIT)
-                };
-                if n >= 0 {
-                    buf.truncate(n as usize);
-                    break 'recv Ok(buf);
-                }
-                let e = std::io::Error::last_os_error();
-                if e.kind() != std::io::ErrorKind::WouldBlock {
-                    break 'recv Err(e);
-                }
-                // Spurious wakeup: loop back to readable().await.
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                break Err(e);
             }
+            // EAGAIN: wait for the kernel to signal readability, then retry.
+            match async_fd.readable().await {
+                Err(e) => break Err(e),
+                Ok(mut guard) => { guard.clear_ready(); }
+            }
+            // Loop back and retry recv.
         };
 
-        // Check exit condition before moving result into the RustCallHandle closure.
-        let should_exit = matches!(result, Ok(ref b) if b.is_empty()) || result.is_err();
+        let fatal = outcome.is_err();
         let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
             handle: Box::new(RustCallHandle::new(move |py| {
-                match result {
+                match outcome {
                     Ok(buf) => {
                         let data = pyo3::types::PyBytes::new(py, &buf);
                         let _ = fut.call_method1(py, "set_result", (data,));
@@ -1432,9 +1398,9 @@ async fn sock_reader_task(
             })),
         });
 
-        // Exit on EOF or fatal error so stale epoll entries don't pile up.
-        // The next sock_recv call will spawn a fresh worker.
-        if should_exit { break; }
+        if fatal {
+            break;
+        }
     }
 
     sock_readers.pin().remove(&(fd as usize));
