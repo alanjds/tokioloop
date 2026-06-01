@@ -1357,40 +1357,62 @@ async fn sock_reader_task(
     while let Ok(msg) = rx.recv().await {
         let SockRecvMsg::Recv { nbytes, fut } = msg;
 
-        // Defer buffer allocation until we know how many bytes are available.
-        // This avoids allocating a large buffer (e.g. 100KB) when TCP delivers
-        // data in smaller segments (e.g. 65536 bytes), which would waste memory.
-        let result: Result<Vec<u8>, std::io::Error> = loop {
-            // Use FIONREAD to size the allocation exactly before each recv attempt.
+        // Strategy: allocate the receive buffer only AFTER we know data is available,
+        // sized exactly to min(FIONREAD, nbytes).  This avoids allocating a large
+        // buffer (e.g. 100KB) when the kernel hasn't delivered data yet, or when TCP
+        // fragments a large message into smaller segments.
+        let result: Result<Vec<u8>, std::io::Error> = 'recv: {
+            // Fast path: check whether data is already buffered (no wait needed).
             let mut avail: libc::c_int = 0;
-            let alloc_n = if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) } == 0
-                && avail > 0
-            {
-                (avail as usize).min(nbytes)
-            } else {
-                nbytes // FIONREAD unavailable or no data yet — use requested size
-            };
-
-            let mut buf = vec![0u8; alloc_n];
-            let n = unsafe {
-                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, alloc_n, libc::MSG_DONTWAIT)
-            };
-            if n >= 0 {
-                buf.truncate(n as usize);
-                break Ok(buf);
-            }
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::WouldBlock {
-                break Err(e);
-            }
-            // Wait for the kernel to signal data availability.
-            match async_fd.readable().await {
-                Ok(mut guard) => {
-                    guard.clear_ready();
-                    drop(guard);
-                    // Loop back to retry with a fresh FIONREAD.
+            if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) } == 0 && avail > 0 {
+                let alloc_n = (avail as usize).min(nbytes);
+                let mut buf = vec![0u8; alloc_n];
+                let n = unsafe {
+                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, alloc_n, libc::MSG_DONTWAIT)
+                };
+                if n >= 0 {
+                    buf.truncate(n as usize);
+                    break 'recv Ok(buf);
                 }
-                Err(e) => break Err(e),
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    break 'recv Err(e);
+                }
+                // Spurious FIONREAD: fall through to wait path.
+            }
+
+            // Slow path: wait for readability, then FIONREAD + allocate + recv.
+            // No buffer is allocated while waiting — prevents large idle allocations.
+            loop {
+                match async_fd.readable().await {
+                    Err(e) => break 'recv Err(e),
+                    Ok(mut guard) => {
+                        guard.clear_ready();
+                        drop(guard);
+                    }
+                }
+                // Data should be available now; size the buffer precisely.
+                let mut avail: libc::c_int = 0;
+                let alloc_n = if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) } == 0
+                    && avail > 0
+                {
+                    (avail as usize).min(nbytes)
+                } else {
+                    nbytes // FIONREAD unavailable: fallback to requested size
+                };
+                let mut buf = vec![0u8; alloc_n];
+                let n = unsafe {
+                    libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, alloc_n, libc::MSG_DONTWAIT)
+                };
+                if n >= 0 {
+                    buf.truncate(n as usize);
+                    break 'recv Ok(buf);
+                }
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    break 'recv Err(e);
+                }
+                // Spurious wakeup: loop back to readable().await.
             }
         };
 
