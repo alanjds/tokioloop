@@ -12,7 +12,7 @@ use tokio::{runtime::Runtime, task::JoinHandle, net::UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle, PermitHandle},
+    tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle, PermitHandle, RustCallHandle},
     py::{copy_context, attach_blocking},
     log::{LogExc, log_exc_to_py_ctx},
     server::TokioServer,
@@ -24,6 +24,16 @@ use pyo3::IntoPyObjectExt;
 // by remove_reader/remove_writer, while the watcher task only captures the Arc.
 // This prevents Py<T> from being dropped on a tokio worker thread without the GIL.
 type PyCallbackEntry = Arc<Mutex<Option<(Py<PyAny>, Py<PyAny>, Py<PyAny>)>>>;
+
+// Messages sent to persistent per-fd native sock workers.
+// The worker resolves the asyncio Future via the scheduler when I/O completes.
+enum SockRecvMsg {
+    Recv { nbytes: usize, fut: Py<PyAny> },
+}
+
+enum SockSendMsg {
+    SendAll { data: Vec<u8>, fut: Py<PyAny> },
+}
 
 // Timer with absolute timestamp (like RLoop)
 pub struct TokioTimer {
@@ -122,6 +132,10 @@ pub struct TEventLoop {
     // I/O watcher tasks, keyed by fd
     io_reader_entries: Arc<papaya::HashMap<usize, (CancellationToken, PyCallbackEntry)>>,
     io_writer_entries: Arc<papaya::HashMap<usize, (CancellationToken, PyCallbackEntry)>>,
+    // Persistent native sock workers: one long-lived task per fd, reused across calls.
+    // Eliminates per-request task-spawn and epoll_ctl overhead vs the v1 approach.
+    sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
+    sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
 }
 
 impl TEventLoop {
@@ -260,6 +274,46 @@ impl TEventLoop {
             .clone();
         runtime
     }
+
+    /// Return the Sender for the persistent reader worker for `fd`, spawning one if needed.
+    fn get_or_spawn_reader(&self, fd: i32) -> PyResult<async_channel::Sender<SockRecvMsg>> {
+        let pin = self.sock_readers.pin();
+        if let Some(tx) = pin.get(&(fd as usize)) {
+            return Ok(tx.clone());
+        }
+        drop(pin);
+        let fd_dup = unsafe { libc::dup(fd) };
+        if fd_dup < 0 {
+            return Err(PyErr::from(std::io::Error::last_os_error()));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+        let (tx, rx) = async_channel::bounded::<SockRecvMsg>(2);
+        let scheduler_tx = self.scheduler_tx.clone();
+        let sock_readers = Arc::clone(&self.sock_readers);
+        self.get_runtime().spawn(sock_reader_task(fd, owned, rx, scheduler_tx, sock_readers));
+        self.sock_readers.pin().insert(fd as usize, tx.clone());
+        Ok(tx)
+    }
+
+    /// Return the Sender for the persistent writer worker for `fd`, spawning one if needed.
+    fn get_or_spawn_writer(&self, fd: i32) -> PyResult<async_channel::Sender<SockSendMsg>> {
+        let pin = self.sock_writers.pin();
+        if let Some(tx) = pin.get(&(fd as usize)) {
+            return Ok(tx.clone());
+        }
+        drop(pin);
+        let fd_dup = unsafe { libc::dup(fd) };
+        if fd_dup < 0 {
+            return Err(PyErr::from(std::io::Error::last_os_error()));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+        let (tx, rx) = async_channel::bounded::<SockSendMsg>(2);
+        let scheduler_tx = self.scheduler_tx.clone();
+        let sock_writers = Arc::clone(&self.sock_writers);
+        self.get_runtime().spawn(sock_writer_task(fd, owned, rx, scheduler_tx, sock_writers));
+        self.sock_writers.pin().insert(fd as usize, tx.clone());
+        Ok(tx)
+    }
 }
 
 #[pymethods]
@@ -286,6 +340,8 @@ impl TEventLoop {
             sig_handlers: Arc::new(papaya::HashMap::new()),
             io_reader_entries: Arc::new(papaya::HashMap::new()),
             io_writer_entries: Arc::new(papaya::HashMap::new()),
+            sock_readers: Arc::new(papaya::HashMap::new()),
+            sock_writers: Arc::new(papaya::HashMap::new()),
         })
     }
 
@@ -1094,6 +1150,169 @@ impl TEventLoop {
         Ok(())
     }
 
+    // ── Native sock_* ops ──────────────────────────────────────────────────────
+    // These bypass the Python add_reader/remove_reader machinery entirely.
+    // Each uses a fast path (MSG_DONTWAIT with GIL) and, on EAGAIN, a persistent
+    // per-fd worker task that holds a live AsyncFd (epoll stays registered between
+    // calls — no dup/epoll_ctl/spawn overhead per request).
+
+    fn _sock_recv_native(
+        &self,
+        py: Python,
+        sock: Py<PyAny>,
+        nbytes: usize,
+        fut: Py<PyAny>,
+    ) -> PyResult<()> {
+        let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
+
+        // Fast path: data is already in the kernel buffer (e.g. pipelined or
+        // concurrent workloads).  Resolve the future without any thread hop.
+        let mut buf = vec![0u8; nbytes];
+        let n = unsafe {
+            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
+        };
+        if n >= 0 {
+            let data = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+            fut.call_method1(py, "set_result", (data,))?;
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(PyErr::from(e));
+        }
+
+        // Slow path: forward request to the persistent worker for this fd.
+        // The worker owns the AsyncFd (epoll registration stays alive between calls).
+        let tx = self.get_or_spawn_reader(fd)?;
+        let msg = SockRecvMsg::Recv { nbytes, fut };
+        let msg = match tx.try_send(msg) {
+            Ok(()) => return Ok(()),
+            // Worker channel full or closed — remove stale entry and retry with a new worker.
+            Err(async_channel::TrySendError::Full(m)) | Err(async_channel::TrySendError::Closed(m)) => {
+                self.sock_readers.pin().remove(&(fd as usize));
+                m
+            }
+        };
+        let tx2 = self.get_or_spawn_reader(fd)?;
+        let _ = tx2.try_send(msg);
+        Ok(())
+    }
+
+    fn _sock_sendall_native(
+        &self,
+        py: Python,
+        sock: Py<PyAny>,
+        data: Py<PyAny>,
+        fut: Py<PyAny>,
+    ) -> PyResult<()> {
+        let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
+        let bytes: &[u8] = data.bind(py).extract()?;
+        if bytes.is_empty() {
+            fut.call_method1(py, "set_result", (py.None(),))?;
+            return Ok(());
+        }
+
+        // Fast path: send as much as possible without blocking.
+        let n = unsafe {
+            libc::send(
+                fd,
+                bytes.as_ptr() as *const libc::c_void,
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(PyErr::from(e));
+            }
+            // Nothing sent — forward entire buffer to writer worker.
+            let tx = self.get_or_spawn_writer(fd)?;
+            let _ = tx.try_send(SockSendMsg::SendAll { data: bytes.to_vec(), fut });
+            return Ok(());
+        }
+        let sent = n as usize;
+        if sent == bytes.len() {
+            fut.call_method1(py, "set_result", (py.None(),))?;
+            return Ok(());
+        }
+        // Partial send — pass remaining bytes to writer worker.
+        let tx = self.get_or_spawn_writer(fd)?;
+        let _ = tx.try_send(SockSendMsg::SendAll { data: bytes[sent..].to_vec(), fut });
+        Ok(())
+    }
+
+    fn _sock_accept_native(
+        &self,
+        py: Python,
+        sock: Py<PyAny>,
+        fut: Py<PyAny>,
+    ) -> PyResult<()> {
+        let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
+
+        // Fast path: try accept() immediately.
+        match sock.call_method0(py, "accept") {
+            Ok(res) => {
+                if let Ok(conn) = res.bind(py).get_item(0) {
+                    let _ = conn.call_method1("setblocking", (false,));
+                }
+                fut.call_method1(py, "set_result", (res,))?;
+                return Ok(());
+            }
+            Err(ref e) if e.is_instance_of::<pyo3::exceptions::PyBlockingIOError>(py) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Slow path: one-shot dup+AsyncFd (accept is called rarely — once per
+        // connection — so the persistent-worker overhead is not worth it here).
+        let scheduler_tx = self.scheduler_tx.clone();
+        let runtime = self.get_runtime();
+        runtime.spawn(async move {
+            let accept_result: Result<Py<PyAny>, std::io::Error> = 'outer: {
+                let fd_dup = unsafe { libc::dup(fd) };
+                if fd_dup < 0 { break 'outer Err(std::io::Error::last_os_error()); }
+                let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+                match tokio::io::unix::AsyncFd::new(owned) {
+                    Err(e) => break 'outer Err(e),
+                    Ok(async_fd) => match async_fd.readable().await {
+                        Err(e) => break 'outer Err(e),
+                        Ok(mut guard) => {
+                            guard.clear_ready();
+                            drop(guard);
+                            drop(async_fd);
+                            let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                                handle: Box::new(RustCallHandle::new(move |py| {
+                                    let result: PyResult<Py<PyAny>> = (|| {
+                                        let res = sock.call_method0(py, "accept")?;
+                                        if let Ok(conn) = res.bind(py).get_item(0) {
+                                            let _ = conn.call_method1("setblocking", (false,));
+                                        }
+                                        Ok(res)
+                                    })();
+                                    drop(sock);
+                                    match result {
+                                        Ok(res) => { let _ = fut.call_method1(py, "set_result", (res,)); }
+                                        Err(e) => { let _ = fut.call_method1(py, "set_exception", (e.into_value(py),)); }
+                                    }
+                                })),
+                            });
+                            return;
+                        }
+                    },
+                }
+            };
+            // Error before scheduling (dup or AsyncFd::new failed)
+            let e = match accept_result { Err(e) => e, Ok(_) => return };
+            let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                handle: Box::new(RustCallHandle::new(move |py| {
+                    drop(sock);
+                    let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                })),
+            });
+        });
+        Ok(())
+    }
+
     fn _signals_clear(&self) {
         // TODO: Implement tokio-based signal clearing
         // For now, just log to call to make interface work
@@ -1110,4 +1329,139 @@ impl TEventLoop {
 pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
     module.add_class::<TEventLoop>()?;
     Ok(())
+}
+
+/// Persistent per-fd recv worker.  One task lives for the lifetime of a connection.
+/// It holds an `AsyncFd` (epoll stays registered between calls — no per-request
+/// epoll_ctl or dup overhead).  Requests arrive via an async_channel; results are
+/// sent back to the event loop via the scheduler channel as `RustCallHandle`s.
+async fn sock_reader_task(
+    fd: i32,
+    owned: OwnedFd,
+    rx: async_channel::Receiver<SockRecvMsg>,
+    scheduler_tx: async_channel::Sender<ScheduledTask>,
+    sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
+) {
+    let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
+        Ok(a) => a,
+        Err(_) => {
+            sock_readers.pin().remove(&(fd as usize));
+            return;
+        }
+    };
+
+    while let Ok(msg) = rx.recv().await {
+        let SockRecvMsg::Recv { nbytes, fut } = msg;
+        let mut buf = vec![0u8; nbytes];
+
+        let result: Result<isize, std::io::Error> = loop {
+            // Attempt recv before waiting; data may already be present.
+            let n = unsafe {
+                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
+            };
+            if n >= 0 {
+                break Ok(n);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                break Err(e);
+            }
+            // Wait for the kernel to signal data availability.
+            match async_fd.readable().await {
+                Ok(mut guard) => {
+                    guard.clear_ready();
+                    drop(guard);
+                    // Loop back to retry recv.
+                }
+                Err(e) => break Err(e),
+            }
+        };
+
+        // Check exit condition before moving result into the RustCallHandle closure.
+        let should_exit = matches!(result, Ok(0) | Err(_));
+        let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+            handle: Box::new(RustCallHandle::new(move |py| {
+                match result {
+                    Ok(n) => {
+                        let data = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+                        let _ = fut.call_method1(py, "set_result", (data,));
+                    }
+                    Err(e) => {
+                        let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                    }
+                }
+            })),
+        });
+
+        // Exit on EOF or fatal error so stale epoll entries don't pile up.
+        // The next sock_recv call will spawn a fresh worker.
+        if should_exit { break; }
+    }
+
+    sock_readers.pin().remove(&(fd as usize));
+}
+
+/// Persistent per-fd send worker.  Drives a write loop with `writable().await` +
+/// `send(MSG_DONTWAIT | MSG_NOSIGNAL)` until all bytes are flushed.
+async fn sock_writer_task(
+    fd: i32,
+    owned: OwnedFd,
+    rx: async_channel::Receiver<SockSendMsg>,
+    scheduler_tx: async_channel::Sender<ScheduledTask>,
+    sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
+) {
+    let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
+        Ok(a) => a,
+        Err(_) => {
+            sock_writers.pin().remove(&(fd as usize));
+            return;
+        }
+    };
+
+    while let Ok(msg) = rx.recv().await {
+        let SockSendMsg::SendAll { data, fut } = msg;
+        let mut offset = 0usize;
+
+        let result: Result<(), std::io::Error> = loop {
+            // Attempt send; often succeeds immediately (kernel send buffer has space).
+            let n = unsafe {
+                libc::send(
+                    fd,
+                    data[offset..].as_ptr() as *const libc::c_void,
+                    data.len() - offset,
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if n >= 0 {
+                offset += n as usize;
+                if offset >= data.len() { break Ok(()); }
+                continue; // more bytes to send; try again before waiting
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                break Err(e);
+            }
+            match async_fd.writable().await {
+                Ok(mut guard) => {
+                    guard.clear_ready();
+                    drop(guard);
+                }
+                Err(e) => break Err(e),
+            }
+        };
+
+        let is_err = result.is_err();
+        let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+            handle: Box::new(RustCallHandle::new(move |py| {
+                match result {
+                    Ok(()) => { let _ = fut.call_method1(py, "set_result", (py.None(),)); }
+                    Err(e) => { let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),)); }
+                }
+            })),
+        });
+
+        if is_err { break; }
+    }
+
+    sock_writers.pin().remove(&(fd as usize));
 }
