@@ -12,7 +12,7 @@ use tokio::{runtime::Runtime, task::JoinHandle, net::UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle, PermitHandle},
+    tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle, PermitHandle, RustCallHandle},
     py::{copy_context, attach_blocking},
     log::{LogExc, log_exc_to_py_ctx},
     server::TokioServer,
@@ -836,6 +836,217 @@ impl TEventLoop {
         }
     }
 
+    // --- Native sock_* implementations ---
+    // These replace the Python _BaseRustLoop.sock_recv/sock_sendall/sock_accept methods
+    // and skip the add_reader/add_writer machinery entirely.  The Python side (TokioLoop)
+    // creates the asyncio.Future and passes it here; Rust resolves it via the scheduler.
+
+    fn _sock_recv_native(
+        &self,
+        py: Python,
+        sock: Py<PyAny>,
+        nbytes: usize,
+        fut: Py<PyAny>,
+    ) -> PyResult<()> {
+        let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
+
+        // Fast path: try non-blocking recv immediately.  On loopback the kernel buffer
+        // already holds the peer's data at the time we're called, so this almost always
+        // succeeds and skips the entire async machinery.
+        let mut buf = vec![0u8; nbytes];
+        let n = unsafe {
+            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
+        };
+        if n >= 0 {
+            let data = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+            fut.call_method1(py, "set_result", (data,))?;
+            return Ok(());
+        }
+        let imm_err = std::io::Error::last_os_error();
+        if imm_err.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(PyErr::from(imm_err));
+        }
+
+        // Slow path: wait for readability via AsyncFd, then recv.
+        // `buf` is moved into the async task (single allocation — reused for the actual recv).
+        let scheduler_tx = self.scheduler_tx.clone();
+        let runtime = self.get_runtime();
+        runtime.spawn(async move {
+            let recv_result: Result<isize, std::io::Error> = 'outer: {
+                let fd_dup = unsafe { libc::dup(fd) };
+                if fd_dup < 0 {
+                    break 'outer Err(std::io::Error::last_os_error());
+                }
+                let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+                match tokio::io::unix::AsyncFd::new(owned) {
+                    Err(e) => break 'outer Err(e),
+                    Ok(async_fd) => match async_fd.readable().await {
+                        Err(e) => break 'outer Err(e),
+                        Ok(mut guard) => {
+                            guard.clear_ready();
+                            drop(guard);
+                            drop(async_fd);
+                            // Reuse the buf already allocated above — no second allocation.
+                            let n = unsafe {
+                                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
+                            };
+                            if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n) }
+                        }
+                    },
+                }
+            };
+            let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                handle: Box::new(RustCallHandle::new(move |py| {
+                    match recv_result {
+                        Ok(n) => {
+                            let data = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+                            let _ = fut.call_method1(py, "set_result", (data,));
+                        }
+                        Err(e) => {
+                            let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                        }
+                    }
+                })),
+            });
+        });
+        Ok(())
+    }
+
+    fn _sock_sendall_native(
+        &self,
+        py: Python,
+        sock: Py<PyAny>,
+        data: Py<PyAny>,
+        fut: Py<PyAny>,
+    ) -> PyResult<()> {
+        let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
+        let bytes: &[u8] = data.bind(py).extract()?;
+
+        if bytes.is_empty() {
+            fut.call_method1(py, "set_result", (py.None(),))?;
+            return Ok(());
+        }
+
+        // Fast path: immediate non-blocking send.
+        let n = unsafe {
+            libc::send(
+                fd,
+                bytes.as_ptr() as *const libc::c_void,
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(PyErr::from(e));
+            }
+            let bytes_vec = bytes.to_vec();
+            let scheduler_tx = self.scheduler_tx.clone();
+            let runtime = self.get_runtime();
+            runtime.spawn(async move {
+                sock_sendall_loop(fd, bytes_vec, fut, scheduler_tx).await;
+            });
+            return Ok(());
+        }
+        let sent = n as usize;
+        if sent == bytes.len() {
+            fut.call_method1(py, "set_result", (py.None(),))?;
+            return Ok(());
+        }
+        // Partial send: async for remainder.
+        let bytes_vec = bytes[sent..].to_vec();
+        let scheduler_tx = self.scheduler_tx.clone();
+        let runtime = self.get_runtime();
+        runtime.spawn(async move {
+            sock_sendall_loop(fd, bytes_vec, fut, scheduler_tx).await;
+        });
+        Ok(())
+    }
+
+    fn _sock_accept_native(
+        &self,
+        py: Python,
+        sock: Py<PyAny>,
+        fut: Py<PyAny>,
+    ) -> PyResult<()> {
+        let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
+
+        // Fast path: try immediate accept (connection already queued).
+        match sock.call_method0(py, "accept") {
+            Ok(res) => {
+                if let Ok(conn) = res.bind(py).get_item(0) {
+                    let _ = conn.call_method1("setblocking", (false,));
+                }
+                fut.call_method1(py, "set_result", (res,))?;
+                return Ok(());
+            }
+            Err(ref e) if e.is_instance_of::<pyo3::exceptions::PyBlockingIOError>(py) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Slow path: wait for a connection to arrive via AsyncFd.
+        let scheduler_tx = self.scheduler_tx.clone();
+        let runtime = self.get_runtime();
+        runtime.spawn(async move {
+            let fd_dup = unsafe { libc::dup(fd) };
+            if fd_dup < 0 {
+                let e = std::io::Error::last_os_error();
+                let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                    handle: Box::new(RustCallHandle::new(move |py| {
+                        drop(sock);
+                        let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                    })),
+                });
+                return;
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+            let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                        handle: Box::new(RustCallHandle::new(move |py| {
+                            drop(sock);
+                            let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                        })),
+                    });
+                    return;
+                }
+            };
+            match async_fd.readable().await {
+                Ok(mut guard) => {
+                    guard.clear_ready();
+                    drop(guard);
+                    drop(async_fd);
+                    let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                        handle: Box::new(RustCallHandle::new(move |py| {
+                            let result: PyResult<Py<PyAny>> = (|| {
+                                let res = sock.call_method0(py, "accept")?;
+                                res.bind(py).get_item(0)?
+                                    .call_method1("setblocking", (false,))?;
+                                Ok(res)
+                            })();
+                            drop(sock);
+                            match result {
+                                Ok(res) => { let _ = fut.call_method1(py, "set_result", (res,)); }
+                                Err(e) => { let _ = fut.call_method1(py, "set_exception", (e.into_value(py),)); }
+                            }
+                        })),
+                    });
+                }
+                Err(e) => {
+                    let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                        handle: Box::new(RustCallHandle::new(move |py| {
+                            drop(sock);
+                            let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                        })),
+                    });
+                }
+            }
+        });
+        Ok(())
+    }
+
     fn _tcp_conn(
         pyself: Py<Self>,
         py: Python,
@@ -1110,4 +1321,81 @@ impl TEventLoop {
 pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
     module.add_class::<TEventLoop>()?;
     Ok(())
+}
+
+/// Write all of `bytes` to `fd`, using AsyncFd to park between partial sends.
+/// Resolves `fut` via `scheduler_tx` when done or on error.
+async fn sock_sendall_loop(
+    fd: i32,
+    bytes: Vec<u8>,
+    fut: Py<PyAny>,
+    scheduler_tx: async_channel::Sender<ScheduledTask>,
+) {
+    let fd_dup = unsafe { libc::dup(fd) };
+    if fd_dup < 0 {
+        let e = std::io::Error::last_os_error();
+        let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+            handle: Box::new(RustCallHandle::new(move |py| {
+                let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+            })),
+        });
+        return;
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+    let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                handle: Box::new(RustCallHandle::new(move |py| {
+                    let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                })),
+            });
+            return;
+        }
+    };
+    let mut offset = 0usize;
+    let result: Result<(), std::io::Error> = loop {
+        match async_fd.writable().await {
+            Ok(mut guard) => {
+                guard.clear_ready();
+                let n = unsafe {
+                    libc::send(
+                        fd,
+                        bytes[offset..].as_ptr() as *const libc::c_void,
+                        bytes.len() - offset,
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if n < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        continue;
+                    }
+                    break Err(e);
+                }
+                offset += n as usize;
+                if offset >= bytes.len() {
+                    break Ok(());
+                }
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    // async_fd (and fd_dup) are dropped here
+    match result {
+        Ok(()) => {
+            let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                handle: Box::new(RustCallHandle::new(move |py| {
+                    let _ = fut.call_method1(py, "set_result", (py.None(),));
+                })),
+            });
+        }
+        Err(e) => {
+            let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                handle: Box::new(RustCallHandle::new(move |py| {
+                    let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                })),
+            });
+        }
+    }
 }

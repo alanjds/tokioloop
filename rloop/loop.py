@@ -1434,6 +1434,27 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
     def __repr__(self) -> str:
         return f'{type(self).__name__}(id={id(self)} hex={hex(id(self))})'
 
+    #: native sock_* overrides (bypass add_reader/add_writer machinery)
+    def sock_recv(self, sock, nbytes) -> _Future:
+        self._ensure_fd_no_transport(sock.fileno())
+        fut = self.create_future()
+        self._sock_recv_native(sock, nbytes, fut)
+        return fut
+
+    async def sock_sendall(self, sock, data):
+        if not data:
+            return
+        self._ensure_fd_no_transport(sock.fileno())
+        fut = self.create_future()
+        self._sock_sendall_native(sock, data, fut)
+        return await fut
+
+    def sock_accept(self, sock) -> _Future:
+        self._ensure_fd_no_transport(sock.fileno())
+        fut = self.create_future()
+        self._sock_accept_native(sock, fut)
+        return fut
+
     #: special methods
     def _run_forever_pre(self):
         result = super()._run_forever_pre()
