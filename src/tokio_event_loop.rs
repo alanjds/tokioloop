@@ -1356,15 +1356,28 @@ async fn sock_reader_task(
 
     while let Ok(msg) = rx.recv().await {
         let SockRecvMsg::Recv { nbytes, fut } = msg;
-        let mut buf = vec![0u8; nbytes];
 
-        let result: Result<isize, std::io::Error> = loop {
-            // Attempt recv before waiting; data may already be present.
+        // Defer buffer allocation until we know how many bytes are available.
+        // This avoids allocating a large buffer (e.g. 100KB) when TCP delivers
+        // data in smaller segments (e.g. 65536 bytes), which would waste memory.
+        let result: Result<Vec<u8>, std::io::Error> = loop {
+            // Use FIONREAD to size the allocation exactly before each recv attempt.
+            let mut avail: libc::c_int = 0;
+            let alloc_n = if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) } == 0
+                && avail > 0
+            {
+                (avail as usize).min(nbytes)
+            } else {
+                nbytes // FIONREAD unavailable or no data yet — use requested size
+            };
+
+            let mut buf = vec![0u8; alloc_n];
             let n = unsafe {
-                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
+                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, alloc_n, libc::MSG_DONTWAIT)
             };
             if n >= 0 {
-                break Ok(n);
+                buf.truncate(n as usize);
+                break Ok(buf);
             }
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::WouldBlock {
@@ -1375,19 +1388,19 @@ async fn sock_reader_task(
                 Ok(mut guard) => {
                     guard.clear_ready();
                     drop(guard);
-                    // Loop back to retry recv.
+                    // Loop back to retry with a fresh FIONREAD.
                 }
                 Err(e) => break Err(e),
             }
         };
 
         // Check exit condition before moving result into the RustCallHandle closure.
-        let should_exit = matches!(result, Ok(0) | Err(_));
+        let should_exit = matches!(result, Ok(ref b) if b.is_empty()) || result.is_err();
         let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
             handle: Box::new(RustCallHandle::new(move |py| {
                 match result {
-                    Ok(n) => {
-                        let data = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+                    Ok(buf) => {
+                        let data = pyo3::types::PyBytes::new(py, &buf);
                         let _ = fut.call_method1(py, "set_result", (data,));
                     }
                     Err(e) => {
