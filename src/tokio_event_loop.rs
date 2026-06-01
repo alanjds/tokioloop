@@ -1165,23 +1165,27 @@ impl TEventLoop {
     ) -> PyResult<()> {
         let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
 
-        // Fast path: data is already in the kernel buffer (e.g. pipelined or
-        // concurrent workloads).  Resolve the future without any thread hop.
-        let mut buf = vec![0u8; nbytes];
-        let n = unsafe {
-            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
-        };
-        if n >= 0 {
-            let data = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
-            fut.call_method1(py, "set_result", (data,))?;
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::WouldBlock {
-            return Err(PyErr::from(e));
+        // Fast path: use FIONREAD to check available bytes without allocating a
+        // full nbytes buffer.  Avoids a large wasted allocation on every EAGAIN.
+        let mut avail: libc::c_int = 0;
+        if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail as *mut libc::c_int) } == 0
+            && avail > 0
+        {
+            let read_size = (avail as usize).min(nbytes);
+            let mut buf = vec![0u8; read_size];
+            let n = unsafe {
+                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, libc::MSG_DONTWAIT)
+            };
+            if n >= 0 {
+                buf.truncate(n as usize);
+                let data = pyo3::types::PyBytes::new(py, &buf);
+                fut.call_method1(py, "set_result", (data,))?;
+                return Ok(());
+            }
+            // EAGAIN or error — fall through to worker
         }
 
-        // Slow path: forward request to the persistent worker for this fd.
+        // Forward request to the persistent worker for this fd.
         // The worker owns the AsyncFd (epoll registration stays alive between calls).
         let tx = self.get_or_spawn_reader(fd)?;
         let msg = SockRecvMsg::Recv { nbytes, fut };
