@@ -1166,18 +1166,24 @@ impl TEventLoop {
         let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
 
         // Fast path: attempt recv immediately while we hold the GIL.
-        // Data is often already in the kernel buffer (pipelined requests, loopback),
-        // so this avoids the worker channel round-trip entirely.
-        let mut buf = vec![0u8; nbytes];
-        let n = unsafe {
-            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
+        // Stack-allocate for small messages (≤ 4 KB) to avoid heap overhead.
+        const STACK_CAP: usize = 4096;
+        let (n, fast_data) = if nbytes <= STACK_CAP {
+            let mut buf = [0u8; STACK_CAP];
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT) };
+            let data = if n > 0 { Some(pyo3::types::PyBytes::new(py, &buf[..n as usize])) } else { None };
+            (n, data)
+        } else {
+            let mut buf = vec![0u8; nbytes];
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT) };
+            let data = if n > 0 { Some(pyo3::types::PyBytes::new(py, &buf[..n as usize])) } else { None };
+            (n, data)
         };
-        if n > 0 {
-            buf.truncate(n as usize);
-            let data = pyo3::types::PyBytes::new(py, &buf);
+        if let Some(data) = fast_data {
             fut.call_method1(py, "set_result", (data,))?;
             return Ok(());
-        } else if n == 0 {
+        }
+        if n == 0 {
             fut.call_method1(py, "set_result", (pyo3::types::PyBytes::new(py, b""),))?;
             return Ok(());
         }
@@ -1341,7 +1347,8 @@ pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
 /// Persistent per-fd recv worker.  One task lives for the lifetime of a connection.
 /// It holds an `AsyncFd` (epoll stays registered between calls — no per-request
 /// epoll_ctl or dup overhead).  Requests arrive via an async_channel; results are
-/// sent back to the event loop via the scheduler channel as `RustCallHandle`s.
+/// sent back to the event loop via the scheduler channel as `RustCallHandle`s so
+/// that GIL work is batched in `io_processing_loop`.
 async fn sock_reader_task(
     fd: i32,
     owned: OwnedFd,
@@ -1380,7 +1387,6 @@ async fn sock_reader_task(
                 Err(e) => break Err(e),
                 Ok(mut guard) => { guard.clear_ready(); }
             }
-            // Loop back and retry recv.
         };
 
         let fatal = outcome.is_err();
@@ -1398,9 +1404,7 @@ async fn sock_reader_task(
             })),
         });
 
-        if fatal {
-            break;
-        }
+        if fatal { break; }
     }
 
     sock_readers.pin().remove(&(fd as usize));
