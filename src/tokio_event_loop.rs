@@ -73,6 +73,8 @@ impl Ord for TokioTimer {
 pub(crate) enum ScheduledTask {
     Immediate { handle: TBoxedHandle },
     Delayed { timer: TokioTimer },
+    /// Worker confirmed readability via FIONREAD; `_run` will recv directly into Python memory.
+    RecvReady { fd: i32, avail: usize, nbytes: usize, fut: Py<PyAny> },
 }
 
 impl std::fmt::Debug for ScheduledTask {
@@ -80,6 +82,7 @@ impl std::fmt::Debug for ScheduledTask {
         match self {
             ScheduledTask::Immediate { .. } => write!(f, "ScheduledTask::Immediate"),
             ScheduledTask::Delayed { timer } => write!(f, "ScheduledTask::Delayed {{ when: {} }}", timer.when),
+            ScheduledTask::RecvReady { fd, .. } => write!(f, "ScheduledTask::RecvReady {{ fd: {} }}", fd),
         }
     }
 }
@@ -438,6 +441,8 @@ impl TEventLoop {
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
                 // Ready handles collected each select! iteration, drained under one GIL
                 let mut current_handles: VecDeque<TBoxedHandle> = VecDeque::new();
+                // RecvReady items: recv directly into Python memory under the same GIL batch
+                let mut pending_recvs: VecDeque<(i32, usize, usize, Py<PyAny>)> = VecDeque::new();
 
                 let mut scheduler_rx = scheduler_rx;
 
@@ -454,6 +459,7 @@ impl TEventLoop {
                                         match extra {
                                             ScheduledTask::Immediate { handle } => current_handles.push_back(handle),
                                             ScheduledTask::Delayed { timer } => delayed_tasks.push(timer),
+                                            ScheduledTask::RecvReady { fd, avail, nbytes, fut } => pending_recvs.push_back((fd, avail, nbytes, fut)),
                                         }
                                     }
                                 }
@@ -464,6 +470,17 @@ impl TEventLoop {
                                         match extra {
                                             ScheduledTask::Immediate { handle } => current_handles.push_back(handle),
                                             ScheduledTask::Delayed { timer } => delayed_tasks.push(timer),
+                                            ScheduledTask::RecvReady { fd, avail, nbytes, fut } => pending_recvs.push_back((fd, avail, nbytes, fut)),
+                                        }
+                                    }
+                                }
+                                Ok(ScheduledTask::RecvReady { fd, avail, nbytes, fut }) => {
+                                    pending_recvs.push_back((fd, avail, nbytes, fut));
+                                    while let Ok(extra) = scheduler_rx.try_recv() {
+                                        match extra {
+                                            ScheduledTask::Immediate { handle } => current_handles.push_back(handle),
+                                            ScheduledTask::Delayed { timer } => delayed_tasks.push(timer),
+                                            ScheduledTask::RecvReady { fd, avail, nbytes, fut } => pending_recvs.push_back((fd, avail, nbytes, fut)),
                                         }
                                     }
                                 }
@@ -521,12 +538,51 @@ impl TEventLoop {
                         }
                     }
 
-                    // Run ALL ready callbacks under a single GIL acquisition.
+                    // Run ALL ready callbacks and pending recvs under a single GIL acquisition.
                     // Use attach_blocking so GC-triggered runtime drops don't panic.
-                    if !current_handles.is_empty() {
+                    if !current_handles.is_empty() || !pending_recvs.is_empty() {
                         let handlers = loop_handlers.clone();
                         let state = TEventLoopRunState {};
                         attach_blocking(|py| {
+                            // Drain pending RecvReady items first: recv directly into Python memory.
+                            while let Some((fd, avail, nbytes, fut)) = pending_recvs.pop_front() {
+                                if avail == 0 {
+                                    let data = pyo3::types::PyBytes::new(py, b"");
+                                    let _ = fut.call_method1(py, "set_result", (data,));
+                                    continue;
+                                }
+                                let n = avail.min(nbytes);
+                                // Track actual bytes received (FIONREAD is accurate on Linux TCP,
+                                // but we handle k < n cleanly to avoid returning garbage bytes).
+                                let actual_k = std::cell::Cell::new(0usize);
+                                let result = pyo3::types::PyBytes::new_with(py, n, |dst: &mut [u8]| {
+                                    let k = unsafe {
+                                        libc::recv(fd, dst.as_mut_ptr() as *mut libc::c_void, n, 0)
+                                    };
+                                    if k < 0 {
+                                        return Err(PyErr::from(std::io::Error::last_os_error()));
+                                    }
+                                    actual_k.set(k as usize);
+                                    Ok(())
+                                });
+                                match result {
+                                    Ok(data) => {
+                                        let k = actual_k.get();
+                                        // Virtually always k == n on Linux TCP after FIONREAD.
+                                        // On the rare occasion k < n, create a correctly-sized bytes.
+                                        let final_data = if k < n {
+                                            pyo3::types::PyBytes::new(py, &data.as_bytes()[..k])
+                                        } else {
+                                            data
+                                        };
+                                        let _ = fut.call_method1(py, "set_result", (final_data,));
+                                    }
+                                    Err(e) => {
+                                        let _ = fut.call_method1(py, "set_exception", (e.into_value(py),));
+                                    }
+                                }
+                            }
+                            // Drain scheduled callbacks.
                             while let Some(handle) = current_handles.pop_front() {
                                 if !handle.cancelled() {
                                     let _ = handle.run(py, &handlers, &state);
@@ -541,13 +597,35 @@ impl TEventLoop {
                         // teardown callbacks (e.g. connection_lost) before we exit.
                         tokio::task::yield_now().await;
                         // Drain any callbacks that arrived during teardown.
-                        while let Ok(ScheduledTask::Immediate { handle }) = scheduler_rx.try_recv() {
-                            current_handles.push_back(handle);
+                        while let Ok(task) = scheduler_rx.try_recv() {
+                            match task {
+                                ScheduledTask::Immediate { handle } => current_handles.push_back(handle),
+                                ScheduledTask::RecvReady { fd, avail, nbytes, fut } => pending_recvs.push_back((fd, avail, nbytes, fut)),
+                                ScheduledTask::Delayed { .. } => {}
+                            }
                         }
-                        if !current_handles.is_empty() {
+                        if !current_handles.is_empty() || !pending_recvs.is_empty() {
                             let handlers = loop_handlers.clone();
                             let state = TEventLoopRunState {};
                             attach_blocking(|py| {
+                                while let Some((fd, avail, nbytes, fut)) = pending_recvs.pop_front() {
+                                    let n = avail.min(nbytes);
+                                    let actual_k = std::cell::Cell::new(0usize);
+                                    let result = pyo3::types::PyBytes::new_with(py, n, |dst: &mut [u8]| {
+                                        let k = unsafe { libc::recv(fd, dst.as_mut_ptr() as *mut libc::c_void, n, 0) };
+                                        if k < 0 { return Err(PyErr::from(std::io::Error::last_os_error())); }
+                                        actual_k.set(k as usize);
+                                        Ok(())
+                                    });
+                                    match result {
+                                        Ok(data) => {
+                                            let k = actual_k.get();
+                                            let final_data = if k < n { pyo3::types::PyBytes::new(py, &data.as_bytes()[..k]) } else { data };
+                                            let _ = fut.call_method1(py, "set_result", (final_data,));
+                                        }
+                                        Err(e) => { let _ = fut.call_method1(py, "set_exception", (e.into_value(py),)); }
+                                    }
+                                }
                                 while let Some(handle) = current_handles.pop_front() {
                                     if !handle.cancelled() {
                                         let _ = handle.run(py, &handlers, &state);
@@ -1367,42 +1445,36 @@ async fn sock_reader_task(
     while let Ok(msg) = rx.recv().await {
         let SockRecvMsg::Recv { nbytes, fut } = msg;
 
-        // Allocate once and attempt recv immediately — data may have arrived while
-        // the message was in the channel (avoids a redundant readable().await wait).
-        let mut buf = vec![0u8; nbytes];
-        let outcome: Result<Vec<u8>, std::io::Error> = loop {
-            let n = unsafe {
-                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
-            };
-            if n >= 0 {
-                buf.truncate(n as usize);
-                break Ok(buf);
+        // Wait until the fd is readable, then query available bytes via FIONREAD.
+        // The actual recv into Python memory happens in _run under the GIL, eliminating
+        // one Rust-heap allocation and one Vec→PyBytes copy vs the previous approach.
+        let result: Result<(i32, usize), std::io::Error> = loop {
+            // Try FIONREAD first — data may already be present (arrived while message
+            // was in the channel or from a prior readable() guard that wasn't consumed).
+            let mut avail: libc::c_int = 0;
+            if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) } == 0 && avail > 0 {
+                break Ok((fd, avail as usize));
             }
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::WouldBlock {
-                break Err(e);
-            }
-            // EAGAIN: wait for the kernel to signal readability, then retry.
+            // No data yet — wait for epoll to signal readability.
             match async_fd.readable().await {
                 Err(e) => break Err(e),
                 Ok(mut guard) => { guard.clear_ready(); }
             }
         };
 
-        let fatal = outcome.is_err();
-        let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
-            handle: Box::new(RustCallHandle::new(move |py| {
-                match outcome {
-                    Ok(buf) => {
-                        let data = pyo3::types::PyBytes::new(py, &buf);
-                        let _ = fut.call_method1(py, "set_result", (data,));
-                    }
-                    Err(e) => {
+        let fatal = result.is_err();
+        match result {
+            Ok((fd, avail)) => {
+                let _ = scheduler_tx.try_send(ScheduledTask::RecvReady { fd, avail, nbytes, fut });
+            }
+            Err(e) => {
+                let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                    handle: Box::new(RustCallHandle::new(move |py| {
                         let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
-                    }
-                }
-            })),
-        });
+                    })),
+                });
+            }
+        }
 
         if fatal { break; }
     }
