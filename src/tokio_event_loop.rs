@@ -136,6 +136,9 @@ pub struct TEventLoop {
     // Eliminates per-request task-spawn and epoll_ctl overhead vs the v1 approach.
     sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
     sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
+    // Dedicated io_uring thread for all socket recv/send operations.
+    uring_tx: std::sync::mpsc::SyncSender<crate::uring::UringRequest>,
+    uring_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl TEventLoop {
@@ -323,6 +326,11 @@ impl TEventLoop {
         let (scheduler_tx, scheduler_rx) = async_channel::unbounded::<ScheduledTask>();
         let (signal_socket_tx, signal_socket_rx) = async_channel::unbounded::<u8>();
 
+        let (uring_tx, uring_thread) = crate::uring::start_io_uring_thread(scheduler_tx.clone())
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("io_uring init failed: {e}")
+            ))?;
+
         Ok(Self {
             runtime: OnceLock::new(),
             scheduler_tx,
@@ -342,6 +350,8 @@ impl TEventLoop {
             io_writer_entries: Arc::new(papaya::HashMap::new()),
             sock_readers: Arc::new(papaya::HashMap::new()),
             sock_writers: Arc::new(papaya::HashMap::new()),
+            uring_tx,
+            uring_thread: Mutex::new(Some(uring_thread)),
         })
     }
 
@@ -581,7 +591,15 @@ impl TEventLoop {
             };
 
             result
-        })
+        })?;
+
+        // Shut down the io_uring thread after the event loop exits.
+        let _ = self.uring_tx.send(crate::uring::UringRequest::Shutdown);
+        if let Some(handle) = self.uring_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+
+        Ok(())
     }
 
     #[pyo3(signature = (callback, *args, context=None))]
@@ -1192,22 +1210,8 @@ impl TEventLoop {
             fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),))?;
             return Ok(());
         }
-        // EAGAIN: data not yet available — hand off to the persistent worker.
-
-        // Forward request to the persistent worker for this fd.
-        // The worker owns the AsyncFd (epoll registration stays alive between calls).
-        let tx = self.get_or_spawn_reader(fd)?;
-        let msg = SockRecvMsg::Recv { nbytes, fut };
-        let msg = match tx.try_send(msg) {
-            Ok(()) => return Ok(()),
-            // Worker channel full or closed — remove stale entry and retry with a new worker.
-            Err(async_channel::TrySendError::Full(m)) | Err(async_channel::TrySendError::Closed(m)) => {
-                self.sock_readers.pin().remove(&(fd as usize));
-                m
-            }
-        };
-        let tx2 = self.get_or_spawn_reader(fd)?;
-        let _ = tx2.try_send(msg);
+        // EAGAIN: data not yet available — submit to the io_uring thread.
+        let _ = self.uring_tx.send(crate::uring::UringRequest::Recv { fd, nbytes, fut });
         Ok(())
     }
 
@@ -1239,9 +1243,8 @@ impl TEventLoop {
             if e.kind() != std::io::ErrorKind::WouldBlock {
                 return Err(PyErr::from(e));
             }
-            // Nothing sent — forward entire buffer to writer worker.
-            let tx = self.get_or_spawn_writer(fd)?;
-            let _ = tx.try_send(SockSendMsg::SendAll { data: bytes.to_vec(), fut });
+            // Nothing sent — submit to the io_uring thread.
+            let _ = self.uring_tx.send(crate::uring::UringRequest::SendAll { fd, data: bytes.to_vec(), fut });
             return Ok(());
         }
         let sent = n as usize;
@@ -1249,9 +1252,8 @@ impl TEventLoop {
             fut.call_method1(py, "set_result", (py.None(),))?;
             return Ok(());
         }
-        // Partial send — pass remaining bytes to writer worker.
-        let tx = self.get_or_spawn_writer(fd)?;
-        let _ = tx.try_send(SockSendMsg::SendAll { data: bytes[sent..].to_vec(), fut });
+        // Partial send — submit remaining bytes to the io_uring thread.
+        let _ = self.uring_tx.send(crate::uring::UringRequest::SendAll { fd, data: bytes[sent..].to_vec(), fut });
         Ok(())
     }
 

@@ -18,6 +18,7 @@ pub mod tokio_event_loop;
 pub mod tokio_handles;
 pub mod tokio_tcp;
 pub mod tokio_udp;
+pub(crate) mod uring;
 
 pub(crate) fn get_lib_version() -> &'static str {
     static LIB_VERSION: OnceLock<String> = OnceLock::new();
