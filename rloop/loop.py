@@ -1435,6 +1435,31 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
         return f'{type(self).__name__}(id={id(self)} hex={hex(id(self))})'
 
     #: special methods
+    # Native sock_* overrides — bypass add_reader/add_writer machinery entirely.
+    # A persistent per-fd worker task (Rust) holds the AsyncFd so epoll stays
+    # registered between calls; only a channel message crosses the thread boundary
+    # per request (no per-request spawn/dup/epoll_ctl overhead).
+
+    def sock_recv(self, sock, nbytes) -> _Future:
+        self._ensure_fd_no_transport(sock.fileno())
+        fut = self.create_future()
+        self._sock_recv_native(sock, nbytes, fut)
+        return fut
+
+    async def sock_sendall(self, sock, data):
+        if not data:
+            return
+        self._ensure_fd_no_transport(sock.fileno())
+        fut = self.create_future()
+        self._sock_sendall_native(sock, data, fut)
+        await fut
+
+    def sock_accept(self, sock) -> _Future:
+        self._ensure_fd_no_transport(sock.fileno())
+        fut = self.create_future()
+        self._sock_accept_native(sock, fut)
+        return fut
+
     def _run_forever_pre(self):
         result = super()._run_forever_pre()
         _register_tokio_thread(self)

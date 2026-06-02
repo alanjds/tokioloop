@@ -1,23 +1,39 @@
 use std::{
-    collections::{BinaryHeap, VecDeque}, os::fd::{FromRawFd, IntoRawFd}, sync::{atomic, Arc, OnceLock, RwLock}, time::{Duration, Instant}
+    collections::{BinaryHeap, VecDeque},
+    os::fd::{FromRawFd, OwnedFd},
+    sync::{atomic, Arc, Mutex, OnceLock, RwLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use pyo3::prelude::*;
-use mio::{Interest, Poll, Token, Waker, event, net::TcpListener};
 use std::sync::atomic::AtomicBool;
 use tokio::{runtime::Runtime, task::JoinHandle, net::UnixStream};
-use async_channel::{Sender, Receiver};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle},
-    py::{copy_context, run_in_ctx, run_in_ctx0, run_in_ctx1},
+    tokio_handles::{TCBHandle, TTimerHandle, TBoxedHandle, THandle, PermitHandle, RustCallHandle},
+    py::{copy_context, attach_blocking},
     log::{LogExc, log_exc_to_py_ctx},
     server::TokioServer,
     tokio_tcp::{TokioTCPServer, TokioTCPServerRef},
 };
 use pyo3::IntoPyObjectExt;
-use socket2::Socket;
+
+// Holds Python callback args behind a Mutex so they can be cleared with the GIL
+// by remove_reader/remove_writer, while the watcher task only captures the Arc.
+// This prevents Py<T> from being dropped on a tokio worker thread without the GIL.
+type PyCallbackEntry = Arc<Mutex<Option<(Py<PyAny>, Py<PyAny>, Py<PyAny>)>>>;
+
+// Messages sent to persistent per-fd native sock workers.
+// The worker resolves the asyncio Future via the scheduler when I/O completes.
+enum SockRecvMsg {
+    Recv { nbytes: usize, fut: Py<PyAny> },
+}
+
+enum SockSendMsg {
+    SendAll { data: Vec<u8>, fut: Py<PyAny> },
+}
 
 // Timer with absolute timestamp (like RLoop)
 pub struct TokioTimer {
@@ -54,13 +70,7 @@ impl Ord for TokioTimer {
     }
 }
 
-struct PyHandleData {
-    interest: Interest,
-    cbr: Option<Py<crate::tokio_handles::TCBHandle>>,
-    cbw: Option<Py<crate::tokio_handles::TCBHandle>>,
-}
-
-enum ScheduledTask {
+pub(crate) enum ScheduledTask {
     Immediate { handle: TBoxedHandle },
     Delayed { timer: TokioTimer },
 }
@@ -104,8 +114,8 @@ impl LoopHandlers {
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub struct TEventLoop {
     runtime: OnceLock<Arc<Runtime>>,
-    scheduler_tx: Sender<ScheduledTask>,
-    scheduler_rx: Receiver<ScheduledTask>,
+    pub(crate) scheduler_tx: async_channel::Sender<ScheduledTask>,
+    scheduler_rx: async_channel::Receiver<ScheduledTask>,
     counter_ready: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
     stopping: Arc<atomic::AtomicBool>,
@@ -114,13 +124,18 @@ pub struct TEventLoop {
     exception_handler: Arc<RwLock<Py<PyAny>>>,
     #[pyo3(get)]
     _base_ctx: Py<PyAny>,
-    // Signal handling fields for Phase 3 implementation
+    // Signal handling
     signal_socket_rx: async_channel::Receiver<u8>,
     signal_socket_tx: async_channel::Sender<u8>,
     sig_listening: Arc<AtomicBool>,
     sig_handlers: Arc<papaya::HashMap<u8, Py<PyAny>>>,
-    // I/O handling fields for future tokio integration
-    io_callbacks: Arc<papaya::HashMap<usize, (Py<PyAny>, Py<PyAny>, Py<PyAny>)>>,
+    // I/O watcher tasks, keyed by fd
+    io_reader_entries: Arc<papaya::HashMap<usize, (CancellationToken, PyCallbackEntry)>>,
+    io_writer_entries: Arc<papaya::HashMap<usize, (CancellationToken, PyCallbackEntry)>>,
+    // Persistent native sock workers: one long-lived task per fd, reused across calls.
+    // Eliminates per-request task-spawn and epoll_ctl overhead vs the v1 approach.
+    sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
+    sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
 }
 
 impl TEventLoop {
@@ -245,15 +260,11 @@ impl TEventLoop {
         };
 
         log::debug!("Scheduling task: {:?}", task);
-        match self.scheduler_tx.clone().try_send(task) {
-            Ok(()) => {
-                log::debug!("Task sent successfully");
-            }
-            Err(_) => {
-                log::debug!("Failed to schedule task - channel closed, ignoring");
-                return Err(anyhow::anyhow!("Failed to schedule task - loop stopping & channel closed"));
-            }
+        if self.scheduler_tx.try_send(task).is_err() {
+            log::debug!("Failed to schedule task - channel closed, ignoring");
+            return Err(anyhow::anyhow!("Failed to schedule task - loop stopping & channel closed"));
         }
+        log::debug!("Task sent successfully");
         Ok(())
     }
 
@@ -262,6 +273,46 @@ impl TEventLoop {
             .expect("Runtime not initialized - call initialize_runtime first")
             .clone();
         runtime
+    }
+
+    /// Return the Sender for the persistent reader worker for `fd`, spawning one if needed.
+    fn get_or_spawn_reader(&self, fd: i32) -> PyResult<async_channel::Sender<SockRecvMsg>> {
+        let pin = self.sock_readers.pin();
+        if let Some(tx) = pin.get(&(fd as usize)) {
+            return Ok(tx.clone());
+        }
+        drop(pin);
+        let fd_dup = unsafe { libc::dup(fd) };
+        if fd_dup < 0 {
+            return Err(PyErr::from(std::io::Error::last_os_error()));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+        let (tx, rx) = async_channel::bounded::<SockRecvMsg>(2);
+        let scheduler_tx = self.scheduler_tx.clone();
+        let sock_readers = Arc::clone(&self.sock_readers);
+        self.get_runtime().spawn(sock_reader_task(fd, owned, rx, scheduler_tx, sock_readers));
+        self.sock_readers.pin().insert(fd as usize, tx.clone());
+        Ok(tx)
+    }
+
+    /// Return the Sender for the persistent writer worker for `fd`, spawning one if needed.
+    fn get_or_spawn_writer(&self, fd: i32) -> PyResult<async_channel::Sender<SockSendMsg>> {
+        let pin = self.sock_writers.pin();
+        if let Some(tx) = pin.get(&(fd as usize)) {
+            return Ok(tx.clone());
+        }
+        drop(pin);
+        let fd_dup = unsafe { libc::dup(fd) };
+        if fd_dup < 0 {
+            return Err(PyErr::from(std::io::Error::last_os_error()));
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+        let (tx, rx) = async_channel::bounded::<SockSendMsg>(2);
+        let scheduler_tx = self.scheduler_tx.clone();
+        let sock_writers = Arc::clone(&self.sock_writers);
+        self.get_runtime().spawn(sock_writer_task(fd, owned, rx, scheduler_tx, sock_writers));
+        self.sock_writers.pin().insert(fd as usize, tx.clone());
+        Ok(tx)
     }
 }
 
@@ -273,7 +324,7 @@ impl TEventLoop {
         let (signal_socket_tx, signal_socket_rx) = async_channel::unbounded::<u8>();
 
         Ok(Self {
-            runtime: OnceLock::new(),  // Will be initialized later
+            runtime: OnceLock::new(),
             scheduler_tx,
             scheduler_rx,
             counter_ready: atomic::AtomicUsize::new(0),
@@ -283,13 +334,14 @@ impl TEventLoop {
             exc_handler: Arc::new(RwLock::new(py.None())),
             exception_handler: Arc::new(RwLock::new(py.None())),
             _base_ctx: copy_context(py),
-            // Initialize signal handling fields
             signal_socket_rx,
             signal_socket_tx,
             sig_listening: Arc::new(atomic::AtomicBool::new(false)),
             sig_handlers: Arc::new(papaya::HashMap::new()),
-            // I/O handling fields for future tokio integration
-            io_callbacks: Arc::new(papaya::HashMap::new()),
+            io_reader_entries: Arc::new(papaya::HashMap::new()),
+            io_writer_entries: Arc::new(papaya::HashMap::new()),
+            sock_readers: Arc::new(papaya::HashMap::new()),
+            sock_writers: Arc::new(papaya::HashMap::new()),
         })
     }
 
@@ -369,63 +421,51 @@ impl TEventLoop {
     fn _run(&self, py: Python) -> PyResult<()> {
         let runtime = self.get_runtime();
 
-        // Create LoopHandlers for use in the async task
         let loop_handlers = LoopHandlers {
             exc_handler: Arc::clone(&self.exc_handler),
             exception_handler: Arc::clone(&self.exception_handler),
         };
 
-        // Clone receiver BEFORE the async block - this is the key fix!
         let scheduler_rx = self.scheduler_rx.clone();
-
-        // Keep the same sender - all scheduling uses the same channel
-        // This ensures the receiver in _run() is connected to all tasks
 
         let stopping_clone = Arc::clone(&self.stopping);
         let epoch = self.epoch;
-
-        // Get a copy of the scheduler sender for signal handling
-        let _scheduler_tx = self.scheduler_tx.clone();
-
-        // Get signal socket references for use in the async task
         let signal_socket_rx = self.signal_socket_rx.clone();
         let sig_listening_clone = Arc::clone(&self.sig_listening);
 
-        // Release GIL to allow tokio tasks to acquire it
         py.detach(|| {
-            // Main tokio task
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
-
-                // // Register this Python event loop within the current tokio thread
-                // Python::attach(|py| -> PyResult<()> {
-                //     let rloop_mod = py.import("rloop.loop")?;
-                //     let register_fn = rloop_mod.getattr("_register_tokio_thread")?;
-                //     let loop_id_clone = loop_id.clone();
-                //     log::trace!("Calling rloop.loop._register_tokio_thread(\"{}\")", loop_id_clone);
-                //     register_fn.call1((loop_id_clone,))?;
-                //     Ok(())
-                // }).expect("Failed to register tokio thread");
-
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
-                let (current_handles_tx, mut current_handles_rx) = tokio::sync::mpsc::unbounded_channel::<TBoxedHandle>();
+                // Ready handles collected each select! iteration, drained under one GIL
+                let mut current_handles: VecDeque<TBoxedHandle> = VecDeque::new();
+
+                let mut scheduler_rx = scheduler_rx;
 
                 loop {
-                    // Check signals before entering tokio::select!
-                    // Python::attach(|py| {
-                    //     let _ = py.check_signals();
-                    // });
-
                     tokio::select! {
-                        // Handle incoming scheduled tasks
+                        // Drain all immediately available scheduled tasks in one shot
                         task = scheduler_rx.recv() => {
                             match task {
                                 Ok(ScheduledTask::Immediate { handle }) => {
                                     log::trace!("Received: Immediate task");
-                                    let _ = current_handles_tx.send(handle);
+                                    current_handles.push_back(handle);
+                                    // Greedily drain any additional tasks already in the channel
+                                    while let Ok(extra) = scheduler_rx.try_recv() {
+                                        match extra {
+                                            ScheduledTask::Immediate { handle } => current_handles.push_back(handle),
+                                            ScheduledTask::Delayed { timer } => delayed_tasks.push(timer),
+                                        }
+                                    }
                                 }
                                 Ok(ScheduledTask::Delayed { timer }) => {
                                     log::trace!("Received: Delayed task");
                                     delayed_tasks.push(timer);
+                                    while let Ok(extra) = scheduler_rx.try_recv() {
+                                        match extra {
+                                            ScheduledTask::Immediate { handle } => current_handles.push_back(handle),
+                                            ScheduledTask::Delayed { timer } => delayed_tasks.push(timer),
+                                        }
+                                    }
                                 }
                                 Err(_) => {
                                     log::debug!("Scheduler channel closed");
@@ -434,75 +474,41 @@ impl TEventLoop {
                             }
                         }
 
-                        // Handle timer expiration
+                        // Timer branch: sleep exactly until the next deadline (no polling)
                         _ = async {
-                            if let Some(next_timer) = delayed_tasks.peek() {
-                                let next_time = next_timer.when;
-                                let current = Instant::now().duration_since(epoch).as_micros();
-                                if next_time > current {
-                                    let micros_to_wait = next_time - current;
-                                    let sleep_duration = if micros_to_wait > 100u128 { 100u64 } else { micros_to_wait as u64 };
-                                    tokio::time::sleep(Duration::from_micros(sleep_duration)).await;
-                                } else {
-                                    let current_time = Instant::now().duration_since(epoch).as_micros();
-                                    // Timer sleep completed, check for expired timers
-                                    while let Some(timer) = delayed_tasks.peek() {
-                                        if timer.when <= current_time {
-                                            log::trace!("Delayed task: selected to run");
-                                            let timer = delayed_tasks.pop().unwrap();
-                                            if !timer.handle.cancelled() {
-                                                let _ = current_handles_tx.send(timer.handle);
-                                                log::trace!("Delayed task: sent to run");
-                                            } else {
-                                                log::trace!("Delayed task: cancelled. Not sent to run");
-                                            }
-                                        } else {
-                                            break;
-                                        }
+                            let next_us = delayed_tasks.peek().unwrap().when;
+                            let elapsed_us = Instant::now().duration_since(epoch).as_micros();
+                            if next_us > elapsed_us {
+                                let wait_us = (next_us - elapsed_us) as u64;
+                                tokio::time::sleep(Duration::from_micros(wait_us)).await;
+                            }
+                            // Drain all timers that have now expired
+                            let now = Instant::now().duration_since(epoch).as_micros();
+                            while let Some(timer) = delayed_tasks.peek() {
+                                if timer.when <= now {
+                                    let timer = delayed_tasks.pop().unwrap();
+                                    if !timer.handle.cancelled() {
+                                        log::trace!("Delayed task ready to run");
+                                        current_handles.push_back(timer.handle);
+                                    } else {
+                                        log::trace!("Delayed task cancelled, skipping");
                                     }
+                                } else {
+                                    break;
                                 }
-                            } else {
-                                tokio::time::sleep(Duration::from_millis(1)).await;
                             }
                         }, if !delayed_tasks.is_empty() => {}
 
-                        // Signal socket reading
+                        // Signal socket
                         sig = signal_socket_rx.recv() => {
                             if let Ok(signal_num) = sig {
                                 log::trace!("Processing signal: {}", signal_num);
-
-                                let signal_name = match signal_num {
-                                    1 => "SIGHUP",
-                                    2 => "SIGINT",
-                                    3 => "SIGQUIT",
-                                    6 => "SIGABRT",
-                                    8 => "SIGFPE",
-                                    9 => "SIGKILL",
-                                    10 => "SIGUSR1",
-                                    11 => "SIGSEGV",
-                                    12 => "SIGUSR2",
-                                    13 => "SIGPIPE",
-                                    14 => "SIGALRM",
-                                    15 => "SIGTERM",
-                                    17 => "SIGCHLD",
-                                    18 => "SIGCONT",
-                                    19 => "SIGSTOP",
-                                    20 => "SIGTSTP",
-                                    21 => "SIGTTIN",
-                                    22 => "SIGTTOU",
-                                    _ => "UNKNOWN",
-                                };
-                                log::debug!("Signal received: {} ({})", signal_num, signal_name);
-
-                                // Auto-stop on termination signals
                                 match signal_num {
-                                    2 | 15 => {  // SIGINT or SIGTERM
-                                        log::info!("Termination signal {} ({}) received, stopping event loop", signal_num, signal_name);
+                                    2 | 15 => {
+                                        log::info!("Termination signal {} received, stopping event loop", signal_num);
                                         stopping_clone.store(true, atomic::Ordering::Release);
                                     }
-                                    _ => {
-                                        // Other signals are handled by PyO3 signal processing
-                                    }
+                                    _ => {}
                                 }
                             } else {
                                 log::debug!("Signal channel closed");
@@ -513,53 +519,50 @@ impl TEventLoop {
                                 break;
                             }
                         }
-
-                        // Default case when no timers
-                        _ = async {
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }, if delayed_tasks.is_empty() => {}
-
-                        handle = current_handles_rx.recv() => {
-                            if let Some(handle) = handle {
-                                log::trace!("Task received to run");
-                                if !handle.cancelled() {
-                                    // Clone handlers for this handle execution
-                                    let handlers = loop_handlers.clone();
-                                    let mut state = TEventLoopRunState{};
-
-                                    // Execute Python callback in GIL
-                                    log::trace!("PyO3: attaching Python to run the task");
-                                    Python::attach(|py|{
-                                        log::debug!("Executing handle in tokio context");
-                                        // Execute the handle with proper context
-                                        let _ = handle.run(py, &handlers, &state);
-                                        log::debug!("Handle execution completed");
-                                        // to avoid panic when Py<T> tries to decrement refcount
-                                        drop(handle);
-                                    })
-                                } else {
-                                    Python::attach(|_py|{
-                                        // to avoid panic when Py<T> tries to decrement refcount
-                                        drop(handle);
-                                    });
-                                }
-                            } else {
-                                log::debug!("Handle channel closed, breaking from select");
-                                break;
-                            }
-                        }
                     }
 
-                    // Check stop condition
+                    // Run ALL ready callbacks under a single GIL acquisition.
+                    // Use attach_blocking so GC-triggered runtime drops don't panic.
+                    if !current_handles.is_empty() {
+                        let handlers = loop_handlers.clone();
+                        let state = TEventLoopRunState {};
+                        attach_blocking(|py| {
+                            while let Some(handle) = current_handles.pop_front() {
+                                if !handle.cancelled() {
+                                    let _ = handle.run(py, &handlers, &state);
+                                }
+                                drop(handle);
+                            }
+                        });
+                    }
+
                     if stopping_clone.load(atomic::Ordering::Acquire) {
+                        // Yield once so io_processing_loop tasks can schedule their
+                        // teardown callbacks (e.g. connection_lost) before we exit.
+                        tokio::task::yield_now().await;
+                        // Drain any callbacks that arrived during teardown.
+                        while let Ok(ScheduledTask::Immediate { handle }) = scheduler_rx.try_recv() {
+                            current_handles.push_back(handle);
+                        }
+                        if !current_handles.is_empty() {
+                            let handlers = loop_handlers.clone();
+                            let state = TEventLoopRunState {};
+                            attach_blocking(|py| {
+                                while let Some(handle) = current_handles.pop_front() {
+                                    if !handle.cancelled() {
+                                        let _ = handle.run(py, &handlers, &state);
+                                    }
+                                    drop(handle);
+                                }
+                            });
+                        }
                         break;
                     }
-                };
+                }
 
                 Ok(())
             });
 
-            // Block until completion
             let result = match runtime.block_on(task_handle) {
                 Ok(Ok(())) => {
                     log::info!("Tokio event loop completed successfully");
@@ -635,7 +638,6 @@ impl TEventLoop {
         Ok(())
     }
 
-    // I/O methods for socket operations - these are critical for TCP functionality
     #[pyo3(signature = (fd, callback, *args, context=None))]
     fn add_reader(
         &self,
@@ -647,22 +649,111 @@ impl TEventLoop {
     ) -> PyResult<crate::tokio_handles::TCBHandle> {
         log::debug!("TokioEventLoop::add_reader called for fd: {}", fd);
 
-        // For now, implement a simple version that schedules the callback
-        // In a full implementation, this would register the fd with tokio's interest system
-        let context = context.unwrap_or_else(|| copy_context(py));
-        let handle = TCBHandle::new(callback.clone_ref(py), args.clone_ref(py), context.clone_ref(py));
-        let handle_obj = Py::new(py, handle)?;
-
-        // Store the callback for later execution when fd becomes readable
-        {
-            let mut callbacks = self.io_callbacks.pin();
-            callbacks.insert(fd, (handle_obj.clone_ref(py).into(), py.None(), context.clone_ref(py)));
+        // Cancel any existing reader watcher for this fd and clear its Python objects
+        // (we hold the GIL here, so this is safe)
+        if let Some((old_token, old_entry)) = self.io_reader_entries.pin().remove(&fd) {
+            old_token.cancel();
+            if let Ok(mut guard) = old_entry.lock() {
+                guard.take();
+            }
         }
 
-        // Schedule an immediate task to check readability
-        self.schedule_handle(handle_obj.clone_ref(py), None)?;
+        let context = context.unwrap_or_else(|| copy_context(py));
 
-        // Return a new handle with the same parameters
+        // Wrap Python objects in a shared entry so the async task never holds Py<T> directly.
+        // The task captures the Arc; clear() is called here (with GIL) via remove_reader().
+        let entry: PyCallbackEntry = Arc::new(Mutex::new(Some((
+            callback.clone_ref(py),
+            args.clone_ref(py),
+            context.clone_ref(py),
+        ))));
+        let entry_task = Arc::clone(&entry);
+
+        let token = CancellationToken::new();
+        self.io_reader_entries.pin().insert(fd, (token.clone(), entry));
+
+        let scheduler_tx = self.scheduler_tx.clone();
+        let runtime = self.get_runtime();
+
+        // Semaphore(1): ensures at most one callback is in-flight per fd.
+        // The permit is held by PermitHandle and released when the handle is dropped
+        // (after the event loop runs or cancels it), preventing duplicate callbacks.
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+
+        runtime.spawn(async move {
+            let fd_dup = unsafe { libc::dup(fd as i32) };
+            if fd_dup < 0 {
+                log::error!("add_reader: dup({}) failed", fd);
+                return;
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+            let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("add_reader: AsyncFd::new failed for fd {}: {}", fd, e);
+                    return;
+                }
+            };
+
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        log::trace!("add_reader watcher cancelled for fd {}", fd);
+                        break;
+                    }
+                    result = async_fd.readable() => {
+                        match result {
+                            Ok(mut guard) => {
+                                guard.clear_ready();
+                                // Acquire permit: blocks until the previous callback was consumed
+                                let permit = match Arc::clone(&sem).acquire_owned().await {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                };
+                                let handle = Python::attach(|py| {
+                                    let locked = entry_task.lock().map_err(|_| {
+                                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("entry_task lock poisoned")
+                                    })?;
+                                    let (cb, ag, cx) = locked.as_ref().ok_or_else(|| {
+                                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("reader entry removed")
+                                    })?;
+                                    Py::new(py, TCBHandle::new(
+                                        cb.clone_ref(py),
+                                        ag.clone_ref(py),
+                                        cx.clone_ref(py),
+                                    ))
+                                });
+                                match handle {
+                                    Ok(h) => {
+                                        let wrapped = Box::new(PermitHandle {
+                                            inner: Box::new(h),
+                                            _permit: permit,
+                                        });
+                                        if scheduler_tx.try_send(ScheduledTask::Immediate { handle: wrapped }).is_err() {
+                                            log::debug!("add_reader: scheduler closed for fd {}", fd);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::debug!("add_reader: entry removed or error for fd {}: {:?}", fd, e);
+                                        drop(permit);
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("add_reader: AsyncFd error for fd {}: {}", fd, e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // entry_task (Arc) dropped here. If Option is None (cleared by remove_reader),
+            // no Py<T> is freed. If Some, the map still holds the other Arc reference,
+            // so Py<T> survives until TEventLoop is GC'd with the GIL held.
+        });
+
         Ok(TCBHandle::new(callback, args, context))
     }
 
@@ -677,46 +768,125 @@ impl TEventLoop {
     ) -> PyResult<crate::tokio_handles::TCBHandle> {
         log::debug!("TokioEventLoop::add_writer called for fd: {}", fd);
 
-        // For now, implement a simple version that schedules the callback
-        // In a full implementation, this would register the fd with tokio's interest system
-        let context = context.unwrap_or_else(|| copy_context(py));
-        let handle = TCBHandle::new(callback.clone_ref(py), args.clone_ref(py), context.clone_ref(py));
-        let handle_obj = Py::new(py, handle)?;
-
-        // Store the callback for later execution when fd becomes writable
-        {
-            let mut callbacks = self.io_callbacks.pin();
-            callbacks.insert(fd, (py.None(), handle_obj.clone_ref(py).into(), context.clone_ref(py)));
+        if let Some((old_token, old_entry)) = self.io_writer_entries.pin().remove(&fd) {
+            old_token.cancel();
+            if let Ok(mut guard) = old_entry.lock() {
+                guard.take();
+            }
         }
 
-        // Schedule an immediate task to check writability
-        self.schedule_handle(handle_obj.clone_ref(py), None)?;
+        let context = context.unwrap_or_else(|| copy_context(py));
 
-        // Return a new handle with the same parameters
+        let entry: PyCallbackEntry = Arc::new(Mutex::new(Some((
+            callback.clone_ref(py),
+            args.clone_ref(py),
+            context.clone_ref(py),
+        ))));
+        let entry_task = Arc::clone(&entry);
+
+        let token = CancellationToken::new();
+        self.io_writer_entries.pin().insert(fd, (token.clone(), entry));
+
+        let scheduler_tx = self.scheduler_tx.clone();
+        let runtime = self.get_runtime();
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+
+        runtime.spawn(async move {
+            let fd_dup = unsafe { libc::dup(fd as i32) };
+            if fd_dup < 0 {
+                log::error!("add_writer: dup({}) failed", fd);
+                return;
+            }
+            let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+            let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("add_writer: AsyncFd::new failed for fd {}: {}", fd, e);
+                    return;
+                }
+            };
+
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => {
+                        log::trace!("add_writer watcher cancelled for fd {}", fd);
+                        break;
+                    }
+                    result = async_fd.writable() => {
+                        match result {
+                            Ok(mut guard) => {
+                                guard.clear_ready();
+                                let permit = match Arc::clone(&sem).acquire_owned().await {
+                                    Ok(p) => p,
+                                    Err(_) => break,
+                                };
+                                let handle = Python::attach(|py| {
+                                    let locked = entry_task.lock().map_err(|_| {
+                                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("entry_task lock poisoned")
+                                    })?;
+                                    let (cb, ag, cx) = locked.as_ref().ok_or_else(|| {
+                                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("writer entry removed")
+                                    })?;
+                                    Py::new(py, TCBHandle::new(
+                                        cb.clone_ref(py),
+                                        ag.clone_ref(py),
+                                        cx.clone_ref(py),
+                                    ))
+                                });
+                                match handle {
+                                    Ok(h) => {
+                                        let wrapped = Box::new(PermitHandle {
+                                            inner: Box::new(h),
+                                            _permit: permit,
+                                        });
+                                        if scheduler_tx.try_send(ScheduledTask::Immediate { handle: wrapped }).is_err() {
+                                            log::debug!("add_writer: scheduler closed for fd {}", fd);
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::debug!("add_writer: entry removed or error for fd {}: {:?}", fd, e);
+                                        drop(permit);
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("add_writer: AsyncFd error for fd {}: {}", fd, e);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(TCBHandle::new(callback, args, context))
     }
 
-    fn remove_reader(&self, py: Python, fd: usize) -> bool {
+    fn remove_reader(&self, _py: Python, fd: usize) -> bool {
         log::debug!("TokioEventLoop::remove_reader called for fd: {}", fd);
-
-        // Remove the reader callback
-        let mut callbacks = self.io_callbacks.pin();
-        if let Some((reader_cb, writer_cb, ctx)) = callbacks.remove(&fd) {
-            // Only return true if there was a reader callback
-            !reader_cb.is_none(py)
+        if let Some((token, entry)) = self.io_reader_entries.pin().remove(&fd) {
+            token.cancel();
+            // Clear Py<T> objects with the GIL held (we're in a pymethods fn)
+            if let Ok(mut guard) = entry.lock() {
+                guard.take();
+            }
+            true
         } else {
             false
         }
     }
 
-    fn remove_writer(&self, py: Python, fd: usize) -> bool {
+    fn remove_writer(&self, _py: Python, fd: usize) -> bool {
         log::debug!("TokioEventLoop::remove_writer called for fd: {}", fd);
-
-        // Remove the writer callback
-        let mut callbacks = self.io_callbacks.pin();
-        if let Some((reader_cb, writer_cb, ctx)) = callbacks.remove(&fd) {
-            // Only return true if there was a writer callback
-            !writer_cb.is_none(py)
+        if let Some((token, entry)) = self.io_writer_entries.pin().remove(&fd) {
+            token.cancel();
+            if let Ok(mut guard) = entry.lock() {
+                guard.take();
+            }
+            true
         } else {
             false
         }
@@ -814,18 +984,8 @@ impl TEventLoop {
 
     fn _tcp_stream_bound(&self, fd: usize) -> bool {
         log::debug!("TokioEventLoop::_tcp_stream_bound called for fd: {}", fd);
-
-        // Check if we have any I/O callbacks registered for this fd
-        let callbacks = self.io_callbacks.pin();
-        if let Some((reader_cb, writer_cb, _ctx)) = callbacks.get(&fd) {
-            // If we have callbacks registered, it's considered "bound"
-            // to the event loop system - use Python::attach to get a py context
-            Python::attach(|py| {
-                !(reader_cb.is_none(py)) || !(writer_cb.is_none(py))
-            })
-        } else {
-            false
-        }
+        self.io_reader_entries.pin().contains_key(&fd)
+            || self.io_writer_entries.pin().contains_key(&fd)
     }
 
     fn _udp_conn(
@@ -933,7 +1093,7 @@ impl TEventLoop {
                     Ok(n) if n > 0 => {
                         log::debug!("Received signals: {} signals", n);
                         // Process signals received from Python
-                        Python::attach(|py| {
+                        attach_blocking(|py| {
                             match py.check_signals() {
                                 Ok(()) => {
                                     log::debug!("PyO3 signals processed successfully");
@@ -990,6 +1150,182 @@ impl TEventLoop {
         Ok(())
     }
 
+    // ── Native sock_* ops ──────────────────────────────────────────────────────
+    // These bypass the Python add_reader/remove_reader machinery entirely.
+    // Each uses a fast path (MSG_DONTWAIT with GIL) and, on EAGAIN, a persistent
+    // per-fd worker task that holds a live AsyncFd (epoll stays registered between
+    // calls — no dup/epoll_ctl/spawn overhead per request).
+
+    fn _sock_recv_native(
+        &self,
+        py: Python,
+        sock: Py<PyAny>,
+        nbytes: usize,
+        fut: Py<PyAny>,
+    ) -> PyResult<()> {
+        let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
+
+        // Fast path: attempt recv immediately while we hold the GIL.
+        // Stack-allocate for small messages (≤ 4 KB) to avoid heap overhead.
+        const STACK_CAP: usize = 4096;
+        let (n, fast_data) = if nbytes <= STACK_CAP {
+            let mut buf = [0u8; STACK_CAP];
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT) };
+            let data = if n > 0 { Some(pyo3::types::PyBytes::new(py, &buf[..n as usize])) } else { None };
+            (n, data)
+        } else {
+            let mut buf = vec![0u8; nbytes];
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT) };
+            let data = if n > 0 { Some(pyo3::types::PyBytes::new(py, &buf[..n as usize])) } else { None };
+            (n, data)
+        };
+        if let Some(data) = fast_data {
+            fut.call_method1(py, "set_result", (data,))?;
+            return Ok(());
+        }
+        if n == 0 {
+            fut.call_method1(py, "set_result", (pyo3::types::PyBytes::new(py, b""),))?;
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::WouldBlock {
+            fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),))?;
+            return Ok(());
+        }
+        // EAGAIN: data not yet available — hand off to the persistent worker.
+
+        // Forward request to the persistent worker for this fd.
+        // The worker owns the AsyncFd (epoll registration stays alive between calls).
+        let tx = self.get_or_spawn_reader(fd)?;
+        let msg = SockRecvMsg::Recv { nbytes, fut };
+        let msg = match tx.try_send(msg) {
+            Ok(()) => return Ok(()),
+            // Worker channel full or closed — remove stale entry and retry with a new worker.
+            Err(async_channel::TrySendError::Full(m)) | Err(async_channel::TrySendError::Closed(m)) => {
+                self.sock_readers.pin().remove(&(fd as usize));
+                m
+            }
+        };
+        let tx2 = self.get_or_spawn_reader(fd)?;
+        let _ = tx2.try_send(msg);
+        Ok(())
+    }
+
+    fn _sock_sendall_native(
+        &self,
+        py: Python,
+        sock: Py<PyAny>,
+        data: Py<PyAny>,
+        fut: Py<PyAny>,
+    ) -> PyResult<()> {
+        let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
+        let bytes: &[u8] = data.bind(py).extract()?;
+        if bytes.is_empty() {
+            fut.call_method1(py, "set_result", (py.None(),))?;
+            return Ok(());
+        }
+
+        // Fast path: send as much as possible without blocking.
+        let n = unsafe {
+            libc::send(
+                fd,
+                bytes.as_ptr() as *const libc::c_void,
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(PyErr::from(e));
+            }
+            // Nothing sent — forward entire buffer to writer worker.
+            let tx = self.get_or_spawn_writer(fd)?;
+            let _ = tx.try_send(SockSendMsg::SendAll { data: bytes.to_vec(), fut });
+            return Ok(());
+        }
+        let sent = n as usize;
+        if sent == bytes.len() {
+            fut.call_method1(py, "set_result", (py.None(),))?;
+            return Ok(());
+        }
+        // Partial send — pass remaining bytes to writer worker.
+        let tx = self.get_or_spawn_writer(fd)?;
+        let _ = tx.try_send(SockSendMsg::SendAll { data: bytes[sent..].to_vec(), fut });
+        Ok(())
+    }
+
+    fn _sock_accept_native(
+        &self,
+        py: Python,
+        sock: Py<PyAny>,
+        fut: Py<PyAny>,
+    ) -> PyResult<()> {
+        let fd = sock.call_method0(py, "fileno")?.extract::<i32>(py)?;
+
+        // Fast path: try accept() immediately.
+        match sock.call_method0(py, "accept") {
+            Ok(res) => {
+                if let Ok(conn) = res.bind(py).get_item(0) {
+                    let _ = conn.call_method1("setblocking", (false,));
+                }
+                fut.call_method1(py, "set_result", (res,))?;
+                return Ok(());
+            }
+            Err(ref e) if e.is_instance_of::<pyo3::exceptions::PyBlockingIOError>(py) => {}
+            Err(e) => return Err(e),
+        }
+
+        // Slow path: one-shot dup+AsyncFd (accept is called rarely — once per
+        // connection — so the persistent-worker overhead is not worth it here).
+        let scheduler_tx = self.scheduler_tx.clone();
+        let runtime = self.get_runtime();
+        runtime.spawn(async move {
+            let accept_result: Result<Py<PyAny>, std::io::Error> = 'outer: {
+                let fd_dup = unsafe { libc::dup(fd) };
+                if fd_dup < 0 { break 'outer Err(std::io::Error::last_os_error()); }
+                let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+                match tokio::io::unix::AsyncFd::new(owned) {
+                    Err(e) => break 'outer Err(e),
+                    Ok(async_fd) => match async_fd.readable().await {
+                        Err(e) => break 'outer Err(e),
+                        Ok(mut guard) => {
+                            guard.clear_ready();
+                            drop(guard);
+                            drop(async_fd);
+                            let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                                handle: Box::new(RustCallHandle::new(move |py| {
+                                    let result: PyResult<Py<PyAny>> = (|| {
+                                        let res = sock.call_method0(py, "accept")?;
+                                        if let Ok(conn) = res.bind(py).get_item(0) {
+                                            let _ = conn.call_method1("setblocking", (false,));
+                                        }
+                                        Ok(res)
+                                    })();
+                                    drop(sock);
+                                    match result {
+                                        Ok(res) => { let _ = fut.call_method1(py, "set_result", (res,)); }
+                                        Err(e) => { let _ = fut.call_method1(py, "set_exception", (e.into_value(py),)); }
+                                    }
+                                })),
+                            });
+                            return;
+                        }
+                    },
+                }
+            };
+            // Error before scheduling (dup or AsyncFd::new failed)
+            let e = match accept_result { Err(e) => e, Ok(_) => return };
+            let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+                handle: Box::new(RustCallHandle::new(move |py| {
+                    drop(sock);
+                    let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                })),
+            });
+        });
+        Ok(())
+    }
+
     fn _signals_clear(&self) {
         // TODO: Implement tokio-based signal clearing
         // For now, just log to call to make interface work
@@ -1006,4 +1342,135 @@ impl TEventLoop {
 pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
     module.add_class::<TEventLoop>()?;
     Ok(())
+}
+
+/// Persistent per-fd recv worker.  One task lives for the lifetime of a connection.
+/// It holds an `AsyncFd` (epoll stays registered between calls — no per-request
+/// epoll_ctl or dup overhead).  Requests arrive via an async_channel; results are
+/// sent back to the event loop via the scheduler channel as `RustCallHandle`s so
+/// that GIL work is batched in `io_processing_loop`.
+async fn sock_reader_task(
+    fd: i32,
+    owned: OwnedFd,
+    rx: async_channel::Receiver<SockRecvMsg>,
+    scheduler_tx: async_channel::Sender<ScheduledTask>,
+    sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
+) {
+    let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
+        Ok(a) => a,
+        Err(_) => {
+            sock_readers.pin().remove(&(fd as usize));
+            return;
+        }
+    };
+
+    while let Ok(msg) = rx.recv().await {
+        let SockRecvMsg::Recv { nbytes, fut } = msg;
+
+        // Allocate once and attempt recv immediately — data may have arrived while
+        // the message was in the channel (avoids a redundant readable().await wait).
+        let mut buf = vec![0u8; nbytes];
+        let outcome: Result<Vec<u8>, std::io::Error> = loop {
+            let n = unsafe {
+                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
+            };
+            if n >= 0 {
+                buf.truncate(n as usize);
+                break Ok(buf);
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                break Err(e);
+            }
+            // EAGAIN: wait for the kernel to signal readability, then retry.
+            match async_fd.readable().await {
+                Err(e) => break Err(e),
+                Ok(mut guard) => { guard.clear_ready(); }
+            }
+        };
+
+        let fatal = outcome.is_err();
+        let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+            handle: Box::new(RustCallHandle::new(move |py| {
+                match outcome {
+                    Ok(buf) => {
+                        let data = pyo3::types::PyBytes::new(py, &buf);
+                        let _ = fut.call_method1(py, "set_result", (data,));
+                    }
+                    Err(e) => {
+                        let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
+                    }
+                }
+            })),
+        });
+
+        if fatal { break; }
+    }
+
+    sock_readers.pin().remove(&(fd as usize));
+}
+
+/// Persistent per-fd send worker.  Drives a write loop with `writable().await` +
+/// `send(MSG_DONTWAIT | MSG_NOSIGNAL)` until all bytes are flushed.
+async fn sock_writer_task(
+    fd: i32,
+    owned: OwnedFd,
+    rx: async_channel::Receiver<SockSendMsg>,
+    scheduler_tx: async_channel::Sender<ScheduledTask>,
+    sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
+) {
+    let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
+        Ok(a) => a,
+        Err(_) => {
+            sock_writers.pin().remove(&(fd as usize));
+            return;
+        }
+    };
+
+    while let Ok(msg) = rx.recv().await {
+        let SockSendMsg::SendAll { data, fut } = msg;
+        let mut offset = 0usize;
+
+        let result: Result<(), std::io::Error> = loop {
+            // Attempt send; often succeeds immediately (kernel send buffer has space).
+            let n = unsafe {
+                libc::send(
+                    fd,
+                    data[offset..].as_ptr() as *const libc::c_void,
+                    data.len() - offset,
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if n >= 0 {
+                offset += n as usize;
+                if offset >= data.len() { break Ok(()); }
+                continue; // more bytes to send; try again before waiting
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                break Err(e);
+            }
+            match async_fd.writable().await {
+                Ok(mut guard) => {
+                    guard.clear_ready();
+                    drop(guard);
+                }
+                Err(e) => break Err(e),
+            }
+        };
+
+        let is_err = result.is_err();
+        let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
+            handle: Box::new(RustCallHandle::new(move |py| {
+                match result {
+                    Ok(()) => { let _ = fut.call_method1(py, "set_result", (py.None(),)); }
+                    Err(e) => { let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),)); }
+                }
+            })),
+        });
+
+        if is_err { break; }
+    }
+
+    sock_writers.pin().remove(&(fd as usize));
 }

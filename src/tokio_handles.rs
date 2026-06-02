@@ -31,6 +31,43 @@ pub trait THandle: Send + Sync {
 
 pub(crate) type TBoxedHandle = Box<dyn THandle + Send + Sync>;
 
+/// Schedules an arbitrary Rust closure through the event loop.
+/// Used to route io_processing_loop teardown calls (e.g. connection_lost)
+/// through the scheduler so they run before run_until_complete returns.
+pub(crate) struct RustCallHandle(std::sync::Mutex<Option<Box<dyn FnOnce(Python) + Send>>>);
+
+impl RustCallHandle {
+    pub(crate) fn new(f: impl FnOnce(Python) + Send + 'static) -> Self {
+        Self(std::sync::Mutex::new(Some(Box::new(f))))
+    }
+}
+
+impl THandle for RustCallHandle {
+    fn run(&self, py: Python, _handlers: &LoopHandlers, _state: &TEventLoopRunState) {
+        if let Some(f) = self.0.lock().unwrap().take() {
+            f(py);
+        }
+    }
+}
+
+/// Wraps an inner handle and holds a Semaphore permit.
+/// The permit is released when this wrapper is dropped (after run or cancel),
+/// which allows the add_reader/add_writer watcher to check readability again.
+/// This ensures at most one callback is in-flight per fd at any time.
+pub(crate) struct PermitHandle {
+    pub(crate) inner: TBoxedHandle,
+    pub(crate) _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl THandle for PermitHandle {
+    fn run(&self, py: Python, handlers: &LoopHandlers, state: &TEventLoopRunState) {
+        self.inner.run(py, handlers, state);
+    }
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+}
+
 #[pyclass(frozen, module = "rloop._rloop")]
 pub(crate) struct TCBHandle {
     callback: Py<PyAny>,
