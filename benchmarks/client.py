@@ -30,7 +30,7 @@ def wquant(values, quantiles, weights):
     return np.interp(quantiles, wqs, values)
 
 
-def bench(unix, addr, start, duration, timeout, reqsize, msg):
+def bench(unix, addr, start, duration, timeout, reqsize, msg, delay_ms=0.0):
     if unix:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     else:
@@ -60,6 +60,8 @@ def bench(unix, addr, start, duration, timeout, reqsize, msg):
             min_latency = req_time
         latency_stats[req_time] += 1
         n += 1
+        if delay_ms:
+            time.sleep(delay_ms / 1000.0)
 
     try:
         sock.close()
@@ -98,7 +100,7 @@ def run(args):
     with futures.ProcessPoolExecutor(max_workers=wrk) as e:
         fs = []
         for _ in range(wrk):
-            fs.append(e.submit(bench, unix, addr, start, duration, timeout, req_size, msg))
+            fs.append(e.submit(bench, unix, addr, start, duration, timeout, req_size, msg, args.delay_ms))
 
         res = futures.wait(fs)
         for fut in res.done:
@@ -156,4 +158,6 @@ if __name__ == '__main__':
     parser.add_argument('--timeout', default=2, type=int, help='socket timeout in seconds')
     parser.add_argument('--addr', default='127.0.0.1:25000', type=str, help='server address')
     parser.add_argument('--output', default='text', type=str, help='output format', choices=['text', 'json'])
+    parser.add_argument('--delay-ms', default=0.0, type=float, dest='delay_ms',
+                        help='sleep between sends (ms) to force EAGAIN on server')
     run(parser.parse_args())
