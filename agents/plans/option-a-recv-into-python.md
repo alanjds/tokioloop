@@ -231,3 +231,43 @@ BENCHMARK_EXC_PREFIX=.venv/bin .venv/bin/python benchmarks/benchmarks.py raw
 tokioloop vs asyncio: **85.8% / 69.2% / 46.4%**
 
 Target after Option A: **≥86% / ≥75% / ≥55%**
+
+---
+
+## Results (branch `claude/native-sock-option-perf-EyPqK`)
+
+Option A was implemented and an EOF stale-task fix was added (Option B-lite was also
+explored but reverted — it was 13 pp slower on 1KB due to per-EAGAIN task spawn overhead).
+
+### Raw benchmark
+
+| Loop | 1KB | 10KB | 100KB |
+|------|----:|-----:|------:|
+| asyncio | 10,985 | 10,761 | 6,645 |
+| tokioloop | 10,913 | 8,714 | 6,350 |
+| **ratio** | **99.4%** | **81.0%** | **95.5%** |
+
+### Proto benchmark (`loop.create_server` + `asyncio.Protocol`)
+
+| Loop | 1KB | 10KB | 100KB |
+|------|----:|-----:|------:|
+| asyncio | 12,667 | 11,932 | 8,417 |
+| tokioloop | 8,694 | 8,217 | 4,537 |
+| **ratio** | **68.6%** | **68.9%** | **53.9%** |
+
+### Stream benchmark (`asyncio.start_server` + StreamReader.readline)
+
+| Loop | 1KB | 10KB | 100KB |
+|------|----:|-----:|------:|
+| asyncio | 10,821 | 9,950 | 5,810 |
+| tokioloop | 2,961 | 2,959 | 2,222 |
+| **ratio** | **27.4%** | **29.7%** | **38.2%** |
+
+Raw is near parity. Proto and stream have identified bottlenecks described in the next plan.
+
+## Next Steps
+
+See **[`agents/plans/proto-stream-improvements.md`](proto-stream-improvements.md)** for the
+follow-up optimizations:
+- Remove unnecessary `to_vec()` in `io_processing_loop` (`src/tokio_tcp.rs`) → proto +5-10 pp
+- `TokioStreamReader` deque-based buffering (`rloop/streams.py`) → stream +15-20 pp
