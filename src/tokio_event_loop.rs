@@ -136,9 +136,10 @@ pub struct TEventLoop {
     // Eliminates per-request task-spawn and epoll_ctl overhead vs the v1 approach.
     sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
     sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
-    // Dedicated io_uring thread for all socket recv/send operations.
-    uring_tx: std::sync::mpsc::SyncSender<crate::uring::UringRequest>,
-    uring_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    // Dedicated io_uring thread pool for all socket recv/send operations.
+    // Each thread handles a shard of fds (fd % pool_size) in parallel.
+    // Wrapped in Mutex<Option<...>> so _run() can take ownership for clean shutdown.
+    uring_pool: Mutex<Option<crate::uring::UringPool>>,
 }
 
 impl TEventLoop {
@@ -326,7 +327,7 @@ impl TEventLoop {
         let (scheduler_tx, scheduler_rx) = async_channel::unbounded::<ScheduledTask>();
         let (signal_socket_tx, signal_socket_rx) = async_channel::unbounded::<u8>();
 
-        let (uring_tx, uring_thread) = crate::uring::start_io_uring_thread(scheduler_tx.clone())
+        let uring_pool = crate::uring::start_uring_pool(scheduler_tx.clone())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 format!("io_uring init failed: {e}")
             ))?;
@@ -350,8 +351,7 @@ impl TEventLoop {
             io_writer_entries: Arc::new(papaya::HashMap::new()),
             sock_readers: Arc::new(papaya::HashMap::new()),
             sock_writers: Arc::new(papaya::HashMap::new()),
-            uring_tx,
-            uring_thread: Mutex::new(Some(uring_thread)),
+            uring_pool: Mutex::new(Some(uring_pool)),
         })
     }
 
@@ -593,10 +593,9 @@ impl TEventLoop {
             result
         })?;
 
-        // Shut down the io_uring thread after the event loop exits.
-        let _ = self.uring_tx.send(crate::uring::UringRequest::Shutdown);
-        if let Some(handle) = self.uring_thread.lock().unwrap().take() {
-            let _ = handle.join();
+        // Shut down the io_uring thread pool after the event loop exits.
+        if let Some(pool) = self.uring_pool.lock().unwrap().take() {
+            pool.shutdown();
         }
 
         Ok(())
@@ -1210,8 +1209,10 @@ impl TEventLoop {
             fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),))?;
             return Ok(());
         }
-        // EAGAIN: data not yet available — submit to the io_uring thread.
-        let _ = self.uring_tx.send(crate::uring::UringRequest::Recv { fd, nbytes, fut });
+        // EAGAIN: data not yet available — submit to the io_uring pool.
+        if let Some(pool) = self.uring_pool.lock().unwrap().as_ref() {
+            pool.submit_recv(fd, nbytes, fut);
+        }
         Ok(())
     }
 
@@ -1243,8 +1244,10 @@ impl TEventLoop {
             if e.kind() != std::io::ErrorKind::WouldBlock {
                 return Err(PyErr::from(e));
             }
-            // Nothing sent — submit to the io_uring thread.
-            let _ = self.uring_tx.send(crate::uring::UringRequest::SendAll { fd, data: bytes.to_vec(), fut });
+            // Nothing sent — submit to the io_uring pool.
+            if let Some(pool) = self.uring_pool.lock().unwrap().as_ref() {
+                pool.submit_send(fd, bytes.to_vec(), fut);
+            }
             return Ok(());
         }
         let sent = n as usize;
@@ -1252,8 +1255,10 @@ impl TEventLoop {
             fut.call_method1(py, "set_result", (py.None(),))?;
             return Ok(());
         }
-        // Partial send — submit remaining bytes to the io_uring thread.
-        let _ = self.uring_tx.send(crate::uring::UringRequest::SendAll { fd, data: bytes[sent..].to_vec(), fut });
+        // Partial send — submit remaining bytes to the io_uring pool.
+        if let Some(pool) = self.uring_pool.lock().unwrap().as_ref() {
+            pool.submit_send(fd, bytes[sent..].to_vec(), fut);
+        }
         Ok(())
     }
 
