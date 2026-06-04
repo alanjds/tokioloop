@@ -49,8 +49,9 @@ Python::attach(|py| {
 });
 ```
 
-**File:** `src/tokio_tcp.rs:239-247`  
-**Expected improvement:** proto ~69% → ~75-80% of asyncio
+**File:** `src/tokio_tcp.rs` (`io_processing_loop`, `Ok(n)` read arm)  
+**Expected improvement:** proto ~69% → ~75-80% of asyncio  
+**Status:** ✅ implemented — `to_vec()` removed; `&read_buf[..n]` passed directly to `PyBytes::new`.
 
 ---
 
@@ -71,124 +72,86 @@ io_processing_loop reads chunk [Rust]
 The two extra copies (one into the bytearray buffer, one out to the return value) explain
 the ~28% floor vs proto's ~69%.
 
-### Fix: `TokioStreamReader` — deque-of-bytes instead of bytearray
+> **Status:** NOT implemented. The original draft of this section had two blocking
+> defects (wrong wiring + a correctness bug). They are documented below so a future
+> effort starts from an accurate design. This is a larger, correctness-sensitive task,
+> not a quick win.
 
-Add `rloop/streams.py` with a `TokioStreamReader(asyncio.StreamReader)` subclass that stores
-incoming chunks in a `collections.deque` of raw `bytes` objects, avoiding the `feed_data`
-copy entirely. `readline()` scans the deque using `bytes.find(b'\n')`.
+### Wiring: there is no `loop.start_server` — patch `asyncio.streams.StreamReader`
 
-```python
-# rloop/streams.py
-import asyncio
-import collections
+The original draft proposed overriding `start_server()` on the loop. **That does not work.**
+Verified on **Python 3.13.12** (and 3.11), in both GIL and no-GIL builds (free-threading is a
+CPython build flag, not a separate stdlib — `asyncio` is identical):
 
+- `asyncio.AbstractEventLoop.start_server` and `asyncio.base_events.BaseEventLoop.start_server`
+  **do not exist**. There is no loop-level `start_server` to override.
+- `asyncio.start_server` is a free function in `asyncio.streams`. It constructs the reader
+  itself and calls `loop.create_server`:
 
-class TokioStreamReader(asyncio.StreamReader):
-    """asyncio.StreamReader that stores chunks as-is instead of extending a bytearray."""
+  ```python
+  async def start_server(client_connected_cb, host=None, port=None, *, limit=..., **kwds):
+      loop = events.get_running_loop()
+      def factory():
+          reader = StreamReader(limit=limit, loop=loop)            # ← reader built here
+          protocol = StreamReaderProtocol(reader, client_connected_cb, loop=loop)
+          return protocol
+      return await loop.create_server(factory, host, port, **kwds)
+  ```
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._tsr_chunks: collections.deque = collections.deque()
-        self._tsr_len: int = 0
+The benchmark (`benchmarks/server.py`) and `tests/tcp/test_tcp_server.py` both call
+`asyncio.start_server`, so a loop method would never be consulted. The only way to inject a
+custom reader is to **monkeypatch `asyncio.streams.StreamReader`** so the `factory()` above
+constructs ours. This mirrors tokioloop's existing monkeypatch pattern for
+`asyncio.events.get_running_loop` / `get_event_loop` in `rloop/loop.py` (search
+`_patch_asyncio_events_get_running_loop`). The patch must be installed when the TokioLoop
+policy is activated and restored on teardown.
 
-    def feed_data(self, data: bytes) -> None:
-        if not data:
-            return
-        # Append without copying into bytearray
-        self._tsr_chunks.append(data)
-        self._tsr_len += len(data)
-        self._wakeup_waiter()
-        # Keep parent's length accounting so at_eof() / flow-control work
-        self._buffer.extend(b'\x00' * len(data))
-        self._maybe_resume_transport()
+### Correctness: a reader replacement must keep ALL consumption methods consistent
 
-    def feed_eof(self) -> None:
-        super().feed_eof()
-        self._wakeup_waiter()
+The original draft kept a deque of chunks but padded the inherited `self._buffer` bytearray
+with `b'\x00' * len(data)` placeholder bytes "for accounting", and only overrode `readline()`.
+**This corrupts every other reader.** `asyncio.StreamReader.read()`, `readexactly()`, and
+`readuntil()` all return slices of `self._buffer` — they would hand back null bytes. The stream
+benchmark only exercises `readline`, so it would *pass the benchmark while silently returning
+garbage* for any general `start_server` consumer.
 
-    def _wakeup_waiter(self) -> None:
-        waiter = self._waiter
-        if waiter is not None:
-            self._waiter = None
-            if not waiter.cancelled():
-                waiter.set_result(None)
+A correct deque-based reader must therefore either:
 
-    async def readline(self) -> bytes:
-        while True:
-            # Scan deque for '\n'
-            scanned = 0
-            for i, chunk in enumerate(self._tsr_chunks):
-                pos = chunk.find(b'\n')
-                if pos != -1:
-                    return self._tsr_consume_line(i, pos)
-                scanned += len(chunk)
-            # No '\n' yet — check EOF
-            if self._eof:
-                return self._tsr_drain_all()
-            # Wait for more data
-            await self._wait_for_data('readline')
+1. **Override every consumption path** against the deque — `read`, `readexactly`, `readuntil`,
+   `readline`, plus `at_eof` / flow-control hooks — and not store real bytes in `self._buffer`
+   at all (don't pad it with placeholders); or
+2. **Not subclass** `StreamReader`; instead provide an independent reader that reimplements the
+   `StreamReader` consumption surface over the deque.
 
-    def _tsr_consume_line(self, chunk_idx: int, pos_in_chunk: int) -> bytes:
-        """Extract everything up to and including pos_in_chunk in chunk chunk_idx."""
-        parts = []
-        for _ in range(chunk_idx):
-            c = self._tsr_chunks.popleft()
-            parts.append(c)
-            self._tsr_len -= len(c)
-            del self._buffer[:len(c)]
-        head = self._tsr_chunks[0]
-        line_part = head[:pos_in_chunk + 1]
-        remainder = head[pos_in_chunk + 1:]
-        parts.append(line_part)
-        self._tsr_len -= pos_in_chunk + 1
-        del self._buffer[:pos_in_chunk + 1]
-        if remainder:
-            self._tsr_chunks[0] = remainder
-        else:
-            self._tsr_chunks.popleft()
-        return b''.join(parts)
+Either way the design owns the full read API, not just `readline`. Reusing asyncio's private
+internals (`_buffer`, `_waiter`, `_wait_for_data`, `_maybe_resume_transport`, `_eof`) is also
+version-fragile across 3.13/3.14 and GIL vs no-GIL; pin behaviour with tests on each target.
 
-    def _tsr_drain_all(self) -> bytes:
-        result = b''.join(self._tsr_chunks)
-        self._tsr_chunks.clear()
-        del self._buffer[:self._tsr_len]
-        self._tsr_len = 0
-        return result
-```
+### Expected improvement and ceiling
 
-Wire into the event loop by overriding `start_server()` in `rloop/loop.py`:
-
-```python
-async def start_server(self, client_connected_cb, host=None, port=None, *,
-                       limit=2**16, **kwds):
-    from .streams import TokioStreamReader
-    def factory():
-        reader = TokioStreamReader(limit=limit)
-        protocol = asyncio.StreamReaderProtocol(reader, client_connected_cb)
-        return protocol
-    return await self.create_server(factory, host, port, **kwds)
-```
-
-**Files:** `rloop/streams.py` (new), `rloop/loop.py` (add `start_server` override)  
+**Files:** `rloop/streams.py` (new), `rloop/loop.py` (install/remove the `StreamReader`
+monkeypatch alongside the existing event patches)  
 **Expected improvement:** stream ~28% → ~40-50% of asyncio
 
-**Ceiling note:** The return value of `readline()` still requires one join/copy to assemble
-the output bytes. Stream will always be one copy behind proto. Closing the gap further would
+**Ceiling note:** `readline()`'s return value still requires one join/copy to assemble the
+output bytes. Stream will always be one copy behind proto. Closing the gap further would
 require a Rust-backed line accumulator that delivers complete lines directly as `PyBytes`.
 
 ---
 
 ## Implementation Order
 
-1. **Proto fix first** — recompile, run tests, benchmark to confirm improvement.
-2. **Stream fix** — implement `TokioStreamReader`, wire into `start_server()`, run stream benchmark.
+1. **Proto fix** — recompile, run tests, benchmark to confirm improvement. ✅ done.
+2. **Stream fix (future)** — install the `asyncio.streams.StreamReader` monkeypatch, implement a
+   reader that owns the full consumption API, add tests for `read`/`readexactly`/`readuntil`/
+   `readline` on 3.13+ (GIL and no-GIL), then benchmark.
 
 ---
 
 ## Verification
 
 ```bash
-# Build (proto fix requires recompile; stream fix is Python-only)
+# Build (proto fix requires recompile)
 RUSTFLAGS=-Awarnings maturin develop
 
 # Tests
@@ -198,9 +161,9 @@ pytest tests/test_sockets.py tests/tcp/test_tcp_server.py -k TokioLoop -q --time
 python benchmarks/benchmarks.py raw proto stream
 ```
 
-Targets after both fixes:
-- proto ≥ 75% across all message sizes
-- stream ≥ 40% across all message sizes
+Targets:
+- proto ≥ 75% across all message sizes (this change)
+- stream ≥ 40% across all message sizes (future stream work)
 
 ---
 
@@ -214,11 +177,6 @@ allocating an intermediate Vec. Eliminates one heap alloc and one memcpy
 per TCP read on the proto/create_server path.
 ```
 
-```
-perf: TokioStreamReader — deque-based buffering for start_server path
-
-Subclass asyncio.StreamReader to store incoming data chunks in a deque
-instead of extending a bytearray in feed_data(). readline() scans the
-deque using bytes.find(b'\\n'), avoiding the extra bytearray alloc+copy.
-Override start_server() to inject TokioStreamReader.
-```
+The stream optimization is intentionally left unimplemented — see the "Stream
+Bottleneck" section for the corrected design (monkeypatch `asyncio.streams.StreamReader`,
+own the full consumption API). A commit message will be drafted when that work is done.
