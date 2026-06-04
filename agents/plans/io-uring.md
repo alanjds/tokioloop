@@ -320,7 +320,48 @@ With multishot + fixed buffers: potentially **≥95% / ≥90% / ≥80%**.
 
 1. Basic `IORING_OP_RECV` single-shot — replace `sock_recv` EAGAIN path
 2. `IORING_OP_SEND` single-shot — replace `sock_sendall`
-3. Benchmark and verify correctness
+3. Benchmark and verify correctness ✅ **done** (see Results below)
 4. `IORING_OP_ACCEPT` — replace `sock_accept`
 5. (Optional) Multishot recv + buffer rings
+
+---
+
+## Results (implemented on `claude/io-uring-performance-YkX7H`)
+
+Steps 1–3 are complete. The single-shot RECV+SEND io_uring thread replaced the
+AsyncFd/epoll worker for all EAGAIN cases in `_sock_recv_native` and
+`_sock_sendall_native`. Tests: zero regressions (same 6 pre-existing failures).
+
+### Same-machine benchmark vs feat/native-sock-v3 (raw, concurrency=1)
+
+| Loop | 1KB | 10KB | 100KB |
+|------|----:|-----:|------:|
+| asyncio | 18,002 | 15,732 | 8,959 |
+| rloop | 17,955 | 15,635 | 7,587 |
+| **tokioloop v3** | **15,348** | **10,633** | **3,638** |
+| **tokioloop uring** | **15,090** | **9,976** | **3,760** |
+| uvloop | 18,843 | 17,097 | 10,048 |
+
+**tokioloop vs asyncio:** 83.8% / 63.4% / 42.0% (uring) vs 86.5% / 67.5% / 40.5% (v3)
+
+### Concurrency benchmark (raw 1KB)
+
+| | c=2 | c=3 |
+|--|----:|----:|
+| asyncio | 20,241 | 21,662 |
+| **tokioloop** | **16,338** | **17,046** |
+| tokioloop vs asyncio | 80.7% | 78.7% |
+
+### Why the targets weren't reached
+
+The existing benchmarks don't stress the io_uring path: the client is synchronous
+(send→wait→send), so the server socket almost always has data on the first
+`recv(MSG_DONTWAIT)`. The EAGAIN fallback — where io_uring activates — fires rarely.
+The performance targets require benchmarks that expose this path.
+
+### Next step
+
+See **[agents/plans/new-benchmarks.md](new-benchmarks.md)** for two new benchmark
+targets (`high_conc` at c=10/50/100 and `slow` with forced EAGAIN via 2 ms client
+think-time) that will properly exercise the io_uring hot path.
 6. (Optional) Fixed buffers for zero-copy
