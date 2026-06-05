@@ -29,7 +29,7 @@ async def main():
         iters = max(2000, 2_000_000 // size)
         best = {}
         for name, cls in (('asyncio', asyncio.StreamReader), ('tokio', TokioStreamReader)):
-            best[name] = min(await _bench(cls, msg, iters) for _ in range(5))
+            best[name] = min([await _bench(cls, msg, iters) for _ in range(5)])
         a, t = best['asyncio'], best['tokio']
         print(
             f'size={size:>6}  iters={iters:>6}  '
