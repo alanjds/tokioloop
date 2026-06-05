@@ -53,6 +53,18 @@ Python::attach(|py| {
 **Expected improvement:** proto ~69% → ~75-80% of asyncio  
 **Status:** ✅ implemented — `to_vec()` removed; `&read_buf[..n]` passed directly to `PyBytes::new`.
 
+**Validated A/B (Python 3.13.7, same host, concurrency=1, tokioloop/asyncio ratio):**
+
+| size | before (`to_vec`) | after (slice) | Δ |
+|------|------:|------:|------:|
+| 1 KB | 85.1% | 87.6% | +2.5 pp |
+| 10 KB | 88.4% | 87.5% | ~flat (noise) |
+| 100 KB | 71.2% | 87.5% | **+16.3 pp** |
+
+The eliminated 64 KB alloc+copy dominates at large payloads, exactly where the gain lands.
+(Absolute ratios are host-dependent and differ from the original benchmark hardware; the
+before/after delta is the meaningful signal.)
+
 ---
 
 ## Stream Bottleneck — asyncio.StreamReader Double Buffer
