@@ -189,6 +189,57 @@ Profile and optimize the tokioloop **stream transport path**, which is what actu
   echo connection (e.g. `py-spy` / `cProfile` on the server) to attribute the per-message
   cost, then target the dominant hop.
 
+### Profiling findings — the cost is an extra cross-thread GIL hand-off per message
+
+py-spy (on-CPU, Python; native run separately) on the echo **server** under a concurrency=1
+client, Python 3.13.7:
+
+| server (concurrency=1, 1 KB) | rps | on-CPU Python samples in 14 s |
+|------|----:|----:|
+| tokioloop **proto** | ~8,900 | **2** |
+| tokioloop **stream** | ~2,800 | 164 |
+| asyncio **stream** | ~9,700 | 2,035 |
+
+Two things stand out: (1) tokioloop does *far less* Python CPU work than asyncio yet is 3x
+slower on stream — so it is **not** Python-CPU-bound; the native profile shows the Python main
+thread parked in `epoll` inside `runtime.block_on`, i.e. **latency-bound**. (2) tokioloop proto
+captures ~0 Python samples but is 3x faster than tokioloop stream. The difference is structural,
+in the per-message critical path:
+
+- **Proto:** `io_processing_loop` task → `Python::attach` (GIL #1) → `data_received` →
+  `transport.write` — **one GIL acquire, one tokio task, no scheduler hop.**
+- **Stream:** `io_processing_loop` task → `Python::attach` (GIL #1) → `data_received` →
+  `feed_data` → `set_result(waiter)` → `call_soon(task.__step)` → `schedule_handle` sends to the
+  **`scheduler_tx` channel** → the `_run` task wakes on another tokio worker → `attach_blocking`
+  (GIL #2) → runs `task.__step` → `echo_client_streams` resumes → `readline` returns →
+  `writer.write`. **Two GIL acquires across two tokio tasks + a channel round-trip + a tokio task
+  wakeup per message.**
+
+`call_soon` (and therefore every Future→Task wakeup, e.g. waking the parked `readline`) always
+routes through `scheduler_tx` to the `_run` task (`src/tokio_event_loop.rs:669` →
+`schedule_handle`). At concurrency=1 the throughput is `1 / round-trip-latency`, so that extra
+cross-thread GIL bounce directly accounts for the proto↔stream gap. The asyncio reference pays
+none of this — its loop, reader wakeup and write all run inline on one thread.
+
+### Candidate optimizations (to spike + measure next)
+
+1. **In-batch task execution (highest value, most invasive).** After a callback scheduled via
+   `call_soon` is enqueued while a GIL batch is already running (e.g. `data_received` inside
+   `io_processing_loop`'s `Python::attach`), drain and run the just-scheduled handles **in the
+   same GIL hold on the same thread**, instead of bouncing to the `_run` task. Collapses GIL #1+#2
+   into one and removes the channel round-trip for the common "data arrives → wake the reader →
+   write" pattern. Risk: must preserve asyncio's single-threaded, sequential-callback invariant
+   (one drainer at a time; GIL serializes Python but ordering/fairness/timer-starvation need care).
+2. **Re-drain within `_run`'s batch.** The normal `_run` path runs `current_handles` once then
+   returns to `select!`; chained `call_soon`s incur a channel round-trip to itself. Adding a
+   re-drain loop inside the `attach_blocking` (as the teardown path at lines 598–639 already does)
+   lets chained callbacks run in one GIL hold. Smaller/safer, but does not remove the *first*
+   `io_processing_loop → _run` cross-task hop, so likely a partial win for streams.
+3. **Unify connection reads into the `_run` task** so `data_received` and the woken user task run
+   on the same task/thread (no cross-task hand-off). Largest refactor.
+
+Recommended: spike (1) behind measurement; fall back to (2) if (1) proves too invasive.
+
 ---
 
 ## Implementation Order
@@ -196,8 +247,11 @@ Profile and optimize the tokioloop **stream transport path**, which is what actu
 1. **Proto fix** — recompile, run tests, benchmark to confirm improvement. ✅ done.
 2. **Stream reader** — `asyncio.streams.StreamReader` monkeypatch + full-consumption-API
    deque reader + 24 tests on 3.13. ✅ done (correct + isolated-faster; network-neutral).
-3. **Stream transport path (next)** — profile and optimize the `start_server` transport /
-   event-loop round-trip, the actual bottleneck per the A/B above.
+3. **Stream transport path** — profiled (see findings above): the bottleneck is an extra
+   cross-thread GIL hand-off per message (`io_processing_loop` → `scheduler_tx` → `_run`). ✅
+   diagnosed.
+4. **In-batch task execution (next)** — spike candidate (1) above to collapse the per-message
+   double GIL acquire / channel round-trip, measured against the proto/stream benchmarks.
 
 ---
 
