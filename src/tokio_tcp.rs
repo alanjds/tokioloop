@@ -168,10 +168,11 @@ impl TokioTCPTransport {
         // that data_received just scheduled, in-place, without bouncing to the _run task.
         let scheduler_rx = pyloop.borrow(py).scheduler_rx.clone();
         let handlers = pyloop.borrow(py).loop_handlers();
+        let callback_lock = pyloop.borrow(py).callback_lock();
 
         let state_clone = state.clone();
         let io_task = runtime.spawn(async move {
-            Self::io_processing_loop(transport_clone, state_clone, protocol, resume_notify, write_notify, scheduler_tx, scheduler_rx, handlers).await;
+            Self::io_processing_loop(transport_clone, state_clone, protocol, resume_notify, write_notify, scheduler_tx, scheduler_rx, handlers, callback_lock).await;
         });
 
         {
@@ -191,6 +192,7 @@ impl TokioTCPTransport {
         scheduler_tx: async_channel::Sender<ScheduledTask>,
         scheduler_rx: async_channel::Receiver<ScheduledTask>,
         handlers: LoopHandlers,
+        callback_lock: Arc<Mutex<()>>,
     ) {
         // 64KB read buffer — 8x fewer syscalls for large messages vs 8KB
         let mut read_buf = [0u8; 65536];
@@ -254,7 +256,7 @@ impl TokioTCPTransport {
                                     (PyBytes::new(py, &read_buf[..n]),)
                                 );
 
-                                // SPIKE (candidate #1): in-batch task execution.
+                                // In-batch task execution (candidate #1).
                                 // data_received may have woken a Future (e.g. a parked
                                 // StreamReader.readline waiter), which schedules the user
                                 // task's __step via call_soon -> scheduler channel. Normally
@@ -265,27 +267,33 @@ impl TokioTCPTransport {
                                 // writer.write fires before we release the GIL — mirroring the
                                 // proto path (data_received -> write in one attach).
                                 //
-                                // NOTE: spike-grade. Correct for a single connection; for the
-                                // general multi-connection loop this needs a single-drainer
-                                // guarantee + FIFO preservation (see plan). Non-Immediate tasks
-                                // are forwarded back to _run untouched.
-                                let state = TEventLoopRunState {};
-                                let mut budget = 0u32;
-                                while let Ok(task) = scheduler_rx.try_recv() {
-                                    match task {
-                                        ScheduledTask::Immediate { handle } => {
-                                            if !handle.cancelled() {
-                                                let _ = handle.run(py, &handlers, &state);
+                                // Safety: the callback_lock guarantees callbacks never run on
+                                // two threads at once (asyncio's non-overlap invariant), even if
+                                // a callback releases the GIL mid-run. We already hold the GIL
+                                // here, so we must use try_lock (never block): if _run or another
+                                // io loop is executing callbacks, we skip the fast path and leave
+                                // the handles in the channel for _run — preserving FIFO via the
+                                // single active executor + FIFO channel, with no GIL<->lock
+                                // deadlock (lock order is GIL-then-try_lock, non-blocking).
+                                if let Ok(_cb_guard) = callback_lock.try_lock() {
+                                    let state = TEventLoopRunState {};
+                                    let mut budget = 0u32;
+                                    while let Ok(task) = scheduler_rx.try_recv() {
+                                        match task {
+                                            ScheduledTask::Immediate { handle } => {
+                                                if !handle.cancelled() {
+                                                    let _ = handle.run(py, &handlers, &state);
+                                                }
+                                            }
+                                            other => {
+                                                // Timers / RecvReady belong to the _run loop.
+                                                let _ = scheduler_tx.try_send(other);
                                             }
                                         }
-                                        other => {
-                                            // Timers / RecvReady belong to the _run loop.
-                                            let _ = scheduler_tx.try_send(other);
+                                        budget += 1;
+                                        if budget >= 256 {
+                                            break;
                                         }
-                                    }
-                                    budget += 1;
-                                    if budget >= 256 {
-                                        break;
                                     }
                                 }
                             });
