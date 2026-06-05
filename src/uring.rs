@@ -1,77 +1,81 @@
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::thread;
+use std::os::unix::io::{FromRawFd, OwnedFd};
 
 use io_uring::{opcode, types, IoUring};
 use pyo3::prelude::*;
 
-use crate::tokio_event_loop::ScheduledTask;
 use crate::tokio_handles::RustCallHandle;
-
-// ---------------------------------------------------------------------------
-// Request types sent into each io_uring thread
-// ---------------------------------------------------------------------------
-
-pub enum UringRequest {
-    Recv { fd: i32, nbytes: usize, fut: Py<PyAny> },
-    SendAll { fd: i32, data: Vec<u8>, fut: Py<PyAny> },
-    Shutdown,
-}
-
-// Safety: Py<PyAny> is Send when the GIL is not held at the point of transfer,
-// which is guaranteed here (we only call Python methods under the scheduler).
-unsafe impl Send for UringRequest {}
 
 // ---------------------------------------------------------------------------
 // In-flight operation tracking
 // ---------------------------------------------------------------------------
 
-struct InFlightOp {
-    fut: Py<PyAny>,
-    buf: Vec<u8>,   // owned buffer; must not be moved/dropped until CQE arrives
-    offset: usize,  // bytes already sent (SendAll partial-send tracking)
-    op_type: OpType,
-    fd: i32,
+pub struct InFlightOp {
+    pub fut: Py<PyAny>,
+    pub buf: Vec<u8>,   // owned; must not be moved until CQE arrives
+    pub offset: usize,  // bytes already sent (SendAll)
+    pub op_type: OpType,
+    pub fd: i32,
 }
 
-enum OpType {
+pub enum OpType {
     Recv,
     SendAll,
 }
 
 // ---------------------------------------------------------------------------
-// IoUringExecutor — runs on a dedicated OS thread, no Tokio dependency
+// UringState — io_uring ring + in-flight map, driven from the Tokio task.
+//
+// All access is serialised: push_recv/push_send are called under the GIL
+// (inside attach_blocking), and drain_completions / flush are called from the
+// same Tokio task after releasing the GIL. A Mutex<UringState> in TEventLoop
+// provides safe exclusive access.
 // ---------------------------------------------------------------------------
 
-struct IoUringExecutor {
-    ring: IoUring,
+pub struct UringState {
+    pub ring: IoUring,
     in_flight: HashMap<u64, InFlightOp>,
     next_id: u64,
-    scheduler_tx: async_channel::Sender<ScheduledTask>,
+    pub dirty: bool, // true when SQEs were pushed but not yet flushed
 }
 
-impl IoUringExecutor {
-    fn submit_recv(&mut self, fd: i32, nbytes: usize, fut: Py<PyAny>) {
+impl UringState {
+    /// Create a new ring and a non-blocking eventfd that fires on every CQE batch.
+    pub fn new() -> std::io::Result<(Self, OwnedFd)> {
+        let ring = IoUring::new(512)?;
+
+        let efd_raw = unsafe {
+            libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC)
+        };
+        if efd_raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        ring.submitter().register_eventfd(efd_raw)?;
+        let efd = unsafe { OwnedFd::from_raw_fd(efd_raw) };
+
+        Ok((UringState { ring, in_flight: HashMap::new(), next_id: 1, dirty: false }, efd))
+    }
+
+    pub fn push_recv(&mut self, fd: i32, nbytes: usize, fut: Py<PyAny>) {
         let mut buf = vec![0u8; nbytes];
         let id = self.next_id;
         self.next_id += 1;
         let sqe = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), nbytes as u32)
             .build()
             .user_data(id);
-        // SAFETY: `buf` is moved into `in_flight[id]` immediately after this push.
-        // It will not be accessed or dropped until handle_completion() removes the entry,
-        // which only happens after the kernel signals completion via CQE.
+        // SAFETY: `buf` is moved into `in_flight[id]` immediately; it will not
+        // be accessed or dropped until handle_completions() removes the entry.
         unsafe {
             if self.ring.submission().push(&sqe).is_err() {
-                // Submission queue full: flush it first, then retry.
                 let _ = self.ring.submit();
                 let _ = self.ring.submission().push(&sqe);
             }
         }
         self.in_flight.insert(id, InFlightOp { fut, buf, offset: 0, op_type: OpType::Recv, fd });
+        self.dirty = true;
     }
 
-    fn submit_send(&mut self, fd: i32, offset: usize, data: Vec<u8>, fut: Py<PyAny>) {
+    pub fn push_send(&mut self, fd: i32, offset: usize, data: Vec<u8>, fut: Py<PyAny>) {
         let id = self.next_id;
         self.next_id += 1;
         let len = (data.len() - offset) as u32;
@@ -79,8 +83,7 @@ impl IoUringExecutor {
         let sqe = opcode::Send::new(types::Fd(fd), ptr, len)
             .build()
             .user_data(id);
-        // SAFETY: `data` is moved into `in_flight[id]` immediately after this push.
-        // Its memory remains pinned until handle_completion() finishes.
+        // SAFETY: `data` is moved into `in_flight[id]` immediately.
         unsafe {
             if self.ring.submission().push(&sqe).is_err() {
                 let _ = self.ring.submit();
@@ -88,183 +91,88 @@ impl IoUringExecutor {
             }
         }
         self.in_flight.insert(id, InFlightOp { fut, buf: data, offset, op_type: OpType::SendAll, fd });
+        self.dirty = true;
     }
 
-    fn build_completion_handles(completions: Vec<(u64, i32, InFlightOp)>) -> Box<dyn FnOnce(Python) + Send> {
-        // Build a single closure that resolves all futures in one GIL acquisition.
-        Box::new(move |py: Python| {
-            for (_, result, op) in completions {
-                match op.op_type {
-                    OpType::Recv => {
-                        let fut = op.fut;
-                        let mut buf = op.buf;
-                        if result >= 0 {
-                            buf.truncate(result as usize);
-                            let data = pyo3::types::PyBytes::new(py, &buf);
-                            let _ = fut.call_method1(py, "set_result", (data,));
-                        } else {
-                            let e = std::io::Error::from_raw_os_error(-result);
-                            let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
-                        }
-                    }
-                    OpType::SendAll => {
-                        let fut = op.fut;
-                        if result < 0 {
-                            let e = std::io::Error::from_raw_os_error(-result);
-                            let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
-                        } else {
-                            // Fully sent (partial sends are re-submitted before this point).
-                            let _ = fut.call_method1(py, "set_result", (py.None(),));
-                        }
-                    }
-                }
-            }
-        })
-    }
-
-    fn run(mut self, request_rx: mpsc::Receiver<UringRequest>) {
-        loop {
-            // 1. Non-blocking drain: pick up all requests already queued.
-            let mut shutdown = false;
-            while let Ok(req) = request_rx.try_recv() {
-                match req {
-                    UringRequest::Shutdown => { shutdown = true; break; }
-                    UringRequest::Recv { fd, nbytes, fut } => self.submit_recv(fd, nbytes, fut),
-                    UringRequest::SendAll { fd, data, fut } => self.submit_send(fd, 0, data, fut),
-                }
-            }
-            if shutdown { break; }
-
-            // 2. If nothing is in-flight, block until a new request arrives.
-            if self.in_flight.is_empty() {
-                match request_rx.recv() {
-                    Ok(UringRequest::Shutdown) | Err(_) => break,
-                    Ok(UringRequest::Recv { fd, nbytes, fut }) => self.submit_recv(fd, nbytes, fut),
-                    Ok(UringRequest::SendAll { fd, data, fut }) => self.submit_send(fd, 0, data, fut),
-                }
-            }
-
-            // 3. Submit all pending SQEs and wait for at least one completion.
-            if let Err(e) = self.ring.submit_and_wait(1) {
-                log::error!("io_uring submit_and_wait: {e}");
-                break;
-            }
-
-            // 4. Collect completions into a Vec so the borrow on `ring` ends before
-            //    we call submit_send (which needs &mut self.ring).
-            let raw_completions: Vec<(u64, i32)> = self
-                .ring
-                .completion()
-                .map(|cqe| (cqe.user_data(), cqe.result()))
-                .collect();
-
-            if raw_completions.is_empty() {
-                continue;
-            }
-
-            // 5. Resolve completions. Partial SendAll ops are re-submitted immediately;
-            //    the rest are collected for a single batched GIL call.
-            let mut to_deliver: Vec<(u64, i32, InFlightOp)> = Vec::with_capacity(raw_completions.len());
-            for (id, result) in raw_completions {
-                if let Some(op) = self.in_flight.remove(&id) {
-                    // Re-submit partial sends inside this thread to avoid a GIL round-trip.
-                    if let OpType::SendAll = op.op_type {
-                        if result > 0 {
-                            let new_offset = op.offset + result as usize;
-                            if new_offset < op.buf.len() {
-                                self.submit_send(op.fd, new_offset, op.buf, op.fut);
-                                continue;
-                            }
-                        }
-                    }
-                    to_deliver.push((id, result, op));
-                }
-            }
-
-            if to_deliver.is_empty() {
-                continue;
-            }
-
-            // 6. Deliver all completions in ONE scheduler item → ONE GIL acquisition.
-            let handle = RustCallHandle::new(Self::build_completion_handles(to_deliver));
-            let _ = self.scheduler_tx.try_send(ScheduledTask::Immediate { handle: Box::new(handle) });
+    /// Flush pending SQEs to the kernel (non-blocking).
+    pub fn flush(&mut self) {
+        if self.dirty {
+            let _ = self.ring.submit();
+            self.dirty = false;
         }
+    }
+
+    pub fn has_in_flight(&self) -> bool {
+        !self.in_flight.is_empty()
+    }
+
+    /// Drain all available CQEs. Partial sends are re-submitted immediately.
+    /// Returns completed ops for the caller to resolve under the GIL.
+    pub fn drain_completions(&mut self) -> Vec<(InFlightOp, i32)> {
+        let raw: Vec<(u64, i32)> = self
+            .ring
+            .completion()
+            .map(|cqe| (cqe.user_data(), cqe.result()))
+            .collect();
+
+        let mut out = Vec::with_capacity(raw.len());
+        for (id, result) in raw {
+            if let Some(op) = self.in_flight.remove(&id) {
+                // Partial send: re-submit remaining bytes inline (avoids a GIL round-trip).
+                if let OpType::SendAll = op.op_type {
+                    if result > 0 {
+                        let new_off = op.offset + result as usize;
+                        if new_off < op.buf.len() {
+                            self.push_send(op.fd, new_off, op.buf, op.fut);
+                            continue;
+                        }
+                    }
+                }
+                out.push((op, result));
+            }
+        }
+        out
     }
 }
 
 // ---------------------------------------------------------------------------
-// UringPool — a fixed pool of io_uring threads with fd-based routing.
-//
-// Routing by (fd % pool_size) ensures all ops for a given fd stay on the
-// same thread, keeping the per-thread in_flight map consistent while
-// spreading load across N parallel rings.
+// Build a single RustCallHandle that resolves all futures in one GIL pass.
 // ---------------------------------------------------------------------------
 
-pub struct UringPool {
-    senders: Vec<mpsc::SyncSender<UringRequest>>,
-    threads: Vec<thread::JoinHandle<()>>,
-}
-
-impl UringPool {
-    pub fn new(
-        scheduler_tx: async_channel::Sender<ScheduledTask>,
-    ) -> std::io::Result<Self> {
-        // Use one thread per available CPU, capped at 8 to avoid excessive rings.
-        let n = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
-            .min(8)
-            .max(1);
-
-        let mut senders = Vec::with_capacity(n);
-        let mut threads = Vec::with_capacity(n);
-        for i in 0..n {
-            let ring = IoUring::new(256)?;
-            let (tx, rx) = mpsc::sync_channel::<UringRequest>(512);
-            let executor = IoUringExecutor {
-                ring,
-                in_flight: HashMap::new(),
-                next_id: 1,
-                scheduler_tx: scheduler_tx.clone(),
-            };
-            let handle = thread::Builder::new()
-                .name(format!("tokioloop-io-uring-{i}"))
-                .spawn(move || executor.run(rx))?;
-            senders.push(tx);
-            threads.push(handle);
+pub fn build_completion_handle(completions: Vec<(InFlightOp, i32)>) -> RustCallHandle {
+    RustCallHandle::new(move |py: Python| {
+        for (op, result) in completions {
+            match op.op_type {
+                OpType::Recv => {
+                    let fut = op.fut;
+                    let mut buf = op.buf;
+                    if result >= 0 {
+                        buf.truncate(result as usize);
+                        let data = pyo3::types::PyBytes::new(py, &buf);
+                        let _ = fut.call_method1(py, "set_result", (data,));
+                    } else {
+                        let e = std::io::Error::from_raw_os_error(-result);
+                        let _ = fut.call_method1(
+                            py,
+                            "set_exception",
+                            (PyErr::from(e).into_value(py),),
+                        );
+                    }
+                }
+                OpType::SendAll => {
+                    let fut = op.fut;
+                    if result < 0 {
+                        let e = std::io::Error::from_raw_os_error(-result);
+                        let _ = fut.call_method1(
+                            py,
+                            "set_exception",
+                            (PyErr::from(e).into_value(py),),
+                        );
+                    } else {
+                        let _ = fut.call_method1(py, "set_result", (py.None(),));
+                    }
+                }
+            }
         }
-        Ok(UringPool { senders, threads })
-    }
-
-    #[inline]
-    fn sender_for(&self, fd: i32) -> &mpsc::SyncSender<UringRequest> {
-        &self.senders[(fd as usize) % self.senders.len()]
-    }
-
-    pub fn submit_recv(&self, fd: i32, nbytes: usize, fut: Py<PyAny>) {
-        let _ = self.sender_for(fd).send(UringRequest::Recv { fd, nbytes, fut });
-    }
-
-    pub fn submit_send(&self, fd: i32, data: Vec<u8>, fut: Py<PyAny>) {
-        let _ = self.sender_for(fd).send(UringRequest::SendAll { fd, data, fut });
-    }
-
-    pub fn shutdown(self) {
-        for sender in &self.senders {
-            let _ = sender.send(UringRequest::Shutdown);
-        }
-        for handle in self.threads {
-            let _ = handle.join();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
-
-pub fn start_uring_pool(
-    scheduler_tx: async_channel::Sender<ScheduledTask>,
-) -> std::io::Result<UringPool> {
-    UringPool::new(scheduler_tx)
+    })
 }

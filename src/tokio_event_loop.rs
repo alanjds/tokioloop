@@ -1,6 +1,6 @@
 use std::{
     collections::{BinaryHeap, VecDeque},
-    os::fd::{FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     sync::{atomic, Arc, Mutex, OnceLock, RwLock},
     time::{Duration, Instant},
 };
@@ -136,10 +136,12 @@ pub struct TEventLoop {
     // Eliminates per-request task-spawn and epoll_ctl overhead vs the v1 approach.
     sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
     sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
-    // Dedicated io_uring thread pool for all socket recv/send operations.
-    // Each thread handles a shard of fds (fd % pool_size) in parallel.
-    // Wrapped in Mutex<Option<...>> so _run() can take ownership for clean shutdown.
-    uring_pool: Mutex<Option<crate::uring::UringPool>>,
+    // io_uring ring + in-flight map, driven directly from the Tokio scheduler task.
+    // push_recv/push_send are called under the GIL; flush + drain happen in the
+    // async task after releasing the GIL. Arc so the async block can hold a clone.
+    uring_state: Arc<Mutex<crate::uring::UringState>>,
+    // eventfd that io_uring writes to on every CQE batch; watched via AsyncFd in _run().
+    uring_eventfd: OwnedFd,
 }
 
 impl TEventLoop {
@@ -327,7 +329,7 @@ impl TEventLoop {
         let (scheduler_tx, scheduler_rx) = async_channel::unbounded::<ScheduledTask>();
         let (signal_socket_tx, signal_socket_rx) = async_channel::unbounded::<u8>();
 
-        let uring_pool = crate::uring::start_uring_pool(scheduler_tx.clone())
+        let (uring_state, uring_eventfd) = crate::uring::UringState::new()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 format!("io_uring init failed: {e}")
             ))?;
@@ -351,7 +353,8 @@ impl TEventLoop {
             io_writer_entries: Arc::new(papaya::HashMap::new()),
             sock_readers: Arc::new(papaya::HashMap::new()),
             sock_writers: Arc::new(papaya::HashMap::new()),
-            uring_pool: Mutex::new(Some(uring_pool)),
+            uring_state: Arc::new(Mutex::new(uring_state)),
+            uring_eventfd,
         })
     }
 
@@ -443,6 +446,10 @@ impl TEventLoop {
         let signal_socket_rx = self.signal_socket_rx.clone();
         let sig_listening_clone = Arc::clone(&self.sig_listening);
 
+        // io_uring: share state + borrow the raw eventfd fd (valid for duration of _run)
+        let uring_state = Arc::clone(&self.uring_state);
+        let uring_efd_raw: RawFd = self.uring_eventfd.as_raw_fd();
+
         py.detach(|| {
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
@@ -450,6 +457,16 @@ impl TEventLoop {
                 let mut current_handles: VecDeque<TBoxedHandle> = VecDeque::new();
 
                 let mut scheduler_rx = scheduler_rx;
+
+                // AsyncFd wrapper for the io_uring eventfd. Does not own the fd — it is
+                // owned by TEventLoop::uring_eventfd and lives for the duration of _run().
+                struct UringEfd(RawFd);
+                impl AsRawFd for UringEfd { fn as_raw_fd(&self) -> RawFd { self.0 } }
+                let uring_watcher = tokio::io::unix::AsyncFd::new(UringEfd(uring_efd_raw))
+                    .expect("AsyncFd for io_uring eventfd");
+
+                // Whether the ring has in-flight SQEs that need completion.
+                let mut uring_has_in_flight = false;
 
                 loop {
                     tokio::select! {
@@ -529,6 +546,31 @@ impl TEventLoop {
                                 break;
                             }
                         }
+
+                        // io_uring completions: eventfd fires when the kernel has CQEs ready.
+                        result = uring_watcher.readable(), if uring_has_in_flight => {
+                            if let Ok(_guard) = result {
+                                // Read the eventfd counter to reset it (8 bytes, non-blocking).
+                                let mut efd_buf = [0u8; 8];
+                                unsafe {
+                                    libc::read(
+                                        uring_efd_raw,
+                                        efd_buf.as_mut_ptr() as *mut libc::c_void,
+                                        8,
+                                    );
+                                }
+                                // Drain CQEs; partial sends are re-submitted inside drain.
+                                let completions = {
+                                    let mut st = uring_state.lock().unwrap();
+                                    st.drain_completions()
+                                };
+                                if !completions.is_empty() {
+                                    let handle = crate::uring::build_completion_handle(completions);
+                                    current_handles.push_back(Box::new(handle));
+                                }
+                                uring_has_in_flight = uring_state.lock().unwrap().has_in_flight();
+                            }
+                        }
                     }
 
                     // Run ALL ready callbacks under a single GIL acquisition.
@@ -544,6 +586,12 @@ impl TEventLoop {
                                 drop(handle);
                             }
                         });
+                        // Flush any SQEs pushed during the GIL block and update tracking.
+                        {
+                            let mut st = uring_state.lock().unwrap();
+                            st.flush();
+                            uring_has_in_flight = st.has_in_flight();
+                        }
                     }
 
                     if stopping_clone.load(atomic::Ordering::Acquire) {
@@ -593,10 +641,7 @@ impl TEventLoop {
             result
         })?;
 
-        // Shut down the io_uring thread pool after the event loop exits.
-        if let Some(pool) = self.uring_pool.lock().unwrap().take() {
-            pool.shutdown();
-        }
+        // The UringState and eventfd are owned by Arc/OwnedFd and drop automatically.
 
         Ok(())
     }
@@ -1209,10 +1254,8 @@ impl TEventLoop {
             fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),))?;
             return Ok(());
         }
-        // EAGAIN: data not yet available — submit to the io_uring pool.
-        if let Some(pool) = self.uring_pool.lock().unwrap().as_ref() {
-            pool.submit_recv(fd, nbytes, fut);
-        }
+        // EAGAIN: submit to the io_uring ring; the Tokio task will flush + await completion.
+        self.uring_state.lock().unwrap().push_recv(fd, nbytes, fut);
         Ok(())
     }
 
@@ -1244,10 +1287,8 @@ impl TEventLoop {
             if e.kind() != std::io::ErrorKind::WouldBlock {
                 return Err(PyErr::from(e));
             }
-            // Nothing sent — submit to the io_uring pool.
-            if let Some(pool) = self.uring_pool.lock().unwrap().as_ref() {
-                pool.submit_send(fd, bytes.to_vec(), fut);
-            }
+            // Nothing sent — submit to the io_uring ring.
+            self.uring_state.lock().unwrap().push_send(fd, 0, bytes.to_vec(), fut);
             return Ok(());
         }
         let sent = n as usize;
@@ -1255,10 +1296,8 @@ impl TEventLoop {
             fut.call_method1(py, "set_result", (py.None(),))?;
             return Ok(());
         }
-        // Partial send — submit remaining bytes to the io_uring pool.
-        if let Some(pool) = self.uring_pool.lock().unwrap().as_ref() {
-            pool.submit_send(fd, bytes[sent..].to_vec(), fut);
-        }
+        // Partial send — submit remaining bytes.
+        self.uring_state.lock().unwrap().push_send(fd, sent, bytes[sent..].to_vec(), fut);
         Ok(())
     }
 
