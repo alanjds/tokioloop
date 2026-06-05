@@ -222,8 +222,8 @@ Targets:
 Also run the reader-only checks:
 
 ```bash
-pytest tests/test_streams.py -q          # 24 correctness tests vs stock StreamReader
-python /tmp/micro_reader.py               # isolated readline speedup (see Results)
+pytest tests/test_streams.py -q            # 24 correctness tests vs stock StreamReader
+python benchmarks/micro_readline.py        # isolated readline speedup (see Results)
 ```
 
 ---
