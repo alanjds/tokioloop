@@ -81,13 +81,14 @@ io_processing_loop reads chunk [Rust]
         bytes(self._buffer[:isep+1])   ← COPY 2: bytearray → output bytes
 ```
 
-The two extra copies (one into the bytearray buffer, one out to the return value) explain
-the ~28% floor vs proto's ~69%.
+The plan assumed these two copies explain the ~28% stream floor vs proto's ~69%.
+**A controlled A/B (below) disproves that** — the copies are real but they are *not* the
+network bottleneck.
 
-> **Status:** NOT implemented. The original draft of this section had two blocking
-> defects (wrong wiring + a correctness bug). They are documented below so a future
-> effort starts from an accurate design. This is a larger, correctness-sensitive task,
-> not a quick win.
+> **Status:** ✅ reader implemented as `rloop/streams.py::TokioStreamReader`, wired via a
+> `asyncio.streams.StreamReader` monkeypatch in `rloop/loop.py`, covered by 24 tests in
+> `tests/test_streams.py`. The original draft of this section had two blocking defects
+> (wrong wiring + a correctness bug); both were corrected before implementing — see below.
 
 ### Wiring: there is no `loop.start_server` — patch `asyncio.streams.StreamReader`
 
@@ -141,22 +142,62 @@ version-fragile across 3.13/3.14 and GIL vs no-GIL; pin behaviour with tests on 
 
 ### Expected improvement and ceiling
 
-**Files:** `rloop/streams.py` (new), `rloop/loop.py` (install/remove the `StreamReader`
+**Files:** `rloop/streams.py` (new), `rloop/loop.py` (install the `StreamReader`
 monkeypatch alongside the existing event patches)  
-**Expected improvement:** stream ~28% → ~40-50% of asyncio
+**Original expectation:** stream ~28% → ~40-50% of asyncio
 
 **Ceiling note:** `readline()`'s return value still requires one join/copy to assemble the
 output bytes. Stream will always be one copy behind proto. Closing the gap further would
 require a Rust-backed line accumulator that delivers complete lines directly as `PyBytes`.
+
+### Results — the reader is faster in isolation but NOT the network bottleneck
+
+Validated on **Python 3.13.7** (built via uv + maturin):
+
+- **Isolated `readline` micro-benchmark** (best-of-5, data fed then consumed in-process,
+  no socket): `TokioStreamReader` vs stock `asyncio.StreamReader` —
+
+  | size | speedup |
+  |------|--------:|
+  | 1 KB | ~1.05x |
+  | 10 KB | ~1.6x |
+  | 100 KB | **~4.5x** |
+
+  The deque avoids the `feed_data` bytearray copy and returns whole-chunk lines zero-copy,
+  so the win grows with message size. The reader works exactly as designed.
+
+- **End-to-end network stream benchmark** (`asyncio.start_server` echo): a controlled,
+  interleaved A/B toggling only the reader (patch ON vs OFF, same TokioLoop, same session)
+  showed **no measurable difference** — tokioloop held ~2.7k rps (1 KB) / ~1.8k rps (100 KB)
+  either way, vs asyncio's ~10.5k. **Conclusion: the StreamReader copies are not what caps
+  the stream path.** The bottleneck is the tokioloop transport / event-loop path
+  (`io_processing_loop` → `data_received` → `StreamReaderProtocol` → `transport.write` →
+  `drain`, plus per-tick loop overhead).
+
+**Decision:** keep `TokioStreamReader` — it is correct, well-tested, faster in isolation,
+removes the copies this plan targeted, and is a zero-regression foundation for once the
+transport bottleneck is addressed. But it should not be sold as a stream-benchmark win.
+
+### Real next step (supersedes the original stream target)
+
+Profile and optimize the tokioloop **stream transport path**, which is what actually limits
+`start_server` throughput (~26% of asyncio here, ~the same as before this reader change):
+
+- The proto target shares `io_processing_loop` and reaches ~87% of asyncio, while stream sits
+  at ~26%. The delta is the `StreamReaderProtocol` + transport `write`/`drain` round-trip and
+  the extra event-loop hops per message — not the reader. Start by profiling a single
+  echo connection (e.g. `py-spy` / `cProfile` on the server) to attribute the per-message
+  cost, then target the dominant hop.
 
 ---
 
 ## Implementation Order
 
 1. **Proto fix** — recompile, run tests, benchmark to confirm improvement. ✅ done.
-2. **Stream fix (future)** — install the `asyncio.streams.StreamReader` monkeypatch, implement a
-   reader that owns the full consumption API, add tests for `read`/`readexactly`/`readuntil`/
-   `readline` on 3.13+ (GIL and no-GIL), then benchmark.
+2. **Stream reader** — `asyncio.streams.StreamReader` monkeypatch + full-consumption-API
+   deque reader + 24 tests on 3.13. ✅ done (correct + isolated-faster; network-neutral).
+3. **Stream transport path (next)** — profile and optimize the `start_server` transport /
+   event-loop round-trip, the actual bottleneck per the A/B above.
 
 ---
 
@@ -174,8 +215,16 @@ python benchmarks/benchmarks.py raw proto stream
 ```
 
 Targets:
-- proto ≥ 75% across all message sizes (this change)
-- stream ≥ 40% across all message sizes (future stream work)
+- proto ≥ 75% across all message sizes — met (~87%).
+- stream: reader correctness (24 tests pass) + no end-to-end regression. The ~40% network
+  target is deferred to the transport-path work (the reader alone does not move it).
+
+Also run the reader-only checks:
+
+```bash
+pytest tests/test_streams.py -q          # 24 correctness tests vs stock StreamReader
+python /tmp/micro_reader.py               # isolated readline speedup (see Results)
+```
 
 ---
 
