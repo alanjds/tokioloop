@@ -58,6 +58,9 @@ all = [
     { include-group = 'lint' },
     { include-group = 'test' },
 ]
+dev = [
+    "numpy>=2.4.6",
+]
 
 [project.urls]
 Homepage = 'https://github.com/alanjds/tokioloop'

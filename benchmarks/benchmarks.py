@@ -14,7 +14,10 @@ WD = Path(__file__).resolve().parent
 CPU = multiprocessing.cpu_count()
 LOOPS = ['asyncio', 'rloop', 'tokioloop', 'uvloop']
 MSGS = [1024, 1024 * 10, 1024 * 100]
-CONCURRENCIES = sorted({1, max(CPU / 2, 1), max(CPU - 1, 1)})
+CONCURRENCIES = sorted({1, max(CPU // 2, 1), max(CPU - 1, 1)})
+HIGH_CONCURRENCIES = [10, 50, 100]
+SLOW_CONCURRENCIES = [10, 50]
+SLOW_DELAY_MS = 2.0
 
 
 @contextmanager
@@ -37,7 +40,7 @@ def server(loop, streams=False, proto=False):
     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
 
-def client(duration, concurrency, msgsize):
+def client(duration, concurrency, msgsize, delay_ms=0.0):
     exc_prefix = os.environ.get('BENCHMARK_EXC_PREFIX')
     py = 'python'
     if exc_prefix:
@@ -49,6 +52,7 @@ def client(duration, concurrency, msgsize):
         f'--concurrency {concurrency}',
         f'--duration {duration}',
         f'--msize {msgsize}',
+        *([] if not delay_ms else [f'--delay-ms {delay_ms}']),
         '--output json',
     ]
     try:
@@ -66,21 +70,21 @@ def client(duration, concurrency, msgsize):
         return {}
 
 
-def benchmark(msgs=None, concurrencies=None):
+def benchmark(msgs=None, concurrencies=None, delay_ms=0.0):
     concurrencies = concurrencies or CONCURRENCIES
     msgs = msgs or MSGS
     results = {}
     # primer
-    client(1, 1, 1024)
+    client(1, 1, 1024, delay_ms=delay_ms)
     time.sleep(1)
     # warm up
-    client(1, max(concurrencies), 1024 * 100)
+    client(1, max(concurrencies), 1024 * 100, delay_ms=delay_ms)
     time.sleep(2)
     # bench
     for concurrency in concurrencies:
         cres = results[concurrency] = {}
         for msg in msgs:
-            res = client(10, concurrency, msg)
+            res = client(10, concurrency, msg, delay_ms=delay_ms)
             cres[msg] = res
             time.sleep(3)
         time.sleep(1)
@@ -119,6 +123,26 @@ def concurrency():
     return results
 
 
+def high_conc():
+    results = {}
+    for loop in LOOPS:
+        with server(loop):
+            results[loop] = benchmark(msgs=[1024], concurrencies=HIGH_CONCURRENCIES)
+    return results
+
+
+def slow():
+    results = {}
+    for loop in LOOPS:
+        with server(loop):
+            results[loop] = benchmark(
+                msgs=[1024],
+                concurrencies=SLOW_CONCURRENCIES,
+                delay_ms=SLOW_DELAY_MS,
+            )
+    return results
+
+
 def _rloop_version():
     import rloop
 
@@ -131,6 +155,8 @@ def run():
         'stream': stream,
         'proto': proto,
         'concurrency': concurrency,
+        'high_conc': high_conc,
+        'slow': slow,
     }
     inp_benchmarks = sys.argv[1:] or ['raw']
     run_benchmarks = set(inp_benchmarks) & set(all_benchmarks.keys())
