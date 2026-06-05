@@ -4,6 +4,13 @@ Branch: `claude/native-sock-option-perf-IpfRF`
 Base: `feat/native-sock-v3`  
 Date: 2026-06-04
 
+> **Follow-up (2026-06-05, branch `claude/option-b-plan-review-pns7f`):** the
+> next-step #1 was implemented and validated, and the PROTO/STREAM gap was
+> profiled with `py-spy --native`. The profiling overturned the premise of the
+> original next-step #2. See **[Follow-up Work](#follow-up-work-2026-06-05)** and
+> **[Revised Next Steps](#revised-next-steps)** at the bottom — they supersede the
+> "Proposed Next Steps" list captured below.
+
 ---
 
 ## What Was Done
@@ -129,7 +136,7 @@ echo vs 1 for PROTO.
 
 ---
 
-## Proposed Next Steps (priority order)
+## Proposed Next Steps (priority order)  *(original — superseded by [Revised Next Steps](#revised-next-steps))*
 
 ### 1. Fuse read and write in `io_processing_loop` (PROTO/STREAM improvement)
 
@@ -181,3 +188,135 @@ bottleneck visible.
 | `Cargo.toml` | Add `futures = "0.3"` |
 | `results/data.json` | Updated benchmark data |
 | `.gitignore` | Add `.claude/` |
+
+---
+
+## Follow-up Work (2026-06-05)
+
+Branch `claude/option-b-plan-review-pns7f` (stacked on this PR's head).
+
+### Next-step #1 implemented — fuse + greedily drain the write arm ✅
+
+`io_processing_loop`'s write arm previously (a) `return`ed immediately after
+`write_notify.notified()`, forcing a full outer-loop / `select!` re-entry before
+the just-queued write ran, and (b) popped only **one** buffer per `select!`
+iteration. The arm now loops on the notification so the write happens in the same
+poll, and drains the whole `write_buf` greedily so N queued buffers cost one
+iteration. The wait loop also breaks on `closing` so `close()`/`abort()` (which
+wake the arm without enqueuing work) let the outer loop observe `is_closing` and
+exit — without that guard the task deadlocks on close.
+
+**Measurement methodology (important — the absolute numbers below are NOT
+comparable to the tables above).** The tables above were taken on the original
+PR machine. The numbers below were taken in a noisy shared CI container where
+single runs varied by ±15 pp, so they use a **pinned** harness: server pinned to
+CPUs 0–1, client to 2–3, **median of 5×10 s** runs, concurrency=1. Only the
+*before/after delta on the same box* is meaningful.
+
+**PROTO — tokioloop % of asyncio (pinned median):**
+
+| Size   | Baseline (PR head) | Step 1 | Δ |
+|--------|-------------------:|-------:|--:|
+| 1 KB   | 86.8 % | **~95 %** (94.0 / 93.7 / 97.3 over 3 runs) | **+8 pp** ✅ |
+| 10 KB  | 86.9 % | **~92 %** (91.7 / 91.0 / 92.4) | **+5 pp** ✅ |
+| 100 KB | 74.4 % | ~65 % | inconclusive (see note) |
+
+**STREAM — tokioloop % of asyncio (pinned median):**
+
+| Size   | Baseline | Step 1 | Δ |
+|--------|---------:|-------:|--:|
+| 1 KB   | 53.3 % | 55.2 % | +1.9 pp |
+| 10 KB  | 52.8 % | 54.5 % | +1.7 pp |
+| 100 KB | 47.5 % | 48.9 % | +1.4 pp |
+
+- The 1 KB / 10 KB PROTO gain is robust and repeatable across three runs — this
+  is the headline result.
+- **100 KB is within run-to-run noise**, not a regression: the same baseline
+  binary measured 61 % (unpinned) to 74 % (pinned) at 100 KB, overlapping
+  Step 1's ~65 %. There is no code-level mechanism for Step 1 to slow a single
+  100 KB echo (one buffer in flight ⇒ the greedy drain is identical to the old
+  single-pop path).
+- STREAM improves marginally and consistently.
+- **Correctness:** full `pytest tests` failure set is byte-for-byte identical
+  with and without the change (16 fails / 2 errors — all pre-existing
+  environment issues: IPv6 `::1` bind, UDP addressing, unix sockets, signals,
+  timer timing). TCP data-path tests pass (the one TCP failure is the known IPv6
+  env case).
+
+Committed as `perf(tcp): fuse + greedily drain the write arm in io_processing_loop`.
+
+### Next-step #4 done — profiling overturns the #2 hypothesis 🔎
+
+Profiled a live tokioloop PROTO server under 1 KB load with
+`py-spy record --native` (release build rebuilt with line-table debuginfo to
+symbolize Rust frames). Findings:
+
+- **The asyncio-style main event-loop thread is essentially idle** — parked in
+  `run_forever` on a parking_lot condvar. The per-message work runs on tokio
+  worker threads.
+- **Virtually all non-idle samples sit on one stack:** the per-message
+  `protocol.call_method1(py, "data_received", (PyBytes::new(..),))` in
+  `io_processing_loop` — i.e. the GIL-held `data_received → transport.write`
+  round-trip and the native allocation underneath it (`PyBytes::new`, the
+  read-side `to_vec()`, and `data.extract::<Vec<u8>>()` inside `write`).
+- The `select!` write/read **branch evaluation does not show up** as a cost.
+- Disabling glibc malloc trimming/mmap (`MALLOC_TRIM_THRESHOLD_=-1`,
+  `MALLOC_MMAP_MAX_=0`) produced **no** improvement, so the cost is the GIL
+  round-trip + copies themselves, not glibc arena thrashing.
+
+**Conclusion:** the original next-step **#2 (dedicated read/write tasks to reduce
+`select!` branch overhead) targets a bottleneck that the profile does not show**,
+and after Step 1 the PROTO path is already ~92–95 % of asyncio for 1–10 KB. It
+was therefore *not* implemented — doing so would add real teardown/deadlock risk
+(Step 1 itself hit a close-path deadlock during development) for no predicted
+gain. STREAM, not PROTO, is where the large remaining gap lives.
+
+---
+
+## Revised Next Steps
+
+Re-prioritized from the profiling evidence above. **STREAM is the real
+opportunity** (~48–55 % of asyncio); PROTO is close to parity for small/medium
+messages.
+
+### A. Bypass `asyncio.StreamReader` for the STREAM path *(highest value)*
+
+This is the original #3 and remains the only path to closing the STREAM gap. The
+STREAM overhead is the Python-level stream machinery (`StreamReader.feed_data` →
+`call_soon` waiter scheduling → `readline()` continuation), which adds event-loop
+hops the PROTO path does not have. A tokio-native stream/reader that feeds the
+Python `StreamReader` less often (or replaces it) is the lever. Larger change;
+prototype behind the existing transport so PROTO is unaffected.
+
+### B. Cut per-message copies in the PROTO/STREAM data path *(small, evidence-backed)*
+
+The profile puts the residual PROTO cost in per-message allocation. Concrete,
+low-risk reductions:
+- **Read arm:** `let data = read_buf[..n].to_vec();` then `PyBytes::new(py, &data)`
+  allocates and copies twice. Build `PyBytes::new(py, &read_buf[..n])` directly
+  and drop the intermediate `to_vec()` — removes one alloc+copy per message.
+- **Write path:** `data.extract::<Vec<u8>>(py)` copies every `transport.write`
+  payload into a fresh `Vec`. Investigate borrowing via the buffer protocol /
+  retaining the `Py<PyBytes>` to avoid the copy (must still own the bytes across
+  the `.await`).
+- Consider a non-glibc global allocator (mimalloc/jemalloc) **only if** a future
+  profile attributes time to `malloc`/`free` once the copies above are removed —
+  the env-var test above suggests the current allocator is not the bottleneck, so
+  this is speculative.
+
+### C. (Dropped) Dedicated read/write tasks per transport
+
+The original #2. **Not recommended** — profiling shows `select!` branch overhead
+is not a measurable cost, PROTO is already near parity post-Step 1, and the
+two-task split adds shutdown-ordering / `connection_lost`-once / deadlock risk.
+Revisit only if a future profile actually attributes time to the combined
+`select!`.
+
+### Notes for whoever picks this up
+
+- Benchmark on a quiet machine, or reuse the pinned + median methodology (server
+  on one core set, client on another, median of ≥5 runs); single unpinned runs in
+  CI swing ±15 pp and will mislead.
+- Re-symbolize with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+  CARGO_PROFILE_RELEASE_STRIP=false` before `py-spy --native`; the default release
+  profile is stripped (`debug = false`).
