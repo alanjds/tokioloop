@@ -4,6 +4,16 @@
 
 `claude/native-sock-option-perf-EyPqK` — based on `feat/native-sock-option-a`
 
+## Tracking / PRs
+
+- **#33** — proto single-copy `data_received` + corrected stream plan
+  (`claude/option-a-recv-improvements-KQaA4`).
+- **#35** — `TokioStreamReader` + stream transport-path profiling
+  (`claude/stream-reader-deque-opt`, stacked on #33). The profiling in this PR is what
+  redirected the stream work from "remove reader copies" to "remove the per-message
+  cross-thread GIL hop" (see *Profiling findings* below).
+- **Next** — in-batch task execution spike (candidate 1 below).
+
 ## Baseline (current branch, after Option A + EOF fix)
 
 | Target | Loop | 1KB | 10KB | 100KB |
@@ -81,13 +91,14 @@ io_processing_loop reads chunk [Rust]
         bytes(self._buffer[:isep+1])   ← COPY 2: bytearray → output bytes
 ```
 
-The two extra copies (one into the bytearray buffer, one out to the return value) explain
-the ~28% floor vs proto's ~69%.
+The plan assumed these two copies explain the ~28% stream floor vs proto's ~69%.
+**A controlled A/B (below) disproves that** — the copies are real but they are *not* the
+network bottleneck.
 
-> **Status:** NOT implemented. The original draft of this section had two blocking
-> defects (wrong wiring + a correctness bug). They are documented below so a future
-> effort starts from an accurate design. This is a larger, correctness-sensitive task,
-> not a quick win.
+> **Status:** ✅ reader implemented as `rloop/streams.py::TokioStreamReader`, wired via a
+> `asyncio.streams.StreamReader` monkeypatch in `rloop/loop.py`, covered by 24 tests in
+> `tests/test_streams.py`. The original draft of this section had two blocking defects
+> (wrong wiring + a correctness bug); both were corrected before implementing — see below.
 
 ### Wiring: there is no `loop.start_server` — patch `asyncio.streams.StreamReader`
 
@@ -141,22 +152,116 @@ version-fragile across 3.13/3.14 and GIL vs no-GIL; pin behaviour with tests on 
 
 ### Expected improvement and ceiling
 
-**Files:** `rloop/streams.py` (new), `rloop/loop.py` (install/remove the `StreamReader`
+**Files:** `rloop/streams.py` (new), `rloop/loop.py` (install the `StreamReader`
 monkeypatch alongside the existing event patches)  
-**Expected improvement:** stream ~28% → ~40-50% of asyncio
+**Original expectation:** stream ~28% → ~40-50% of asyncio
 
 **Ceiling note:** `readline()`'s return value still requires one join/copy to assemble the
 output bytes. Stream will always be one copy behind proto. Closing the gap further would
 require a Rust-backed line accumulator that delivers complete lines directly as `PyBytes`.
+
+### Results — the reader is faster in isolation but NOT the network bottleneck
+
+Validated on **Python 3.13.7** (built via uv + maturin):
+
+- **Isolated `readline` micro-benchmark** (best-of-5, data fed then consumed in-process,
+  no socket): `TokioStreamReader` vs stock `asyncio.StreamReader` —
+
+  | size | speedup |
+  |------|--------:|
+  | 1 KB | ~1.05x |
+  | 10 KB | ~1.6x |
+  | 100 KB | **~4.5x** |
+
+  The deque avoids the `feed_data` bytearray copy and returns whole-chunk lines zero-copy,
+  so the win grows with message size. The reader works exactly as designed.
+
+- **End-to-end network stream benchmark** (`asyncio.start_server` echo): a controlled,
+  interleaved A/B toggling only the reader (patch ON vs OFF, same TokioLoop, same session)
+  showed **no measurable difference** — tokioloop held ~2.7k rps (1 KB) / ~1.8k rps (100 KB)
+  either way, vs asyncio's ~10.5k. **Conclusion: the StreamReader copies are not what caps
+  the stream path.** The bottleneck is the tokioloop transport / event-loop path
+  (`io_processing_loop` → `data_received` → `StreamReaderProtocol` → `transport.write` →
+  `drain`, plus per-tick loop overhead).
+
+**Decision:** keep `TokioStreamReader` — it is correct, well-tested, faster in isolation,
+removes the copies this plan targeted, and is a zero-regression foundation for once the
+transport bottleneck is addressed. But it should not be sold as a stream-benchmark win.
+
+### Real next step (supersedes the original stream target)
+
+Profile and optimize the tokioloop **stream transport path**, which is what actually limits
+`start_server` throughput (~26% of asyncio here, ~the same as before this reader change):
+
+- The proto target shares `io_processing_loop` and reaches ~87% of asyncio, while stream sits
+  at ~26%. The delta is the `StreamReaderProtocol` + transport `write`/`drain` round-trip and
+  the extra event-loop hops per message — not the reader. Start by profiling a single
+  echo connection (e.g. `py-spy` / `cProfile` on the server) to attribute the per-message
+  cost, then target the dominant hop.
+
+### Profiling findings — the cost is an extra cross-thread GIL hand-off per message
+
+py-spy (on-CPU, Python; native run separately) on the echo **server** under a concurrency=1
+client, Python 3.13.7:
+
+| server (concurrency=1, 1 KB) | rps | on-CPU Python samples in 14 s |
+|------|----:|----:|
+| tokioloop **proto** | ~8,900 | **2** |
+| tokioloop **stream** | ~2,800 | 164 |
+| asyncio **stream** | ~9,700 | 2,035 |
+
+Two things stand out: (1) tokioloop does *far less* Python CPU work than asyncio yet is 3x
+slower on stream — so it is **not** Python-CPU-bound; the native profile shows the Python main
+thread parked in `epoll` inside `runtime.block_on`, i.e. **latency-bound**. (2) tokioloop proto
+captures ~0 Python samples but is 3x faster than tokioloop stream. The difference is structural,
+in the per-message critical path:
+
+- **Proto:** `io_processing_loop` task → `Python::attach` (GIL #1) → `data_received` →
+  `transport.write` — **one GIL acquire, one tokio task, no scheduler hop.**
+- **Stream:** `io_processing_loop` task → `Python::attach` (GIL #1) → `data_received` →
+  `feed_data` → `set_result(waiter)` → `call_soon(task.__step)` → `schedule_handle` sends to the
+  **`scheduler_tx` channel** → the `_run` task wakes on another tokio worker → `attach_blocking`
+  (GIL #2) → runs `task.__step` → `echo_client_streams` resumes → `readline` returns →
+  `writer.write`. **Two GIL acquires across two tokio tasks + a channel round-trip + a tokio task
+  wakeup per message.**
+
+`call_soon` (and therefore every Future→Task wakeup, e.g. waking the parked `readline`) always
+routes through `scheduler_tx` to the `_run` task (`src/tokio_event_loop.rs:669` →
+`schedule_handle`). At concurrency=1 the throughput is `1 / round-trip-latency`, so that extra
+cross-thread GIL bounce directly accounts for the proto↔stream gap. The asyncio reference pays
+none of this — its loop, reader wakeup and write all run inline on one thread.
+
+### Candidate optimizations (to spike + measure next)
+
+1. **In-batch task execution (highest value, most invasive).** After a callback scheduled via
+   `call_soon` is enqueued while a GIL batch is already running (e.g. `data_received` inside
+   `io_processing_loop`'s `Python::attach`), drain and run the just-scheduled handles **in the
+   same GIL hold on the same thread**, instead of bouncing to the `_run` task. Collapses GIL #1+#2
+   into one and removes the channel round-trip for the common "data arrives → wake the reader →
+   write" pattern. Risk: must preserve asyncio's single-threaded, sequential-callback invariant
+   (one drainer at a time; GIL serializes Python but ordering/fairness/timer-starvation need care).
+2. **Re-drain within `_run`'s batch.** The normal `_run` path runs `current_handles` once then
+   returns to `select!`; chained `call_soon`s incur a channel round-trip to itself. Adding a
+   re-drain loop inside the `attach_blocking` (as the teardown path at lines 598–639 already does)
+   lets chained callbacks run in one GIL hold. Smaller/safer, but does not remove the *first*
+   `io_processing_loop → _run` cross-task hop, so likely a partial win for streams.
+3. **Unify connection reads into the `_run` task** so `data_received` and the woken user task run
+   on the same task/thread (no cross-task hand-off). Largest refactor.
+
+Recommended: spike (1) behind measurement; fall back to (2) if (1) proves too invasive.
 
 ---
 
 ## Implementation Order
 
 1. **Proto fix** — recompile, run tests, benchmark to confirm improvement. ✅ done.
-2. **Stream fix (future)** — install the `asyncio.streams.StreamReader` monkeypatch, implement a
-   reader that owns the full consumption API, add tests for `read`/`readexactly`/`readuntil`/
-   `readline` on 3.13+ (GIL and no-GIL), then benchmark.
+2. **Stream reader** — `asyncio.streams.StreamReader` monkeypatch + full-consumption-API
+   deque reader + 24 tests on 3.13. ✅ done (correct + isolated-faster; network-neutral).
+3. **Stream transport path** — profiled (see findings above): the bottleneck is an extra
+   cross-thread GIL hand-off per message (`io_processing_loop` → `scheduler_tx` → `_run`). ✅
+   diagnosed.
+4. **In-batch task execution (next)** — spike candidate (1) above to collapse the per-message
+   double GIL acquire / channel round-trip, measured against the proto/stream benchmarks.
 
 ---
 
@@ -174,8 +279,16 @@ python benchmarks/benchmarks.py raw proto stream
 ```
 
 Targets:
-- proto ≥ 75% across all message sizes (this change)
-- stream ≥ 40% across all message sizes (future stream work)
+- proto ≥ 75% across all message sizes — met (~87%).
+- stream: reader correctness (24 tests pass) + no end-to-end regression. The ~40% network
+  target is deferred to the transport-path work (the reader alone does not move it).
+
+Also run the reader-only checks:
+
+```bash
+pytest tests/test_streams.py -q            # 24 correctness tests vs stock StreamReader
+python benchmarks/micro_readline.py        # isolated readline speedup (see Results)
+```
 
 ---
 
