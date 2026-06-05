@@ -117,7 +117,7 @@ impl LoopHandlers {
 pub struct TEventLoop {
     runtime: OnceLock<Arc<Runtime>>,
     pub(crate) scheduler_tx: async_channel::Sender<ScheduledTask>,
-    scheduler_rx: async_channel::Receiver<ScheduledTask>,
+    pub(crate) scheduler_rx: async_channel::Receiver<ScheduledTask>,
     counter_ready: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
     stopping: Arc<atomic::AtomicBool>,
@@ -149,6 +149,15 @@ impl TEventLoop {
                 self.exception_handler.read().unwrap().clone_ref(py),
             ),
         )
+    }
+
+    /// Build a `LoopHandlers` clone so other tokio tasks (e.g. the per-connection
+    /// io_processing_loop) can run scheduled handles in-place under their own GIL hold.
+    pub(crate) fn loop_handlers(&self) -> LoopHandlers {
+        LoopHandlers {
+            exc_handler: Arc::clone(&self.exc_handler),
+            exception_handler: Arc::clone(&self.exception_handler),
+        }
     }
 
     pub fn schedule0(&self, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {

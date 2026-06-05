@@ -17,8 +17,8 @@ use socket2::{Domain, Type};
 use async_channel;
 
 use crate::{
-    tokio_event_loop::{TEventLoop, ScheduledTask},
-    tokio_handles::{RustCallHandle, TBoxedHandle},
+    tokio_event_loop::{TEventLoop, ScheduledTask, LoopHandlers, TEventLoopRunState},
+    tokio_handles::{RustCallHandle, TBoxedHandle, THandle},
     py::{sock, attach_blocking},
 };
 
@@ -164,10 +164,14 @@ impl TokioTCPTransport {
 
         let runtime = pyloop.borrow(py).get_runtime();
         let scheduler_tx = pyloop.borrow(py).scheduler_tx.clone();
+        // SPIKE (candidate #1): receiver + handlers so the io loop can run the callbacks
+        // that data_received just scheduled, in-place, without bouncing to the _run task.
+        let scheduler_rx = pyloop.borrow(py).scheduler_rx.clone();
+        let handlers = pyloop.borrow(py).loop_handlers();
 
         let state_clone = state.clone();
         let io_task = runtime.spawn(async move {
-            Self::io_processing_loop(transport_clone, state_clone, protocol, resume_notify, write_notify, scheduler_tx).await;
+            Self::io_processing_loop(transport_clone, state_clone, protocol, resume_notify, write_notify, scheduler_tx, scheduler_rx, handlers).await;
         });
 
         {
@@ -185,6 +189,8 @@ impl TokioTCPTransport {
         resume_notify: Arc<Notify>,
         write_notify: Arc<Notify>,
         scheduler_tx: async_channel::Sender<ScheduledTask>,
+        scheduler_rx: async_channel::Receiver<ScheduledTask>,
+        handlers: LoopHandlers,
     ) {
         // 64KB read buffer — 8x fewer syscalls for large messages vs 8KB
         let mut read_buf = [0u8; 65536];
@@ -247,6 +253,41 @@ impl TokioTCPTransport {
                                     pyo3::intern!(py, "data_received"),
                                     (PyBytes::new(py, &read_buf[..n]),)
                                 );
+
+                                // SPIKE (candidate #1): in-batch task execution.
+                                // data_received may have woken a Future (e.g. a parked
+                                // StreamReader.readline waiter), which schedules the user
+                                // task's __step via call_soon -> scheduler channel. Normally
+                                // the _run task picks that up on another worker thread, paying
+                                // a second GIL acquire + a cross-thread hop per message. Here we
+                                // drain those just-scheduled Immediate handles and run them in
+                                // THIS GIL hold on THIS thread, so readline returns and
+                                // writer.write fires before we release the GIL — mirroring the
+                                // proto path (data_received -> write in one attach).
+                                //
+                                // NOTE: spike-grade. Correct for a single connection; for the
+                                // general multi-connection loop this needs a single-drainer
+                                // guarantee + FIFO preservation (see plan). Non-Immediate tasks
+                                // are forwarded back to _run untouched.
+                                let state = TEventLoopRunState {};
+                                let mut budget = 0u32;
+                                while let Ok(task) = scheduler_rx.try_recv() {
+                                    match task {
+                                        ScheduledTask::Immediate { handle } => {
+                                            if !handle.cancelled() {
+                                                let _ = handle.run(py, &handlers, &state);
+                                            }
+                                        }
+                                        other => {
+                                            // Timers / RecvReady belong to the _run loop.
+                                            let _ = scheduler_tx.try_send(other);
+                                        }
+                                    }
+                                    budget += 1;
+                                    if budget >= 256 {
+                                        break;
+                                    }
+                                }
                             });
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
