@@ -4,6 +4,16 @@
 
 `claude/native-sock-option-perf-EyPqK` — based on `feat/native-sock-option-a`
 
+## Tracking / PRs
+
+- **#33** — proto single-copy `data_received` + corrected stream plan
+  (`claude/option-a-recv-improvements-KQaA4`).
+- **#35** — `TokioStreamReader` + stream transport-path profiling
+  (`claude/stream-reader-deque-opt`, stacked on #33). The profiling in this PR is what
+  redirected the stream work from "remove reader copies" to "remove the per-message
+  cross-thread GIL hop" (see *Profiling findings* below).
+- **Next** — in-batch task execution spike (candidate 1 below).
+
 ## Baseline (current branch, after Option A + EOF fix)
 
 | Target | Loop | 1KB | 10KB | 100KB |
