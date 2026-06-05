@@ -320,3 +320,134 @@ Revisit only if a future profile actually attributes time to the combined
 - Re-symbolize with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
   CARGO_PROFILE_RELEASE_STRIP=false` before `py-spy --native`; the default release
   profile is stripped (`debug = false`).
+
+---
+
+# Detailed Improvement Plan — STREAM (expands revised next-step A)
+
+STREAM is the only path with real headroom (~48–58 % of asyncio here; uvloop
+reaches ~85–90 % on the original machine). This section is the concrete,
+staged plan for closing it. **uvloop reaching ~90 % with the *same*
+`asyncio.StreamReader` is the key fact: the bottleneck is not StreamReader's
+Python code, it is how tokioloop delivers reads to it and schedules the
+continuation.** Bypassing StreamReader is therefore the *last* resort, not the
+first move.
+
+## Root cause: cross-thread delivery + double GIL per echo
+
+Trace one STREAM echo (`data = await reader.readline(); writer.write(data)`):
+
+1. **tokio worker thread** (`io_processing_loop` read arm, `src/tokio_tcp.rs`
+   ~line 239): `Python::attach` → `StreamReaderProtocol.data_received` →
+   `StreamReader.feed_data` → wakes the `readline()` waiter Future →
+   `Future.set_result` → **`loop.call_soon`** (the continuation handle).
+2. `call_soon` (`src/tokio_event_loop.rs:850` → `schedule_handle` ~:459):
+   `copy_context` (a `PyContext_CopyCurrent` FFI call), `Py::new(TCBHandle)`
+   (alloc), then `scheduler_tx.try_send` onto the **unbounded async-channel**.
+3. **`_run` thread** (`src/tokio_event_loop.rs:630` select loop): `recv`s the
+   handle, `attach_blocking` (**second GIL acquisition**), runs the `readline`
+   continuation → coroutine resumes → `writer.write` → `transport.write`
+   (enqueue + `write_notify`).
+4. tokio worker write arm sends the bytes.
+
+Versus PROTO, which does `data_received → transport.write` in **one** `attach`
+on the worker thread with **no** scheduler hop. So STREAM's per-echo tax is:
+**one cross-thread channel hop + a second GIL acquisition + a `copy_context` +
+a handle allocation.**
+
+Why uvloop avoids it: in asyncio/uvloop, `data_received` runs **on the loop
+thread**, so `feed_data → call_soon → continuation` is a same-thread C-level
+deque append with a single GIL section. tokioloop runs IO on tokio workers, so
+the wakeup must cross threads and re-acquire the GIL. **This is the structural
+gap to attack.**
+
+> Before writing code, **profile STREAM to confirm and rank these costs** — all
+> PROTO profiling so far does *not* cover the scheduler/`call_soon` path. Run
+> `py-spy record --native` against a live tokioloop STREAM server (1 KB), and
+> sample **both** the tokio worker threads and the `_run` thread. Attribute time
+> to: `copy_context`, handle alloc, `async_channel` send/recv, the two GIL
+> acquisitions, and `StreamReader` Python frames. The stage ordering below is the
+> expected ranking; let the profile reorder it.
+
+## Staged plan (each stage benchmark-gated; abort if no measurable gain)
+
+### Stage 0 — STREAM profiling + a trustworthy harness *(prerequisite)*
+
+- Add a STREAM mode to the interleaved hot-swap A/B harness (the only
+  trustworthy method here — see "Notes" above): build each variant's `.so`
+  once, hot-swap `rloop/_rloop.*.so` per rep, measure all variants back-to-back,
+  aggregate per-rep medians, server/client pinned to disjoint cores.
+- Capture the `py-spy --native` breakdown described above. **Deliverable:** a
+  ranked cost table that confirms (or corrects) the root-cause analysis.
+
+### Stage 1 — Make the `call_soon`/scheduling path cheaper *(low risk)*
+
+Targets in `src/tokio_event_loop.rs` `call_soon`/`call_soon_threadsafe`/
+`schedule_handle`:
+
+- **Skip `copy_context` on the fast path.** `copy_context` runs
+  `PyContext_CopyCurrent` on every `call_soon` (line 851/869). When the caller
+  passes no context and the current context is the default, asyncio reuses the
+  current context rather than copying. Match that: avoid the copy when it is not
+  observably needed (verify against CPython's `Handle` semantics).
+- **Cut the per-handle allocation.** Each `call_soon` does `Py::new(TCBHandle)`
+  + `into_py_any`. Consider a lighter handle representation or pooling for the
+  hot immediate path.
+- **Confirm batching actually triggers.** `_run` already greedily drains the
+  channel (`try_recv` loop, lines 639/649) and runs a batch under one
+  `attach_blocking`. For 1-in-flight echo the batch size is 1, so batching does
+  not help concurrency=1 — note this and do not over-invest here.
+
+Exit criterion: a measurable (≥3–5 % interleaved) STREAM gain. If `copy_context`
+is not hot in the Stage 0 profile, skip Stage 1 entirely.
+
+### Stage 2 — Remove the cross-thread hop / second GIL *(the real lever, higher risk)*
+
+The structural fix is to run the woken `readline` continuation **in the same GIL
+section as the `data_received` that woke it**, instead of bouncing a handle
+through `scheduler_tx` to the `_run` thread. Options, cheapest first:
+
+- **2a. Drain-and-run ready callbacks inline on the worker.** After
+  `io_processing_loop`'s `data_received` returns (still holding the GIL on the
+  worker thread), drain the immediate-handle queue and run the just-scheduled
+  continuation(s) inline, rather than sending them to `_run`. Saves the channel
+  hop and the second GIL acquisition. **Risk:** asyncio guarantees callbacks run
+  on the loop thread in FIFO order; running them on a worker thread can violate
+  ordering / reentrancy assumptions and race with `_run` draining the same
+  queue. Must be gated to stream transports and carefully serialized (e.g. only
+  when `_run` is parked, or via a per-loop "callbacks may run here" handoff).
+  Prototype behind a flag; verify with the full `pytest tests` suite, not just
+  the echo benchmark.
+- **2b. Process stream-transport reads on the loop thread** (uvloop's model):
+  deliver `data_received` for stream transports on the `_run` thread so
+  `feed_data → call_soon → continuation` is a single-thread, single-GIL section.
+  Larger architectural change to how `io_processing_loop` hands data off; keep
+  PROTO on its current worker-thread path (it is already near parity).
+
+Exit criterion: STREAM moves toward uvloop's relative standing. If neither 2a nor
+2b clears the interleaved-noise floor, stop and record the negative result — do
+not ship complexity for noise (the lesson from the Follow-up section above).
+
+### Stage 3 — tokio-native reader bypassing `StreamReader` *(last resort)*
+
+Only if Stage 0 profiling shows `StreamReader`'s own Python frames
+(`feed_data`/`_wakeup_waiter`/`readline` buffering) are genuinely hot **after**
+Stages 1–2. Provide a Rust object exposing `read`/`readline`/`readexactly` that
+the user awaits directly, fed by the tokio read task without asyncio's
+`call_soon` waiter machinery. This is a large change with an API surface to keep
+compatible; defer unless the profile demands it.
+
+## Guardrails
+
+- **Correctness first:** every stage must keep the full `pytest tests` failure
+  set identical to baseline (the known pre-existing env failures only). Stage 2
+  especially can break loop-thread/ordering invariants that the echo benchmark
+  will not catch — run the whole suite, including the SSL/UDP/streams tests.
+- **Measure only with interleaved hot-swap A/B**; treat anything below ~3–5 % as
+  noise on this box.
+- **Keep PROTO untouched** — it is GIL-gated and effectively done; isolate STREAM
+  changes (flag or stream-transport-only path) so a STREAM experiment cannot
+  regress PROTO.
+- **Define the target up front:** e.g. "close half the STREAM gap to asyncio
+  (≈48–58 % → ≥75 %) at 1 KB/10 KB, no PROTO regression, suite green." Stop when
+  hit or when a stage shows no measurable movement.
