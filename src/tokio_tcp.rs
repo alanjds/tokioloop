@@ -237,12 +237,15 @@ impl TokioTCPTransport {
                             });
                         }
                         Ok(n) => {
-                            let data = read_buf[..n].to_vec();
+                            // Pass the stack read buffer slice straight to PyBytes::new.
+                            // PyBytes::new copies into Python-managed memory, so no
+                            // intermediate Vec is needed — saves one heap alloc + memcpy
+                            // per read on the proto/create_server data_received path.
                             Python::attach(|py| {
                                 let _ = protocol.call_method1(
                                     py,
                                     pyo3::intern!(py, "data_received"),
-                                    (PyBytes::new(py, &data),)
+                                    (PyBytes::new(py, &read_buf[..n]),)
                                 );
                             });
                         }
