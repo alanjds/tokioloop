@@ -237,12 +237,14 @@ impl TokioTCPTransport {
                             });
                         }
                         Ok(n) => {
-                            let data = read_buf[..n].to_vec();
+                            // Build PyBytes straight from the read buffer — no intermediate
+                            // Vec. read_buf is only borrowed (immutably) for the duration of
+                            // the attach; the &mut borrow for the next read() starts after.
                             Python::attach(|py| {
                                 let _ = protocol.call_method1(
                                     py,
                                     pyo3::intern!(py, "data_received"),
-                                    (PyBytes::new(py, &data),)
+                                    (PyBytes::new(py, &read_buf[..n]),)
                                 );
                             });
                         }
