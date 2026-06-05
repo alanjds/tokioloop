@@ -1392,6 +1392,21 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
             return True
         return False
 
+    @classmethod
+    def _patch_asyncio_streams_stream_reader(cls) -> bool:
+        # asyncio.start_server builds asyncio.streams.StreamReader directly (there is no
+        # loop.start_server to override), so swap the module-level class for the deque-backed
+        # TokioStreamReader. It is a correct drop-in, so this global patch is safe for any loop.
+        import asyncio.streams as _streams
+
+        from .streams import TokioStreamReader
+
+        if not hasattr(_streams, '_ORIGINAL_StreamReader'):
+            _streams._ORIGINAL_StreamReader = _streams.StreamReader  # type: ignore[attr-defined]
+            _streams.StreamReader = TokioStreamReader  # type: ignore[assignment]
+            return True
+        return False
+
     def __init__(self):
         if not isinstance(asyncio.get_event_loop_policy(), TokioLoopPolicy):
             logger.info('Setting TokioLoopPolicy as default event loop policy')
@@ -1402,6 +1417,9 @@ class TokioLoop(_BaseRustLoop, __TokioBaseLoop, __asyncio.AbstractEventLoop):
 
         if self.__class__._patch_asyncio_events_get_event_loop():
             logger.info('Patched asyncio.events.get_event_loop() for %s', self.__class__.__name__)
+
+        if self.__class__._patch_asyncio_streams_stream_reader():
+            logger.info('Patched asyncio.streams.StreamReader for %s', self.__class__.__name__)
 
         _register_tokio_thread(self, setcurrent=False)
         asyncio.get_event_loop_policy().set_event_loop(self)
