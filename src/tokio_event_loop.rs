@@ -1,11 +1,14 @@
 use std::{
-    collections::{BinaryHeap, VecDeque},
-    os::fd::{FromRawFd, OwnedFd},
+    collections::{BinaryHeap, HashMap, VecDeque},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    pin::Pin,
     sync::{atomic, Arc, Mutex, OnceLock, RwLock},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
+use futures::Stream;
 use pyo3::prelude::*;
 use std::sync::atomic::AtomicBool;
 use tokio::{runtime::Runtime, task::JoinHandle, net::UnixStream};
@@ -25,14 +28,221 @@ use pyo3::IntoPyObjectExt;
 // This prevents Py<T> from being dropped on a tokio worker thread without the GIL.
 type PyCallbackEntry = Arc<Mutex<Option<(Py<PyAny>, Py<PyAny>, Py<PyAny>)>>>;
 
-// Messages sent to persistent per-fd native sock workers.
-// The worker resolves the asyncio Future via the scheduler when I/O completes.
-enum SockRecvMsg {
-    Recv { nbytes: usize, fut: Py<PyAny> },
+// Non-owning fd wrapper — AsyncFd<BorrowedFd> tracks epoll interest without
+// closing the underlying fd on drop (the Python socket owns the fd lifetime).
+struct BorrowedFd(i32);
+
+impl AsRawFd for BorrowedFd {
+    fn as_raw_fd(&self) -> RawFd { self.0 }
 }
 
-enum SockSendMsg {
-    SendAll { data: Vec<u8>, fut: Py<PyAny> },
+// Persistent per-fd set for Option B: AsyncFd is created once per fd and
+// reused across multiple EAGAIN events, saving dup+epoll_ctl ADD/DEL per EAGAIN.
+struct ReadPollSet {
+    // fd → (persistent AsyncFd, Option<pending (nbytes, fut)>)
+    fds: HashMap<i32, (tokio::io::unix::AsyncFd<BorrowedFd>, Option<(usize, Py<PyAny>)>)>,
+    pending_count: usize,
+}
+
+impl ReadPollSet {
+    fn new() -> Self {
+        Self { fds: HashMap::new(), pending_count: 0 }
+    }
+
+    fn add(&mut self, fd: i32, nbytes: usize, fut: Py<PyAny>) {
+        match self.fds.get_mut(&fd) {
+            Some(entry) => {
+                // Reuse existing AsyncFd — no syscall needed
+                if entry.1.is_none() { self.pending_count += 1; }
+                entry.1 = Some((nbytes, fut));
+            }
+            None => {
+                if let Ok(async_fd) = tokio::io::unix::AsyncFd::new(BorrowedFd(fd)) {
+                    self.fds.insert(fd, (async_fd, Some((nbytes, fut))));
+                    self.pending_count += 1;
+                }
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool { self.pending_count == 0 }
+}
+
+impl futures::Stream for ReadPollSet {
+    // (future, Ok(received data) or Err(io error))
+    // recv() is done here while the ReadyGuard is held:
+    // try_io clears ready on success but RETAINS it on EAGAIN (spurious wakeup),
+    // so the next poll_read_ready fires immediately and we retry.
+    type Item = (Py<PyAny>, Result<Vec<u8>, std::io::Error>);
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let me = self.get_mut();
+        for (&fd, (async_fd, maybe_pending)) in me.fds.iter_mut() {
+            if maybe_pending.is_none() { continue; }
+            // Inner retry loop: after a spurious EAGAIN + clear_ready(), re-poll
+            // immediately so that the waker is registered via the Poll::Pending path.
+            loop {
+                match async_fd.poll_read_ready(cx) {
+                    Poll::Ready(Ok(mut guard)) => {
+                        let nbytes = maybe_pending.as_ref().unwrap().0;
+                        let mut avail: libc::c_int = 0;
+                        unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) };
+                        let alloc_size = (avail as usize).min(nbytes).max(1);
+                        let mut buf = vec![0u8; alloc_size];
+                        let ptr = buf.as_mut_ptr() as *mut libc::c_void;
+                        let io_result = guard.try_io(|_| {
+                            let k = unsafe { libc::recv(fd, ptr, alloc_size, 0) };
+                            if k >= 0 { Ok(k as usize) } else { Err(std::io::Error::last_os_error()) }
+                        });
+                        match io_result {
+                            Ok(Ok(k)) => {
+                                buf.truncate(k);
+                                let (_, fut) = maybe_pending.take().unwrap();
+                                me.pending_count -= 1;
+                                return Poll::Ready(Some((fut, Ok(buf))));
+                            }
+                            Ok(Err(e)) => {
+                                let (_, fut) = maybe_pending.take().unwrap();
+                                me.pending_count -= 1;
+                                return Poll::Ready(Some((fut, Err(e))));
+                            }
+                            Err(_would_block) => {
+                                // Spurious wakeup (EPOLLIN fired but buffer is empty).
+                                // clear_ready() resets internal readiness. Loop back to
+                                // poll_read_ready so the Poll::Pending path registers
+                                // the waker for the next real EPOLLIN event.
+                                guard.clear_ready();
+                                // continue inner loop → poll_read_ready again
+                            }
+                        }
+                    }
+                    Poll::Ready(Err(e)) => {
+                        let (_, fut) = maybe_pending.take().unwrap();
+                        me.pending_count -= 1;
+                        return Poll::Ready(Some((fut, Err(e))));
+                    }
+                    Poll::Pending => {
+                        break; // waker registered, move to next fd
+                    }
+                }
+            }
+        }
+        Poll::Pending
+    }
+}
+
+// Persistent per-fd set for sock_sendall EAGAIN handling, mirroring ReadPollSet.
+// Uses OwnedFd (from dup) so its epoll registration doesn't conflict with
+// ReadPollSet's BorrowedFd registration on the same original fd.
+struct WritePollSet {
+    // fd_orig → (AsyncFd on dup'd fd, Option<pending (data, offset, fut)>)
+    fds: HashMap<i32, (tokio::io::unix::AsyncFd<OwnedFd>, Option<(Vec<u8>, usize, Py<PyAny>)>)>,
+    pending_count: usize,
+}
+
+impl WritePollSet {
+    fn new() -> Self { Self { fds: HashMap::new(), pending_count: 0 } }
+
+    // Returns Some((fut, error)) if setup fails (dup or AsyncFd creation);
+    // caller should resolve the future with that error.
+    fn add(&mut self, fd: i32, data: Vec<u8>, fut: Py<PyAny>)
+        -> Option<(Py<PyAny>, std::io::Error)>
+    {
+        match self.fds.get_mut(&fd) {
+            Some(entry) => {
+                if entry.1.is_none() { self.pending_count += 1; }
+                entry.1 = Some((data, 0, fut));
+                None
+            }
+            None => {
+                let fd_dup = unsafe { libc::dup(fd) };
+                if fd_dup < 0 {
+                    return Some((fut, std::io::Error::last_os_error()));
+                }
+                let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
+                match tokio::io::unix::AsyncFd::with_interest(
+                    owned, tokio::io::Interest::WRITABLE,
+                ) {
+                    Ok(async_fd) => {
+                        self.fds.insert(fd, (async_fd, Some((data, 0, fut))));
+                        self.pending_count += 1;
+                        None
+                    }
+                    Err(e) => Some((fut, e)),
+                }
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool { self.pending_count == 0 }
+}
+
+impl futures::Stream for WritePollSet {
+    // (future, Ok(()) = all bytes sent  |  Err(e) = I/O error)
+    type Item = (Py<PyAny>, Result<(), std::io::Error>);
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let me = self.get_mut();
+        for (&fd, (async_fd, maybe_pending)) in me.fds.iter_mut() {
+            if maybe_pending.is_none() { continue; }
+            // Inner retry loop: after EAGAIN + clear_ready(), re-poll immediately
+            // so that Poll::Pending registers the waker (same pattern as ReadPollSet).
+            loop {
+                match async_fd.poll_write_ready(cx) {
+                    Poll::Ready(Ok(mut guard)) => {
+                        let (data, offset, _) = maybe_pending.as_mut().unwrap();
+                        // Greedy send: keep sending until EAGAIN or all bytes flushed.
+                        // Avoid try_io so we don't prematurely clear_ready on partial sends.
+                        let outcome = 'send: loop {
+                            let n = unsafe {
+                                libc::send(
+                                    fd,
+                                    data[*offset..].as_ptr() as *const libc::c_void,
+                                    data.len() - *offset,
+                                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                                )
+                            };
+                            if n > 0 {
+                                *offset += n as usize;
+                                if *offset >= data.len() { break 'send Ok(true); }
+                                continue 'send; // more to send, loop immediately
+                            }
+                            let e = std::io::Error::last_os_error();
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                break 'send Ok(false); // EAGAIN
+                            }
+                            break 'send Err(e);
+                        };
+                        guard.clear_ready();
+                        match outcome {
+                            Ok(true) => {
+                                let (_, _, fut) = maybe_pending.take().unwrap();
+                                me.pending_count -= 1;
+                                return Poll::Ready(Some((fut, Ok(()))));
+                            }
+                            Ok(false) => {
+                                // EAGAIN: loop back → poll_write_ready → Poll::Pending
+                            }
+                            Err(e) => {
+                                let (_, _, fut) = maybe_pending.take().unwrap();
+                                me.pending_count -= 1;
+                                return Poll::Ready(Some((fut, Err(e))));
+                            }
+                        }
+                    }
+                    Poll::Ready(Err(e)) => {
+                        let (_, _, fut) = maybe_pending.take().unwrap();
+                        me.pending_count -= 1;
+                        return Poll::Ready(Some((fut, Err(e))));
+                    }
+                    Poll::Pending => {
+                        break; // waker registered, move to next fd
+                    }
+                }
+            }
+        }
+        Poll::Pending
+    }
 }
 
 // Timer with absolute timestamp (like RLoop)
@@ -111,6 +321,74 @@ impl LoopHandlers {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2a: inline-drain of woken continuations on the IO worker thread.
+//
+// For the STREAM path, `data_received` runs on a tokio worker and calls
+// `StreamReader.feed_data` -> `loop.call_soon(continuation)`. Normally that
+// continuation handle is sent across `scheduler_tx` to the `_run` thread, which
+// re-acquires the GIL to run it: a cross-thread hop plus a *second* GIL section
+// per echo. asyncio/uvloop avoid this by running the read, `data_received`, and
+// the continuation in one GIL section on one thread.
+//
+// To match that, `io_processing_loop` installs a thread-local "inline sink"
+// around its `data_received` call. While installed, `schedule_handle` diverts
+// *immediate* handles into the sink instead of the channel. The worker then runs
+// the captured handles in the SAME `Python::attach`, eliminating the hop and the
+// second GIL acquisition. The sink is taken (set to None) before running, so any
+// `call_soon` issued by the continuations themselves falls back to the channel
+// and runs on `_run` next iteration -- preserving asyncio's deferral semantics
+// and bounding inline work to the directly-woken continuations. PROTO is
+// unaffected: its `data_received` schedules no immediate handle, so the sink
+// stays empty and the inline run is a no-op.
+thread_local! {
+    static INLINE_SINK: std::cell::RefCell<Option<VecDeque<TBoxedHandle>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+pub(crate) fn inline_sink_install() {
+    INLINE_SINK.with(|s| {
+        let mut b = s.borrow_mut();
+        if b.is_none() {
+            *b = Some(VecDeque::new());
+        }
+    });
+}
+
+#[inline]
+pub(crate) fn inline_sink_take() -> Option<VecDeque<TBoxedHandle>> {
+    INLINE_SINK.with(|s| s.borrow_mut().take())
+}
+
+/// Push an immediate handle into the inline sink if one is installed on this
+/// thread. Returns the handle back in `Err` when no sink is active.
+#[inline]
+fn inline_sink_try_push(handle: TBoxedHandle) -> Result<(), TBoxedHandle> {
+    INLINE_SINK.with(|s| {
+        let mut b = s.borrow_mut();
+        match b.as_mut() {
+            Some(q) => {
+                q.push_back(handle);
+                Ok(())
+            }
+            None => Err(handle),
+        }
+    })
+}
+
+/// Gate for the Stage 2a inline path. **On by default**; set
+/// `TOKIOLOOP_INLINE_STREAM=0` (or `false`) to fall back to the legacy
+/// scheduler-hop path. Read once and runtime-toggleable (no rebuild).
+pub(crate) fn inline_stream_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("TOKIOLOOP_INLINE_STREAM")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
+    })
+}
+
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub struct TEventLoop {
     runtime: OnceLock<Arc<Runtime>>,
@@ -132,10 +410,12 @@ pub struct TEventLoop {
     // I/O watcher tasks, keyed by fd
     io_reader_entries: Arc<papaya::HashMap<usize, (CancellationToken, PyCallbackEntry)>>,
     io_writer_entries: Arc<papaya::HashMap<usize, (CancellationToken, PyCallbackEntry)>>,
-    // Persistent native sock workers: one long-lived task per fd, reused across calls.
-    // Eliminates per-request task-spawn and epoll_ctl overhead vs the v1 approach.
-    sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
-    sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
+    // Option B: pending sock_recv / sock_sendall calls queued on EAGAIN,
+    // polled directly in _run's select! loop via ReadPollSet / WritePollSet.
+    pending_reads: Arc<Mutex<HashMap<i32, (usize, Py<PyAny>)>>>,
+    pending_reads_notify: Arc<tokio::sync::Notify>,
+    pending_writes: Arc<Mutex<HashMap<i32, (Vec<u8>, Py<PyAny>)>>>,
+    pending_writes_notify: Arc<tokio::sync::Notify>,
 }
 
 impl TEventLoop {
@@ -254,8 +534,16 @@ impl TEventLoop {
             };
             ScheduledTask::Delayed { timer }
         } else {
-            ScheduledTask::Immediate {
-                handle: Box::new(handle)
+            // Stage 2a: when an inline sink is installed on this thread (only inside
+            // io_processing_loop's data_received window), capture the immediate handle
+            // for same-GIL inline execution instead of crossing the scheduler channel.
+            let boxed: TBoxedHandle = Box::new(handle);
+            match inline_sink_try_push(boxed) {
+                Ok(()) => {
+                    log::trace!("Immediate task captured by inline sink");
+                    return Ok(());
+                }
+                Err(boxed) => ScheduledTask::Immediate { handle: boxed },
             }
         };
 
@@ -268,6 +556,26 @@ impl TEventLoop {
         Ok(())
     }
 
+    /// Stage 2a: run handles captured by the inline sink in the current GIL
+    /// section, using the loop's exception handlers. Mirrors the per-handle
+    /// execution `_run` does, so semantics (cancellation check, exception
+    /// logging) match. Re-entrancy is safe because `TEventLoop` is `frozen`.
+    pub(crate) fn run_handles_inline(&self, py: Python, handles: VecDeque<TBoxedHandle>) {
+        if handles.is_empty() {
+            return;
+        }
+        let handlers = LoopHandlers {
+            exc_handler: Arc::clone(&self.exc_handler),
+            exception_handler: Arc::clone(&self.exception_handler),
+        };
+        let state = TEventLoopRunState {};
+        for handle in handles {
+            if !handle.cancelled() {
+                handle.run(py, &handlers, &state);
+            }
+        }
+    }
+
     pub fn get_runtime(&self) -> Arc<Runtime> {
         let runtime = self.runtime.get()
             .expect("Runtime not initialized - call initialize_runtime first")
@@ -275,45 +583,6 @@ impl TEventLoop {
         runtime
     }
 
-    /// Return the Sender for the persistent reader worker for `fd`, spawning one if needed.
-    fn get_or_spawn_reader(&self, fd: i32) -> PyResult<async_channel::Sender<SockRecvMsg>> {
-        let pin = self.sock_readers.pin();
-        if let Some(tx) = pin.get(&(fd as usize)) {
-            return Ok(tx.clone());
-        }
-        drop(pin);
-        let fd_dup = unsafe { libc::dup(fd) };
-        if fd_dup < 0 {
-            return Err(PyErr::from(std::io::Error::last_os_error()));
-        }
-        let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
-        let (tx, rx) = async_channel::bounded::<SockRecvMsg>(2);
-        let scheduler_tx = self.scheduler_tx.clone();
-        let sock_readers = Arc::clone(&self.sock_readers);
-        self.get_runtime().spawn(sock_reader_task(fd, owned, rx, scheduler_tx, sock_readers));
-        self.sock_readers.pin().insert(fd as usize, tx.clone());
-        Ok(tx)
-    }
-
-    /// Return the Sender for the persistent writer worker for `fd`, spawning one if needed.
-    fn get_or_spawn_writer(&self, fd: i32) -> PyResult<async_channel::Sender<SockSendMsg>> {
-        let pin = self.sock_writers.pin();
-        if let Some(tx) = pin.get(&(fd as usize)) {
-            return Ok(tx.clone());
-        }
-        drop(pin);
-        let fd_dup = unsafe { libc::dup(fd) };
-        if fd_dup < 0 {
-            return Err(PyErr::from(std::io::Error::last_os_error()));
-        }
-        let owned = unsafe { OwnedFd::from_raw_fd(fd_dup) };
-        let (tx, rx) = async_channel::bounded::<SockSendMsg>(2);
-        let scheduler_tx = self.scheduler_tx.clone();
-        let sock_writers = Arc::clone(&self.sock_writers);
-        self.get_runtime().spawn(sock_writer_task(fd, owned, rx, scheduler_tx, sock_writers));
-        self.sock_writers.pin().insert(fd as usize, tx.clone());
-        Ok(tx)
-    }
 }
 
 #[pymethods]
@@ -340,8 +609,10 @@ impl TEventLoop {
             sig_handlers: Arc::new(papaya::HashMap::new()),
             io_reader_entries: Arc::new(papaya::HashMap::new()),
             io_writer_entries: Arc::new(papaya::HashMap::new()),
-            sock_readers: Arc::new(papaya::HashMap::new()),
-            sock_writers: Arc::new(papaya::HashMap::new()),
+            pending_reads: Arc::new(Mutex::new(HashMap::new())),
+            pending_reads_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_writes: Arc::new(Mutex::new(HashMap::new())),
+            pending_writes_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -432,12 +703,23 @@ impl TEventLoop {
         let epoch = self.epoch;
         let signal_socket_rx = self.signal_socket_rx.clone();
         let sig_listening_clone = Arc::clone(&self.sig_listening);
+        let pending_reads = Arc::clone(&self.pending_reads);
+        let pending_reads_notify = Arc::clone(&self.pending_reads_notify);
+        let pending_writes = Arc::clone(&self.pending_writes);
+        let pending_writes_notify = Arc::clone(&self.pending_writes_notify);
 
         py.detach(|| {
             let task_handle: JoinHandle<std::result::Result<(), PyErr>> = runtime.spawn(async move {
                 let mut delayed_tasks: BinaryHeap<TokioTimer> = BinaryHeap::new();
                 // Ready handles collected each select! iteration, drained under one GIL
                 let mut current_handles: VecDeque<TBoxedHandle> = VecDeque::new();
+                // Option B: persistent AsyncFd sets + batches of ready results
+                let mut read_poll_set = ReadPollSet::new();
+                let mut ready_recvs: Vec<(Py<PyAny>, Result<Vec<u8>, std::io::Error>)> =
+                    Vec::new();
+                let mut write_poll_set = WritePollSet::new();
+                let mut ready_writes: Vec<(Py<PyAny>, Result<(), std::io::Error>)> =
+                    Vec::new();
 
                 let mut scheduler_rx = scheduler_rx;
 
@@ -519,11 +801,43 @@ impl TEventLoop {
                                 break;
                             }
                         }
+
+                        // Option B arm 1: drain newly-registered pending reads into the set
+                        _ = pending_reads_notify.notified() => {
+                            let mut map = pending_reads.lock().unwrap();
+                            for (fd, (nbytes, fut)) in map.drain() {
+                                read_poll_set.add(fd, nbytes, fut);
+                            }
+                        }
+
+                        // Option B arm 2: an fd became readable — collect for GIL batch
+                        Some(result) = futures::StreamExt::next(&mut read_poll_set),
+                            if !read_poll_set.is_empty() =>
+                        {
+                            ready_recvs.push(result);
+                        }
+
+                        // Option B arm 3: drain newly-registered pending writes into the set
+                        _ = pending_writes_notify.notified() => {
+                            let mut map = pending_writes.lock().unwrap();
+                            for (fd, (data, fut)) in map.drain() {
+                                if let Some((err_fut, e)) = write_poll_set.add(fd, data, fut) {
+                                    ready_writes.push((err_fut, Err(e)));
+                                }
+                            }
+                        }
+
+                        // Option B arm 4: an fd became writable — collect for GIL batch
+                        Some(result) = futures::StreamExt::next(&mut write_poll_set),
+                            if !write_poll_set.is_empty() =>
+                        {
+                            ready_writes.push(result);
+                        }
                     }
 
-                    // Run ALL ready callbacks under a single GIL acquisition.
+                    // Run ALL ready callbacks + recv/send results under a single GIL acquisition.
                     // Use attach_blocking so GC-triggered runtime drops don't panic.
-                    if !current_handles.is_empty() {
+                    if !current_handles.is_empty() || !ready_recvs.is_empty() || !ready_writes.is_empty() {
                         let handlers = loop_handlers.clone();
                         let state = TEventLoopRunState {};
                         attach_blocking(|py| {
@@ -533,28 +847,72 @@ impl TEventLoop {
                                 }
                                 drop(handle);
                             }
+                            // recv() was already done in poll_next; just wrap data as PyBytes
+                            for (fut, result) in ready_recvs.drain(..) {
+                                match result {
+                                    Err(e) => {
+                                        let _ = fut.call_method1(py, "set_exception",
+                                            (PyErr::from(e).into_value(py),));
+                                    }
+                                    Ok(data) => {
+                                        let bytes = pyo3::types::PyBytes::new(py, &data);
+                                        let _ = fut.call_method1(py, "set_result", (bytes,));
+                                    }
+                                }
+                            }
+                            // sendall() was completed in poll_next; set result or exception
+                            for (fut, result) in ready_writes.drain(..) {
+                                match result {
+                                    Err(e) => {
+                                        let _ = fut.call_method1(py, "set_exception",
+                                            (PyErr::from(e).into_value(py),));
+                                    }
+                                    Ok(()) => {
+                                        let _ = fut.call_method1(py, "set_result", (py.None(),));
+                                    }
+                                }
+                            }
                         });
                     }
 
                     if stopping_clone.load(atomic::Ordering::Acquire) {
-                        // Yield once so io_processing_loop tasks can schedule their
-                        // teardown callbacks (e.g. connection_lost) before we exit.
-                        tokio::task::yield_now().await;
-                        // Drain any callbacks that arrived during teardown.
-                        while let Ok(ScheduledTask::Immediate { handle }) = scheduler_rx.try_recv() {
-                            current_handles.push_back(handle);
-                        }
-                        if !current_handles.is_empty() {
-                            let handlers = loop_handlers.clone();
-                            let state = TEventLoopRunState {};
-                            attach_blocking(|py| {
-                                while let Some(handle) = current_handles.pop_front() {
-                                    if !handle.cancelled() {
-                                        let _ = handle.run(py, &handlers, &state);
+                        // Drain teardown: wait for pending callbacks (e.g. connection_lost
+                        // from io_processing_loop) using a proper recv() await so the Tokio
+                        // I/O driver can deliver pending epoll events. 1 ms timeout is a
+                        // safety net; in practice callbacks arrive within microseconds.
+                        let teardown_timeout = tokio::time::sleep(Duration::from_millis(1));
+                        tokio::pin!(teardown_timeout);
+                        loop {
+                            tokio::select! {
+                                task = scheduler_rx.recv() => {
+                                    match task {
+                                        Ok(ScheduledTask::Immediate { handle }) => {
+                                            current_handles.push_back(handle);
+                                        }
+                                        Ok(ScheduledTask::Delayed { .. }) => {}
+                                        Err(_) => break,
                                     }
-                                    drop(handle);
+                                    // Greedy drain
+                                    while let Ok(ScheduledTask::Immediate { handle }) =
+                                        scheduler_rx.try_recv()
+                                    {
+                                        current_handles.push_back(handle);
+                                    }
+                                    if !current_handles.is_empty() {
+                                        let handlers = loop_handlers.clone();
+                                        let state = TEventLoopRunState {};
+                                        attach_blocking(|py| {
+                                            while let Some(handle) = current_handles.pop_front() {
+                                                if !handle.cancelled() {
+                                                    let _ = handle.run(py, &handlers, &state);
+                                                }
+                                                drop(handle);
+                                            }
+                                        });
+                                    }
                                 }
-                            });
+                                _ = &mut teardown_timeout => { break; }
+                            }
                         }
                         break;
                     }
@@ -586,7 +944,11 @@ impl TEventLoop {
 
     #[pyo3(signature = (callback, *args, context=None))]
     fn call_soon(&self, py: Python, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        let context = context.unwrap_or_else(|| copy_context(py));
+        // Stage 1: the multi-arg `TCBHandle::run()` calls the callback directly and
+        // never enters `context` (only the 0/1-arg variants do), so the per-call_soon
+        // `copy_context()` — a `PyContext_CopyCurrent` FFI plus a Python object
+        // alloc/free — is dead work on this hot path. Skip it when no context is given.
+        let context = context.unwrap_or_else(|| py.None());
 
         // Always use TCBHandle like the regular event loop
         let handle = TCBHandle::new(callback, args, context);
@@ -604,7 +966,9 @@ impl TEventLoop {
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let context = context.unwrap_or_else(|| copy_context(py));
+        // Stage 1: see call_soon — TCBHandle::run() ignores `context`, so the
+        // default copy_context() is dead work; skip it when none is supplied.
+        let context = context.unwrap_or_else(|| py.None());
 
         // Always use TCBHandle like the regular event loop
         let handle = TCBHandle::new(callback, args, context);
@@ -1167,47 +1531,59 @@ impl TEventLoop {
 
         // Fast path: attempt recv immediately while we hold the GIL.
         // Stack-allocate for small messages (≤ 4 KB) to avoid heap overhead.
+        // For large requests, use FIONREAD first to avoid allocating a huge buffer
+        // that gets freed immediately on EAGAIN.
         const STACK_CAP: usize = 4096;
-        let (n, fast_data) = if nbytes <= STACK_CAP {
+        if nbytes <= STACK_CAP {
             let mut buf = [0u8; STACK_CAP];
             let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT) };
-            let data = if n > 0 { Some(pyo3::types::PyBytes::new(py, &buf[..n as usize])) } else { None };
-            (n, data)
-        } else {
-            let mut buf = vec![0u8; nbytes];
-            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT) };
-            let data = if n > 0 { Some(pyo3::types::PyBytes::new(py, &buf[..n as usize])) } else { None };
-            (n, data)
-        };
-        if let Some(data) = fast_data {
-            fut.call_method1(py, "set_result", (data,))?;
-            return Ok(());
-        }
-        if n == 0 {
-            fut.call_method1(py, "set_result", (pyo3::types::PyBytes::new(py, b""),))?;
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::WouldBlock {
-            fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),))?;
-            return Ok(());
-        }
-        // EAGAIN: data not yet available — hand off to the persistent worker.
-
-        // Forward request to the persistent worker for this fd.
-        // The worker owns the AsyncFd (epoll registration stays alive between calls).
-        let tx = self.get_or_spawn_reader(fd)?;
-        let msg = SockRecvMsg::Recv { nbytes, fut };
-        let msg = match tx.try_send(msg) {
-            Ok(()) => return Ok(()),
-            // Worker channel full or closed — remove stale entry and retry with a new worker.
-            Err(async_channel::TrySendError::Full(m)) | Err(async_channel::TrySendError::Closed(m)) => {
-                self.sock_readers.pin().remove(&(fd as usize));
-                m
+            if n > 0 {
+                fut.call_method1(py, "set_result", (pyo3::types::PyBytes::new(py, &buf[..n as usize]),))?;
+                return Ok(());
             }
-        };
-        let tx2 = self.get_or_spawn_reader(fd)?;
-        let _ = tx2.try_send(msg);
+            if n == 0 {
+                fut.call_method1(py, "set_result", (pyo3::types::PyBytes::new(py, b""),))?;
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),))?;
+                return Ok(());
+            }
+            // EAGAIN — fall through to EAGAIN path below
+        } else {
+            // Large buffer: check FIONREAD first to skip allocation when nothing ready
+            let mut avail: libc::c_int = 0;
+            unsafe { libc::ioctl(fd, libc::FIONREAD, &mut avail) };
+            if avail > 0 {
+                let alloc_size = (avail as usize).min(nbytes);
+                let mut buf = vec![0u8; alloc_size];
+                let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, alloc_size, libc::MSG_DONTWAIT) };
+                if n > 0 {
+                    fut.call_method1(py, "set_result", (pyo3::types::PyBytes::new(py, &buf[..n as usize]),))?;
+                    return Ok(());
+                }
+                if n == 0 {
+                    fut.call_method1(py, "set_result", (pyo3::types::PyBytes::new(py, b""),))?;
+                    return Ok(());
+                }
+                let e = std::io::Error::last_os_error();
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),))?;
+                    return Ok(());
+                }
+                // EAGAIN despite FIONREAD — fall through to EAGAIN path below
+            }
+            // FIONREAD == 0: definitely EAGAIN, go straight to EAGAIN path below
+        }
+
+        // EAGAIN: hand off to _run's ReadPollSet (Option B).
+        // BorrowedFd keeps AsyncFd alive per-connection — no dup() needed.
+        {
+            let mut map = self.pending_reads.lock().unwrap();
+            map.insert(fd, (nbytes, fut));
+        }
+        self.pending_reads_notify.notify_one();
         Ok(())
     }
 
@@ -1239,9 +1615,12 @@ impl TEventLoop {
             if e.kind() != std::io::ErrorKind::WouldBlock {
                 return Err(PyErr::from(e));
             }
-            // Nothing sent — forward entire buffer to writer worker.
-            let tx = self.get_or_spawn_writer(fd)?;
-            let _ = tx.try_send(SockSendMsg::SendAll { data: bytes.to_vec(), fut });
+            // Nothing sent — hand entire buffer to _run's WritePollSet (Option B).
+            {
+                let mut map = self.pending_writes.lock().unwrap();
+                map.insert(fd, (bytes.to_vec(), fut));
+            }
+            self.pending_writes_notify.notify_one();
             return Ok(());
         }
         let sent = n as usize;
@@ -1249,9 +1628,12 @@ impl TEventLoop {
             fut.call_method1(py, "set_result", (py.None(),))?;
             return Ok(());
         }
-        // Partial send — pass remaining bytes to writer worker.
-        let tx = self.get_or_spawn_writer(fd)?;
-        let _ = tx.try_send(SockSendMsg::SendAll { data: bytes[sent..].to_vec(), fut });
+        // Partial send — hand remaining bytes to _run's WritePollSet.
+        {
+            let mut map = self.pending_writes.lock().unwrap();
+            map.insert(fd, (bytes[sent..].to_vec(), fut));
+        }
+        self.pending_writes_notify.notify_one();
         Ok(())
     }
 
@@ -1344,133 +1726,4 @@ pub(crate) fn init_pymodule(module: &Bound<PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-/// Persistent per-fd recv worker.  One task lives for the lifetime of a connection.
-/// It holds an `AsyncFd` (epoll stays registered between calls — no per-request
-/// epoll_ctl or dup overhead).  Requests arrive via an async_channel; results are
-/// sent back to the event loop via the scheduler channel as `RustCallHandle`s so
-/// that GIL work is batched in `io_processing_loop`.
-async fn sock_reader_task(
-    fd: i32,
-    owned: OwnedFd,
-    rx: async_channel::Receiver<SockRecvMsg>,
-    scheduler_tx: async_channel::Sender<ScheduledTask>,
-    sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
-) {
-    let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
-        Ok(a) => a,
-        Err(_) => {
-            sock_readers.pin().remove(&(fd as usize));
-            return;
-        }
-    };
 
-    while let Ok(msg) = rx.recv().await {
-        let SockRecvMsg::Recv { nbytes, fut } = msg;
-
-        // Allocate once and attempt recv immediately — data may have arrived while
-        // the message was in the channel (avoids a redundant readable().await wait).
-        let mut buf = vec![0u8; nbytes];
-        let outcome: Result<Vec<u8>, std::io::Error> = loop {
-            let n = unsafe {
-                libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, libc::MSG_DONTWAIT)
-            };
-            if n >= 0 {
-                buf.truncate(n as usize);
-                break Ok(buf);
-            }
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::WouldBlock {
-                break Err(e);
-            }
-            // EAGAIN: wait for the kernel to signal readability, then retry.
-            match async_fd.readable().await {
-                Err(e) => break Err(e),
-                Ok(mut guard) => { guard.clear_ready(); }
-            }
-        };
-
-        let fatal = outcome.is_err();
-        let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
-            handle: Box::new(RustCallHandle::new(move |py| {
-                match outcome {
-                    Ok(buf) => {
-                        let data = pyo3::types::PyBytes::new(py, &buf);
-                        let _ = fut.call_method1(py, "set_result", (data,));
-                    }
-                    Err(e) => {
-                        let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),));
-                    }
-                }
-            })),
-        });
-
-        if fatal { break; }
-    }
-
-    sock_readers.pin().remove(&(fd as usize));
-}
-
-/// Persistent per-fd send worker.  Drives a write loop with `writable().await` +
-/// `send(MSG_DONTWAIT | MSG_NOSIGNAL)` until all bytes are flushed.
-async fn sock_writer_task(
-    fd: i32,
-    owned: OwnedFd,
-    rx: async_channel::Receiver<SockSendMsg>,
-    scheduler_tx: async_channel::Sender<ScheduledTask>,
-    sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
-) {
-    let async_fd = match tokio::io::unix::AsyncFd::new(owned) {
-        Ok(a) => a,
-        Err(_) => {
-            sock_writers.pin().remove(&(fd as usize));
-            return;
-        }
-    };
-
-    while let Ok(msg) = rx.recv().await {
-        let SockSendMsg::SendAll { data, fut } = msg;
-        let mut offset = 0usize;
-
-        let result: Result<(), std::io::Error> = loop {
-            // Attempt send; often succeeds immediately (kernel send buffer has space).
-            let n = unsafe {
-                libc::send(
-                    fd,
-                    data[offset..].as_ptr() as *const libc::c_void,
-                    data.len() - offset,
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                )
-            };
-            if n >= 0 {
-                offset += n as usize;
-                if offset >= data.len() { break Ok(()); }
-                continue; // more bytes to send; try again before waiting
-            }
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::WouldBlock {
-                break Err(e);
-            }
-            match async_fd.writable().await {
-                Ok(mut guard) => {
-                    guard.clear_ready();
-                    drop(guard);
-                }
-                Err(e) => break Err(e),
-            }
-        };
-
-        let is_err = result.is_err();
-        let _ = scheduler_tx.try_send(ScheduledTask::Immediate {
-            handle: Box::new(RustCallHandle::new(move |py| {
-                match result {
-                    Ok(()) => { let _ = fut.call_method1(py, "set_result", (py.None(),)); }
-                    Err(e) => { let _ = fut.call_method1(py, "set_exception", (PyErr::from(e).into_value(py),)); }
-                }
-            })),
-        });
-
-        if is_err { break; }
-    }
-
-    sock_writers.pin().remove(&(fd as usize));
-}

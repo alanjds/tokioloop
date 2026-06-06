@@ -238,12 +238,25 @@ impl TokioTCPTransport {
                         }
                         Ok(n) => {
                             let data = read_buf[..n].to_vec();
+                            // Stage 2a: when enabled, install the inline sink around
+                            // data_received so a STREAM continuation woken by feed_data ->
+                            // call_soon runs in THIS GIL section on THIS worker thread,
+                            // instead of hopping to the _run thread for a second GIL acquire.
+                            let inline = crate::tokio_event_loop::inline_stream_enabled();
                             Python::attach(|py| {
+                                if inline {
+                                    crate::tokio_event_loop::inline_sink_install();
+                                }
                                 let _ = protocol.call_method1(
                                     py,
                                     pyo3::intern!(py, "data_received"),
                                     (PyBytes::new(py, &data),)
                                 );
+                                if inline {
+                                    if let Some(handles) = crate::tokio_event_loop::inline_sink_take() {
+                                        transport.get().pyloop.get().run_handles_inline(py, handles);
+                                    }
+                                }
                             });
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -255,39 +268,53 @@ impl TokioTCPTransport {
                 }
 
                 _ = async {
-                    // Park until there's something to write — handles writes arriving after
-                    // the previous select! iteration started with an empty write_buf.
-                    let has_work = {
-                        let s = state.lock().unwrap();
-                        !s.write_buf.is_empty() || (s.weof && !s.write_shutdown_done)
-                    };
-                    if !has_work {
+                    // Park until there's something to write, then re-check in the SAME poll.
+                    // The previous design returned after notified(), forcing a full outer-loop /
+                    // select! re-entry before the queued write actually ran; looping here
+                    // performs the write without that extra hop.
+                    loop {
+                        let (has_work, closing) = {
+                            let s = state.lock().unwrap();
+                            (!s.write_buf.is_empty() || (s.weof && !s.write_shutdown_done), s.closing)
+                        };
+                        // Break on `closing` too: close()/abort() wake us via write_notify
+                        // without adding work, and the arm must complete so the outer loop can
+                        // observe is_closing and exit instead of parking here forever.
+                        if has_work || closing {
+                            break;
+                        }
                         write_notify.notified().await;
-                        return;
                     }
 
-                    let (write_data, should_shutdown_now) = {
-                        let mut state_lock = state.lock().unwrap();
-                        let write_data = state_lock.write_buf.pop_front();
-                        let should_shutdown = state_lock.weof
-                            && state_lock.write_buf.is_empty()
-                            && !state_lock.write_shutdown_done;
-                        (write_data, should_shutdown)
-                    };
-
-                    if let Some(data) = write_data {
+                    // Greedily drain every currently-queued buffer in one poll so N queued
+                    // writes cost one select! iteration instead of N. Bounded by what is queued
+                    // at entry: data_received() runs in the read arm of this same loop, so our
+                    // own protocol cannot enqueue more while we drain here.
+                    let mut wrote_any = false;
+                    loop {
+                        let data = {
+                            let mut state_lock = state.lock().unwrap();
+                            state_lock.write_buf.pop_front()
+                        };
+                        let Some(data) = data else { break };
+                        wrote_any = true;
                         if let Err(e) = writer.write_all(&data).await {
                             log::error!("TCP write error: [fd={}] {}", fd, e);
-                        } else {
-                            // Flush BufWriter when write_buf is now empty so small messages
-                            // are delivered promptly instead of sitting in the 8KB buffer.
-                            if !should_shutdown_now {
-                                let buf_empty = state.lock().unwrap().write_buf.is_empty();
-                                if buf_empty {
-                                    let _ = writer.flush().await;
-                                }
-                            }
+                            break;
                         }
+                    }
+
+                    let should_shutdown_now = {
+                        let state_lock = state.lock().unwrap();
+                        state_lock.weof
+                            && state_lock.write_buf.is_empty()
+                            && !state_lock.write_shutdown_done
+                    };
+
+                    // Flush BufWriter (write_buf is now drained) so small messages are
+                    // delivered promptly instead of sitting in the 8KB buffer.
+                    if wrote_any && !should_shutdown_now {
+                        let _ = writer.flush().await;
                     }
 
                     if should_shutdown_now {
