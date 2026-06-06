@@ -377,14 +377,15 @@ fn inline_sink_try_push(handle: TBoxedHandle) -> Result<(), TBoxedHandle> {
     })
 }
 
-/// Gate for the Stage 2a inline path, read once from `TOKIOLOOP_INLINE_STREAM`.
-/// Runtime-toggleable (no rebuild) so the same `.so` can be A/B'd.
+/// Gate for the Stage 2a inline path. **On by default**; set
+/// `TOKIOLOOP_INLINE_STREAM=0` (or `false`) to fall back to the legacy
+/// scheduler-hop path. Read once and runtime-toggleable (no rebuild).
 pub(crate) fn inline_stream_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("TOKIOLOOP_INLINE_STREAM")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+            .unwrap_or(true)
     })
 }
 
