@@ -451,3 +451,88 @@ compatible; defer unless the profile demands it.
 - **Define the target up front:** e.g. "close half the STREAM gap to asyncio
   (≈48–58 % → ≥75 %) at 1 KB/10 KB, no PROTO regression, suite green." Stop when
   hit or when a stage shows no measurable movement.
+
+---
+
+# Exploration Results — STREAM Stages 0–2 (2026-06-06, branch `claude/stream-perf-exploration-CWw6E`)
+
+Branched from `96ac303`. Built CPython 3.11.15, release profile, 4-core box.
+Measured with a new **interleaved hot-swap A/B harness** (`benchmarks/ab_stream.py`):
+server pinned to cores 0–1, client to 2–3, all variants run back-to-back per
+(rep, size), reporting the per-variant **median across 5×8 s reps**. Absolute rps
+is machine-specific; only the relative `% of asyncio` and the before/after delta
+are meaningful.
+
+## Stage 0 — harness + profiling
+
+- `benchmarks/ab_stream.py` added (interleaved hot-swap A/B; `--mode streams|proto`).
+- `py-spy --native` (line-tables rebuild) on a live 1 KB STREAM server: `StreamReader`'s
+  own Python frames (`feed_data`/`_wakeup_waiter`) are **cold (~3 %)** → Stage 3
+  (bypass StreamReader) is correctly last-resort. Visible self-time was allocation
+  churn (`mmap64`, `PyObject::new`, `free`) + syscalls; `copy_context`/`async_channel`
+  were inlined away under `lto="fat"` and not resolvable as hotspots. Key insight:
+  at concurrency=1 the echo is **latency-bound**, so the cross-thread handoff cost
+  shows up as *parked threads*, which a CPU sampler barely captures — the 40 pp gap
+  is structural handoff latency, confirmed by uvloop (same `StreamReader`, single
+  thread) running at ~100–110 %.
+
+## Stage 1 — skip dead `copy_context` in `call_soon` *(applied + measured)*
+
+`call_soon`/`call_soon_threadsafe` built a multi-arg `TCBHandle` whose `run()`
+invokes the callback directly and **never enters the stored context** (only the
+0/1-arg variants do). The default `copy_context()` was therefore dead work; it is
+now skipped when no context is supplied (safe — observably a no-op).
+
+**Result: within noise.** STREAM `% of asyncio`, baseline → stage1:
+1 KB 58.6 → 58.8, 10 KB 59.7 → 58.8, 100 KB 60.7 → 60.9 (±1 pp). Confirms
+`copy_context` is **not** the differentiator. Kept as a dead-work cleanup, not a
+perf lever.
+
+## Stage 2a — inline-drain woken continuations on the IO worker *(the lever)* ✅
+
+Root cause (confirmed): a STREAM echo crosses `scheduler_tx` to the `_run` thread
+and acquires the GIL a **second** time to run the `readline` continuation woken by
+`feed_data → call_soon`. asyncio/uvloop run read + `data_received` + continuation
+in one GIL section on one thread.
+
+Fix: `io_processing_loop` installs a **thread-local inline sink** around its
+`data_received` call (`src/tokio_tcp.rs`). While installed, `schedule_handle`
+diverts *immediate* handles into the sink instead of the channel
+(`src/tokio_event_loop.rs`); the worker then runs them via
+`TEventLoop::run_handles_inline` in the **same `Python::attach`**, removing the
+cross-thread hop and the second GIL acquire. The sink is taken (disabled) before
+running, so nested `call_soon` from the continuations falls back to the channel
+(deferred to `_run` next iteration) — preserving FIFO/deferral semantics and
+bounding inline work. Gated behind the runtime flag `TOKIOLOOP_INLINE_STREAM=1`
+(default off; toggleable without rebuild). Re-entrancy is safe because `TEventLoop`
+is `frozen`, and worker-thread continuation execution is already supported by the
+existing `get_running_loop` auto-recovery patch in `rloop/loop.py`.
+
+**Result (STREAM `% of asyncio`, median of 5 reps):**
+
+| Size   | baseline | stage2a | Δ | uvloop |
+|--------|---------:|--------:|--:|-------:|
+| 1 KB   | 56.8 %   | **99.1 %** | **+42.3 pp** | 109.4 % |
+| 10 KB  | 57.5 %   | **97.6 %** | **+40.1 pp** | 106.9 % |
+| 100 KB | 62.0 %   | **83.8 %** | **+21.8 pp** | 100.3 % |
+
+Far exceeds the ≥75 % target; STREAM reaches near-parity with asyncio at 1–10 KB.
+
+**Guardrails met:**
+- **Correctness:** full `pytest tests` with the flag ON has a failure set
+  **identical** to the `96ac303` baseline (17 known env failures: IPv6, UDP, unix,
+  signals, timer timing). The one transient `test_call_later[uvloop.Loop]` was a
+  timing flake (a uvloop test, unaffected by this change; did not reproduce in 3×).
+- **PROTO untouched:** PROTO A/B is flat within noise — `data_received` schedules
+  no immediate handle there, so the sink stays empty and the inline run is a no-op.
+
+## Recommendation / next steps
+
+- Flip `TOKIOLOOP_INLINE_STREAM` to default-on after an independent validation run
+  on a quiet machine + a green full suite; consider promoting it from env flag to a
+  stream-transport-gated default.
+- Stage 2b (deliver stream reads on the `_run` thread) and Stage 3 (bypass
+  `StreamReader`) are **not needed** — 2a already reaches near-parity and the
+  profile shows StreamReader is cold.
+- Optional follow-up (revised-step B): drop the `read_buf[..n].to_vec()` before
+  `PyBytes::new` to remove one alloc+copy per message — independent of 2a.

@@ -321,6 +321,73 @@ impl LoopHandlers {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 2a: inline-drain of woken continuations on the IO worker thread.
+//
+// For the STREAM path, `data_received` runs on a tokio worker and calls
+// `StreamReader.feed_data` -> `loop.call_soon(continuation)`. Normally that
+// continuation handle is sent across `scheduler_tx` to the `_run` thread, which
+// re-acquires the GIL to run it: a cross-thread hop plus a *second* GIL section
+// per echo. asyncio/uvloop avoid this by running the read, `data_received`, and
+// the continuation in one GIL section on one thread.
+//
+// To match that, `io_processing_loop` installs a thread-local "inline sink"
+// around its `data_received` call. While installed, `schedule_handle` diverts
+// *immediate* handles into the sink instead of the channel. The worker then runs
+// the captured handles in the SAME `Python::attach`, eliminating the hop and the
+// second GIL acquisition. The sink is taken (set to None) before running, so any
+// `call_soon` issued by the continuations themselves falls back to the channel
+// and runs on `_run` next iteration -- preserving asyncio's deferral semantics
+// and bounding inline work to the directly-woken continuations. PROTO is
+// unaffected: its `data_received` schedules no immediate handle, so the sink
+// stays empty and the inline run is a no-op.
+thread_local! {
+    static INLINE_SINK: std::cell::RefCell<Option<VecDeque<TBoxedHandle>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[inline]
+pub(crate) fn inline_sink_install() {
+    INLINE_SINK.with(|s| {
+        let mut b = s.borrow_mut();
+        if b.is_none() {
+            *b = Some(VecDeque::new());
+        }
+    });
+}
+
+#[inline]
+pub(crate) fn inline_sink_take() -> Option<VecDeque<TBoxedHandle>> {
+    INLINE_SINK.with(|s| s.borrow_mut().take())
+}
+
+/// Push an immediate handle into the inline sink if one is installed on this
+/// thread. Returns the handle back in `Err` when no sink is active.
+#[inline]
+fn inline_sink_try_push(handle: TBoxedHandle) -> Result<(), TBoxedHandle> {
+    INLINE_SINK.with(|s| {
+        let mut b = s.borrow_mut();
+        match b.as_mut() {
+            Some(q) => {
+                q.push_back(handle);
+                Ok(())
+            }
+            None => Err(handle),
+        }
+    })
+}
+
+/// Gate for the Stage 2a inline path, read once from `TOKIOLOOP_INLINE_STREAM`.
+/// Runtime-toggleable (no rebuild) so the same `.so` can be A/B'd.
+pub(crate) fn inline_stream_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("TOKIOLOOP_INLINE_STREAM")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 #[pyclass(frozen, subclass, module = "rloop._rloop")]
 pub struct TEventLoop {
     runtime: OnceLock<Arc<Runtime>>,
@@ -466,8 +533,16 @@ impl TEventLoop {
             };
             ScheduledTask::Delayed { timer }
         } else {
-            ScheduledTask::Immediate {
-                handle: Box::new(handle)
+            // Stage 2a: when an inline sink is installed on this thread (only inside
+            // io_processing_loop's data_received window), capture the immediate handle
+            // for same-GIL inline execution instead of crossing the scheduler channel.
+            let boxed: TBoxedHandle = Box::new(handle);
+            match inline_sink_try_push(boxed) {
+                Ok(()) => {
+                    log::trace!("Immediate task captured by inline sink");
+                    return Ok(());
+                }
+                Err(boxed) => ScheduledTask::Immediate { handle: boxed },
             }
         };
 
@@ -478,6 +553,26 @@ impl TEventLoop {
         }
         log::debug!("Task sent successfully");
         Ok(())
+    }
+
+    /// Stage 2a: run handles captured by the inline sink in the current GIL
+    /// section, using the loop's exception handlers. Mirrors the per-handle
+    /// execution `_run` does, so semantics (cancellation check, exception
+    /// logging) match. Re-entrancy is safe because `TEventLoop` is `frozen`.
+    pub(crate) fn run_handles_inline(&self, py: Python, handles: VecDeque<TBoxedHandle>) {
+        if handles.is_empty() {
+            return;
+        }
+        let handlers = LoopHandlers {
+            exc_handler: Arc::clone(&self.exc_handler),
+            exception_handler: Arc::clone(&self.exception_handler),
+        };
+        let state = TEventLoopRunState {};
+        for handle in handles {
+            if !handle.cancelled() {
+                handle.run(py, &handlers, &state);
+            }
+        }
     }
 
     pub fn get_runtime(&self) -> Arc<Runtime> {
@@ -848,7 +943,11 @@ impl TEventLoop {
 
     #[pyo3(signature = (callback, *args, context=None))]
     fn call_soon(&self, py: Python, callback: Py<PyAny>, args: Py<PyAny>, context: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        let context = context.unwrap_or_else(|| copy_context(py));
+        // Stage 1: the multi-arg `TCBHandle::run()` calls the callback directly and
+        // never enters `context` (only the 0/1-arg variants do), so the per-call_soon
+        // `copy_context()` — a `PyContext_CopyCurrent` FFI plus a Python object
+        // alloc/free — is dead work on this hot path. Skip it when no context is given.
+        let context = context.unwrap_or_else(|| py.None());
 
         // Always use TCBHandle like the regular event loop
         let handle = TCBHandle::new(callback, args, context);
@@ -866,7 +965,9 @@ impl TEventLoop {
         args: Py<PyAny>,
         context: Option<Py<PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let context = context.unwrap_or_else(|| copy_context(py));
+        // Stage 1: see call_soon — TCBHandle::run() ignores `context`, so the
+        // default copy_context() is dead work; skip it when none is supplied.
+        let context = context.unwrap_or_else(|| py.None());
 
         // Always use TCBHandle like the regular event loop
         let handle = TCBHandle::new(callback, args, context);

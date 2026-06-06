@@ -238,12 +238,25 @@ impl TokioTCPTransport {
                         }
                         Ok(n) => {
                             let data = read_buf[..n].to_vec();
+                            // Stage 2a: when enabled, install the inline sink around
+                            // data_received so a STREAM continuation woken by feed_data ->
+                            // call_soon runs in THIS GIL section on THIS worker thread,
+                            // instead of hopping to the _run thread for a second GIL acquire.
+                            let inline = crate::tokio_event_loop::inline_stream_enabled();
                             Python::attach(|py| {
+                                if inline {
+                                    crate::tokio_event_loop::inline_sink_install();
+                                }
                                 let _ = protocol.call_method1(
                                     py,
                                     pyo3::intern!(py, "data_received"),
                                     (PyBytes::new(py, &data),)
                                 );
+                                if inline {
+                                    if let Some(handles) = crate::tokio_event_loop::inline_sink_take() {
+                                        transport.get().pyloop.get().run_handles_inline(py, handles);
+                                    }
+                                }
                             });
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
