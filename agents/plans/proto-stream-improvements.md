@@ -268,31 +268,46 @@ runs clean (~13.9k rps, every response length-validated). All 24 `test_streams.p
 tests pass; the only failures (`test_tcp_server` ipv6 + `test_tcp_server_recv_send`) are
 pre-existing and reproduce on asyncio/baseline.
 
-**Correctness model (the callback-executor lock).** tokioloop already runs Python on multiple
-worker threads (`_run` + each `io_processing_loop`), and CPython can release the GIL mid-callback,
-so the GIL alone does not guarantee asyncio's "callbacks never overlap" invariant once io loops
-also execute scheduled callbacks. A `Mutex<()>` enforces a single active callback executor:
+**Correctness model (the callback-executor lock).** tokioloop runs Python on multiple worker
+threads (`_run` + each `io_processing_loop`), so it cannot rely on the GIL to serialize protocol
+code — on no-GIL (free-threading) builds there is no GIL, and even on default builds CPython can
+release the GIL mid-callback. A `Mutex<()>` enforces a single active Python executor, covering
+**both scheduled callbacks and the `data_received`/`eof_received` protocol calls**:
 
-- `_run` holds it (blocking) around both of its callback batches, acquired **before** the GIL
-  (`lock → GIL`).
-- `io_processing_loop` already holds the GIL when it wants to drain, so it uses **`try_lock`**
-  (never blocks): on success it runs handles in-batch; on contention it leaves them in the FIFO
-  scheduler channel for `_run`. The inverted `GIL → try_lock` order cannot deadlock because
-  `try_lock` never waits.
+- Every holder acquires it **before** the GIL (`lock → GIL`): `_run` around its two callback
+  batches, and each `io_processing_loop` around its read arms (the `data_received` + in-batch
+  drain, and `eof_received`). Uniform lock order means the blocking `lock()` can never deadlock,
+  and no `.await` is held across the guard.
+- The in-batch drain runs under the already-held lock (no `try_lock` needed); non-immediate
+  (timer/recv) tasks are forwarded back to `_run`.
 
 FIFO is preserved by the single active executor + FIFO channel; every scheduled handle is still
 eventually run (a channel send always wakes `_run`'s `recv`). The in-batch drain is bounded (256)
-so it cannot starve the connection's own read/write loop. Note: `data_received` itself still runs
-on io threads without the lock — that overlap with scheduled callbacks is **pre-existing**
-tokioloop behaviour and unchanged by this work.
+so it cannot starve the connection's own read/write loop.
 
-**Remaining follow-ups (optional):** ✅ multi-connection ordering/stress tests added
-(`tests/test_stream_stress.py` — concurrent tagged ping-pong, large multi-chunk payloads,
-pipelined-lines ordering, and an await-free shared-counter test that would expose overlapping
-callbacks; all run across asyncio/uvloop/rloop/TokioLoop and pass, so TokioLoop matches the
-reference loops exactly). Still open: consider whether `data_received` should also run under the
-callback lock for strict asyncio semantics (separate, broader change); confirm behaviour on
-no-GIL (free-threading) builds.
+### No-GIL (free-threading) validation
+
+Built and run against **CPython 3.13.7t** (`sys._is_gil_enabled()` confirmed `False` after
+importing rloop — pyo3 0.27, `gil_used=false`):
+
+- **With `data_received` under the lock:** the full stream suite passes (44 tests), and the
+  TokioLoop stress tests pass **22/22** repeated runs — no races under true parallelism.
+- **Counterfactual (without the lock on `data_received`):** the concurrent stress tests
+  **intermittently hang** (observed on run 5/15), consistent with the latent data race — e.g.
+  `data_received` writing a connection's `TokioStreamReader` deque on the io thread while that
+  connection's `readline` task runs on `_run`. The GIL masks this on default builds; without it,
+  the race surfaces. This is what motivated bringing `data_received`/`eof_received` under the lock
+  (commit `fix: run data_received/eof_received under the callback-executor lock`).
+
+The lock has **no measured throughput cost** on the default build (stream stays ~90–120% of
+asyncio: c=1 117%/119% at 1/10 KB, c=10 ~89%; proto ~17k c=1, ~27k c=10/50 rps).
+
+**Remaining follow-ups:** ✅ multi-connection ordering/stress tests added
+(`tests/test_stream_stress.py`, run across asyncio/uvloop/rloop/TokioLoop). ✅ `data_received`
+now runs under the callback lock (strict asyncio non-overlap semantics + no-GIL safety). ✅ no-GIL
+build confirmed. Possible future work: a CI matrix entry for the free-threaded build; widening the
+lock coverage audit to any other direct protocol invocations (e.g. `connection_made`/
+`connection_lost` paths) on no-GIL.
 
 ---
 
