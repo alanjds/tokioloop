@@ -12,7 +12,9 @@
   (`claude/stream-reader-deque-opt`, stacked on #33). The profiling in this PR is what
   redirected the stream work from "remove reader copies" to "remove the per-message
   cross-thread GIL hop" (see *Profiling findings* below).
-- **Next** — in-batch task execution spike (candidate 1 below).
+- **`claude/stream-inbatch-tasks`** — in-batch task execution (candidate #1), stacked on the
+  reader branch. ✅ implemented + hardened + validated (stream ~27–38% → ~90–120% of asyncio).
+  See *Candidate #1 results* below.
 
 ## Baseline (current branch, after Option A + EOF fix)
 
@@ -231,24 +233,81 @@ routes through `scheduler_tx` to the `_run` task (`src/tokio_event_loop.rs:669` 
 cross-thread GIL bounce directly accounts for the proto↔stream gap. The asyncio reference pays
 none of this — its loop, reader wakeup and write all run inline on one thread.
 
-### Candidate optimizations (to spike + measure next)
+### Candidate optimizations
 
-1. **In-batch task execution (highest value, most invasive).** After a callback scheduled via
-   `call_soon` is enqueued while a GIL batch is already running (e.g. `data_received` inside
-   `io_processing_loop`'s `Python::attach`), drain and run the just-scheduled handles **in the
-   same GIL hold on the same thread**, instead of bouncing to the `_run` task. Collapses GIL #1+#2
-   into one and removes the channel round-trip for the common "data arrives → wake the reader →
-   write" pattern. Risk: must preserve asyncio's single-threaded, sequential-callback invariant
-   (one drainer at a time; GIL serializes Python but ordering/fairness/timer-starvation need care).
+1. **In-batch task execution (highest value).** ✅ **implemented + validated** on
+   `claude/stream-inbatch-tasks`. After `data_received` runs inside `io_processing_loop`'s
+   `Python::attach`, drain the scheduler channel and run the just-scheduled `Immediate` handles
+   **in the same GIL hold on the same thread**, instead of bouncing to the `_run` task. For the
+   stream echo path this resumes the parked `readline` task and fires `writer.write` before the GIL
+   is released — collapsing GIL #1+#2 and removing the cross-thread channel hop, exactly as proto.
+   See *Candidate #1 results* below.
 2. **Re-drain within `_run`'s batch.** The normal `_run` path runs `current_handles` once then
    returns to `select!`; chained `call_soon`s incur a channel round-trip to itself. Adding a
-   re-drain loop inside the `attach_blocking` (as the teardown path at lines 598–639 already does)
-   lets chained callbacks run in one GIL hold. Smaller/safer, but does not remove the *first*
-   `io_processing_loop → _run` cross-task hop, so likely a partial win for streams.
+   re-drain loop inside the `attach_blocking` (as the teardown path already does) lets chained
+   callbacks run in one GIL hold. Smaller/safer, but does not remove the *first*
+   `io_processing_loop → _run` cross-task hop — superseded by (1) for the stream path.
 3. **Unify connection reads into the `_run` task** so `data_received` and the woken user task run
-   on the same task/thread (no cross-task hand-off). Largest refactor.
+   on the same task/thread (no cross-task hand-off). Largest refactor; not needed given (1).
 
-Recommended: spike (1) behind measurement; fall back to (2) if (1) proves too invasive.
+### Candidate #1 results — in-batch task execution
+
+Implemented in `src/tokio_tcp.rs` (in-batch drain after `data_received`) + a callback-executor
+lock in `src/tokio_event_loop.rs`. Validated on Python 3.13.7 (release build), echo server,
+tokioloop **stream** vs asyncio stream, concurrency=1:
+
+| size | before | after #1 | asyncio | % of asyncio (after) |
+|------|------:|------:|------:|------:|
+| 1 KB | ~2,800 | **~9,800** | ~9,200 | **~107%** |
+| 10 KB | ~2,960 | **~8,560** | ~7,220 | **~119%** |
+| 100 KB | ~2,220 | **~4,500** | ~5,060 | **~90%** |
+
+Stream goes from ~27–38% → ~90–120% of asyncio, landing just under tokioloop's own proto path.
+Proto is unaffected (~11.6k rps at 1 KB — the lock isn't on its path). Concurrency 10/50 echo
+runs clean (~13.9k rps, every response length-validated). All 24 `test_streams.py` + `tcp_conn`
+tests pass; the only failures (`test_tcp_server` ipv6 + `test_tcp_server_recv_send`) are
+pre-existing and reproduce on asyncio/baseline.
+
+**Correctness model (the callback-executor lock).** tokioloop runs Python on multiple worker
+threads (`_run` + each `io_processing_loop`), so it cannot rely on the GIL to serialize protocol
+code — on no-GIL (free-threading) builds there is no GIL, and even on default builds CPython can
+release the GIL mid-callback. A `Mutex<()>` enforces a single active Python executor, covering
+**both scheduled callbacks and the `data_received`/`eof_received` protocol calls**:
+
+- Every holder acquires it **before** the GIL (`lock → GIL`): `_run` around its two callback
+  batches, and each `io_processing_loop` around its read arms (the `data_received` + in-batch
+  drain, and `eof_received`). Uniform lock order means the blocking `lock()` can never deadlock,
+  and no `.await` is held across the guard.
+- The in-batch drain runs under the already-held lock (no `try_lock` needed); non-immediate
+  (timer/recv) tasks are forwarded back to `_run`.
+
+FIFO is preserved by the single active executor + FIFO channel; every scheduled handle is still
+eventually run (a channel send always wakes `_run`'s `recv`). The in-batch drain is bounded (256)
+so it cannot starve the connection's own read/write loop.
+
+### No-GIL (free-threading) validation
+
+Built and run against **CPython 3.13.7t** (`sys._is_gil_enabled()` confirmed `False` after
+importing rloop — pyo3 0.27, `gil_used=false`):
+
+- **With `data_received` under the lock:** the full stream suite passes (44 tests), and the
+  TokioLoop stress tests pass **22/22** repeated runs — no races under true parallelism.
+- **Counterfactual (without the lock on `data_received`):** the concurrent stress tests
+  **intermittently hang** (observed on run 5/15), consistent with the latent data race — e.g.
+  `data_received` writing a connection's `TokioStreamReader` deque on the io thread while that
+  connection's `readline` task runs on `_run`. The GIL masks this on default builds; without it,
+  the race surfaces. This is what motivated bringing `data_received`/`eof_received` under the lock
+  (commit `fix: run data_received/eof_received under the callback-executor lock`).
+
+The lock has **no measured throughput cost** on the default build (stream stays ~90–120% of
+asyncio: c=1 117%/119% at 1/10 KB, c=10 ~89%; proto ~17k c=1, ~27k c=10/50 rps).
+
+**Remaining follow-ups:** ✅ multi-connection ordering/stress tests added
+(`tests/test_stream_stress.py`, run across asyncio/uvloop/rloop/TokioLoop). ✅ `data_received`
+now runs under the callback lock (strict asyncio non-overlap semantics + no-GIL safety). ✅ no-GIL
+build confirmed. Possible future work: a CI matrix entry for the free-threaded build; widening the
+lock coverage audit to any other direct protocol invocations (e.g. `connection_made`/
+`connection_lost` paths) on no-GIL.
 
 ---
 
@@ -260,8 +319,9 @@ Recommended: spike (1) behind measurement; fall back to (2) if (1) proves too in
 3. **Stream transport path** — profiled (see findings above): the bottleneck is an extra
    cross-thread GIL hand-off per message (`io_processing_loop` → `scheduler_tx` → `_run`). ✅
    diagnosed.
-4. **In-batch task execution (next)** — spike candidate (1) above to collapse the per-message
-   double GIL acquire / channel round-trip, measured against the proto/stream benchmarks.
+4. **In-batch task execution** — candidate (1): drain+run the just-scheduled handles inside the
+   io loop's `data_received` GIL hold, guarded by a callback-executor lock. ✅ done + validated
+   (stream ~27–38% → ~90–120% of asyncio; see *Candidate #1 results*).
 
 ---
 

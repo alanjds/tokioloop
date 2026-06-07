@@ -17,8 +17,8 @@ use socket2::{Domain, Type};
 use async_channel;
 
 use crate::{
-    tokio_event_loop::{TEventLoop, ScheduledTask},
-    tokio_handles::{RustCallHandle, TBoxedHandle},
+    tokio_event_loop::{TEventLoop, ScheduledTask, LoopHandlers, TEventLoopRunState},
+    tokio_handles::{RustCallHandle, TBoxedHandle, THandle},
     py::{sock, attach_blocking},
 };
 
@@ -164,10 +164,15 @@ impl TokioTCPTransport {
 
         let runtime = pyloop.borrow(py).get_runtime();
         let scheduler_tx = pyloop.borrow(py).scheduler_tx.clone();
+        // SPIKE (candidate #1): receiver + handlers so the io loop can run the callbacks
+        // that data_received just scheduled, in-place, without bouncing to the _run task.
+        let scheduler_rx = pyloop.borrow(py).scheduler_rx.clone();
+        let handlers = pyloop.borrow(py).loop_handlers();
+        let callback_lock = pyloop.borrow(py).callback_lock();
 
         let state_clone = state.clone();
         let io_task = runtime.spawn(async move {
-            Self::io_processing_loop(transport_clone, state_clone, protocol, resume_notify, write_notify, scheduler_tx).await;
+            Self::io_processing_loop(transport_clone, state_clone, protocol, resume_notify, write_notify, scheduler_tx, scheduler_rx, handlers, callback_lock).await;
         });
 
         {
@@ -185,6 +190,9 @@ impl TokioTCPTransport {
         resume_notify: Arc<Notify>,
         write_notify: Arc<Notify>,
         scheduler_tx: async_channel::Sender<ScheduledTask>,
+        scheduler_rx: async_channel::Receiver<ScheduledTask>,
+        handlers: LoopHandlers,
+        callback_lock: Arc<Mutex<()>>,
     ) {
         // 64KB read buffer — 8x fewer syscalls for large messages vs 8KB
         let mut read_buf = [0u8; 65536];
@@ -232,21 +240,67 @@ impl TokioTCPTransport {
                                 let mut state_lock = state.lock().unwrap();
                                 state_lock.read_eof = true;
                             }
+                            // eof_received is a protocol callback: run it under the
+                            // callback-executor lock so it never overlaps with other
+                            // callbacks (lock -> GIL order, matching _run).
+                            let _cb_guard = callback_lock.lock().unwrap();
                             Python::attach(|py| {
                                 let _ = protocol.call_method0(py, pyo3::intern!(py, "eof_received"));
                             });
                         }
                         Ok(n) => {
-                            // Pass the stack read buffer slice straight to PyBytes::new.
-                            // PyBytes::new copies into Python-managed memory, so no
-                            // intermediate Vec is needed — saves one heap alloc + memcpy
-                            // per read on the proto/create_server data_received path.
+                            // Hold the callback-executor lock across data_received AND the
+                            // in-batch drain, so protocol callbacks never overlap with other
+                            // callbacks. This is required on no-GIL (free-threading) builds:
+                            // data_received writes the connection's StreamReader, and without
+                            // the lock it could run on this io thread in parallel with that
+                            // connection's readline task running on _run — a data race on the
+                            // reader. The GIL hid this on default builds; the lock makes it
+                            // safe everywhere. Acquired before the GIL (lock -> GIL, matching
+                            // _run) so the blocking lock() can never deadlock; no .await is
+                            // held across the guard.
+                            let _cb_guard = callback_lock.lock().unwrap();
+                            let state = TEventLoopRunState {};
                             Python::attach(|py| {
+                                // Pass the stack read buffer slice straight to PyBytes::new.
+                                // PyBytes::new copies into Python-managed memory, so no
+                                // intermediate Vec is needed — saves one heap alloc + memcpy
+                                // per read on the proto/create_server data_received path.
                                 let _ = protocol.call_method1(
                                     py,
                                     pyo3::intern!(py, "data_received"),
                                     (PyBytes::new(py, &read_buf[..n]),)
                                 );
+
+                                // In-batch task execution (candidate #1).
+                                // data_received may have woken a Future (e.g. a parked
+                                // StreamReader.readline waiter), which schedules the user
+                                // task's __step via call_soon -> scheduler channel. Normally
+                                // the _run task picks that up on another worker thread, paying
+                                // a second GIL acquire + a cross-thread hop per message. Here we
+                                // drain those just-scheduled Immediate handles and run them in
+                                // THIS GIL hold on THIS thread, so readline returns and
+                                // writer.write fires before we release the GIL — mirroring the
+                                // proto path (data_received -> write in one attach). We already
+                                // hold callback_lock, so drain directly (no try_lock needed).
+                                let mut budget = 0u32;
+                                while let Ok(task) = scheduler_rx.try_recv() {
+                                    match task {
+                                        ScheduledTask::Immediate { handle } => {
+                                            if !handle.cancelled() {
+                                                let _ = handle.run(py, &handlers, &state);
+                                            }
+                                        }
+                                        other => {
+                                            // Timers / RecvReady belong to the _run loop.
+                                            let _ = scheduler_tx.try_send(other);
+                                        }
+                                    }
+                                    budget += 1;
+                                    if budget >= 256 {
+                                        break;
+                                    }
+                                }
                             });
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}

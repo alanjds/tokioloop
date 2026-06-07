@@ -117,7 +117,7 @@ impl LoopHandlers {
 pub struct TEventLoop {
     runtime: OnceLock<Arc<Runtime>>,
     pub(crate) scheduler_tx: async_channel::Sender<ScheduledTask>,
-    scheduler_rx: async_channel::Receiver<ScheduledTask>,
+    pub(crate) scheduler_rx: async_channel::Receiver<ScheduledTask>,
     counter_ready: atomic::AtomicUsize,
     closed: atomic::AtomicBool,
     stopping: Arc<atomic::AtomicBool>,
@@ -137,6 +137,13 @@ pub struct TEventLoop {
     // Persistent native sock workers: one long-lived task per fd, reused across calls.
     sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
     sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
+    // Callback-executor lock. Guarantees only one tokio task runs Python protocol code
+    // (scheduled callbacks AND data_received/eof_received) at a time — asyncio's "callbacks
+    // never overlap" invariant — even though `_run` and the per-connection io_processing_loops
+    // run Python on different worker threads. The GIL hid this on default builds; on no-GIL
+    // (free-threading) builds the lock is what actually serializes them. Always acquired
+    // before the GIL (lock -> GIL) by every holder, so blocking `lock()` can never deadlock.
+    callback_lock: Arc<Mutex<()>>,
 }
 
 impl TEventLoop {
@@ -149,6 +156,20 @@ impl TEventLoop {
                 self.exception_handler.read().unwrap().clone_ref(py),
             ),
         )
+    }
+
+    /// Shared callback-executor lock (see field docs). Cloned into io_processing_loop.
+    pub(crate) fn callback_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.callback_lock)
+    }
+
+    /// Build a `LoopHandlers` clone so other tokio tasks (e.g. the per-connection
+    /// io_processing_loop) can run scheduled handles in-place under their own GIL hold.
+    pub(crate) fn loop_handlers(&self) -> LoopHandlers {
+        LoopHandlers {
+            exc_handler: Arc::clone(&self.exc_handler),
+            exception_handler: Arc::clone(&self.exception_handler),
+        }
     }
 
     pub fn schedule0(&self, callback: Py<PyAny>, context: Option<Py<PyAny>>) -> Result<()> {
@@ -343,6 +364,7 @@ impl TEventLoop {
             io_writer_entries: Arc::new(papaya::HashMap::new()),
             sock_readers: Arc::new(papaya::HashMap::new()),
             sock_writers: Arc::new(papaya::HashMap::new()),
+            callback_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -428,6 +450,7 @@ impl TEventLoop {
         };
 
         let scheduler_rx = self.scheduler_rx.clone();
+        let callback_lock = Arc::clone(&self.callback_lock);
 
         let stopping_clone = Arc::clone(&self.stopping);
         let epoch = self.epoch;
@@ -541,6 +564,10 @@ impl TEventLoop {
                     if !current_handles.is_empty() || !ready_recvs.is_empty() {
                         let handlers = loop_handlers.clone();
                         let state = TEventLoopRunState {};
+                        // Hold the callback-executor lock so an io_processing_loop can't run
+                        // callbacks in-batch concurrently with this batch. Acquired before the
+                        // GIL to keep a consistent lock order (callback_lock -> GIL).
+                        let _cb_guard = callback_lock.lock().unwrap();
                         attach_blocking(|py| {
                             // Drain RecvReady items: recv directly into Python memory.
                             while let Some((fd, avail, nbytes, fut)) = ready_recvs.pop_front() {
@@ -605,6 +632,7 @@ impl TEventLoop {
                         if !current_handles.is_empty() || !ready_recvs.is_empty() {
                             let handlers = loop_handlers.clone();
                             let state = TEventLoopRunState {};
+                            let _cb_guard = callback_lock.lock().unwrap();
                             attach_blocking(|py| {
                                 while let Some((fd, avail, nbytes, fut)) = ready_recvs.pop_front() {
                                     if avail == 0 {
