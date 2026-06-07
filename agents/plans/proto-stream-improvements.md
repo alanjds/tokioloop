@@ -286,9 +286,13 @@ so it cannot starve the connection's own read/write loop. Note: `data_received` 
 on io threads without the lock — that overlap with scheduled callbacks is **pre-existing**
 tokioloop behaviour and unchanged by this work.
 
-**Remaining follow-ups (optional):** dedicated multi-connection ordering/stress tests; consider
-whether `data_received` should also run under the callback lock for strict asyncio semantics
-(separate, broader change); confirm behaviour on no-GIL (free-threading) builds.
+**Remaining follow-ups (optional):** ✅ multi-connection ordering/stress tests added
+(`tests/test_stream_stress.py` — concurrent tagged ping-pong, large multi-chunk payloads,
+pipelined-lines ordering, and an await-free shared-counter test that would expose overlapping
+callbacks; all run across asyncio/uvloop/rloop/TokioLoop and pass, so TokioLoop matches the
+reference loops exactly). Still open: consider whether `data_received` should also run under the
+callback lock for strict asyncio semantics (separate, broader change); confirm behaviour on
+no-GIL (free-threading) builds.
 
 ---
 
