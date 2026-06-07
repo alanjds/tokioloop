@@ -240,16 +240,32 @@ impl TokioTCPTransport {
                                 let mut state_lock = state.lock().unwrap();
                                 state_lock.read_eof = true;
                             }
+                            // eof_received is a protocol callback: run it under the
+                            // callback-executor lock so it never overlaps with other
+                            // callbacks (lock -> GIL order, matching _run).
+                            let _cb_guard = callback_lock.lock().unwrap();
                             Python::attach(|py| {
                                 let _ = protocol.call_method0(py, pyo3::intern!(py, "eof_received"));
                             });
                         }
                         Ok(n) => {
-                            // Pass the stack read buffer slice straight to PyBytes::new.
-                            // PyBytes::new copies into Python-managed memory, so no
-                            // intermediate Vec is needed — saves one heap alloc + memcpy
-                            // per read on the proto/create_server data_received path.
+                            // Hold the callback-executor lock across data_received AND the
+                            // in-batch drain, so protocol callbacks never overlap with other
+                            // callbacks. This is required on no-GIL (free-threading) builds:
+                            // data_received writes the connection's StreamReader, and without
+                            // the lock it could run on this io thread in parallel with that
+                            // connection's readline task running on _run — a data race on the
+                            // reader. The GIL hid this on default builds; the lock makes it
+                            // safe everywhere. Acquired before the GIL (lock -> GIL, matching
+                            // _run) so the blocking lock() can never deadlock; no .await is
+                            // held across the guard.
+                            let _cb_guard = callback_lock.lock().unwrap();
+                            let state = TEventLoopRunState {};
                             Python::attach(|py| {
+                                // Pass the stack read buffer slice straight to PyBytes::new.
+                                // PyBytes::new copies into Python-managed memory, so no
+                                // intermediate Vec is needed — saves one heap alloc + memcpy
+                                // per read on the proto/create_server data_received path.
                                 let _ = protocol.call_method1(
                                     py,
                                     pyo3::intern!(py, "data_received"),
@@ -265,35 +281,24 @@ impl TokioTCPTransport {
                                 // drain those just-scheduled Immediate handles and run them in
                                 // THIS GIL hold on THIS thread, so readline returns and
                                 // writer.write fires before we release the GIL — mirroring the
-                                // proto path (data_received -> write in one attach).
-                                //
-                                // Safety: the callback_lock guarantees callbacks never run on
-                                // two threads at once (asyncio's non-overlap invariant), even if
-                                // a callback releases the GIL mid-run. We already hold the GIL
-                                // here, so we must use try_lock (never block): if _run or another
-                                // io loop is executing callbacks, we skip the fast path and leave
-                                // the handles in the channel for _run — preserving FIFO via the
-                                // single active executor + FIFO channel, with no GIL<->lock
-                                // deadlock (lock order is GIL-then-try_lock, non-blocking).
-                                if let Ok(_cb_guard) = callback_lock.try_lock() {
-                                    let state = TEventLoopRunState {};
-                                    let mut budget = 0u32;
-                                    while let Ok(task) = scheduler_rx.try_recv() {
-                                        match task {
-                                            ScheduledTask::Immediate { handle } => {
-                                                if !handle.cancelled() {
-                                                    let _ = handle.run(py, &handlers, &state);
-                                                }
-                                            }
-                                            other => {
-                                                // Timers / RecvReady belong to the _run loop.
-                                                let _ = scheduler_tx.try_send(other);
+                                // proto path (data_received -> write in one attach). We already
+                                // hold callback_lock, so drain directly (no try_lock needed).
+                                let mut budget = 0u32;
+                                while let Ok(task) = scheduler_rx.try_recv() {
+                                    match task {
+                                        ScheduledTask::Immediate { handle } => {
+                                            if !handle.cancelled() {
+                                                let _ = handle.run(py, &handlers, &state);
                                             }
                                         }
-                                        budget += 1;
-                                        if budget >= 256 {
-                                            break;
+                                        other => {
+                                            // Timers / RecvReady belong to the _run loop.
+                                            let _ = scheduler_tx.try_send(other);
                                         }
+                                    }
+                                    budget += 1;
+                                    if budget >= 256 {
+                                        break;
                                     }
                                 }
                             });

@@ -137,11 +137,12 @@ pub struct TEventLoop {
     // Persistent native sock workers: one long-lived task per fd, reused across calls.
     sock_readers: Arc<papaya::HashMap<usize, async_channel::Sender<SockRecvMsg>>>,
     sock_writers: Arc<papaya::HashMap<usize, async_channel::Sender<SockSendMsg>>>,
-    // Callback-executor lock. Guarantees only one tokio task runs scheduled callbacks at a
-    // time (asyncio's "callbacks never overlap" invariant), even though `_run` and the
-    // per-connection io_processing_loops run Python on different worker threads and the GIL
-    // can be released mid-callback. `_run` holds it (blocking) around its batch; io loops
-    // `try_lock` it for in-batch execution and fall back to the scheduler channel if busy.
+    // Callback-executor lock. Guarantees only one tokio task runs Python protocol code
+    // (scheduled callbacks AND data_received/eof_received) at a time — asyncio's "callbacks
+    // never overlap" invariant — even though `_run` and the per-connection io_processing_loops
+    // run Python on different worker threads. The GIL hid this on default builds; on no-GIL
+    // (free-threading) builds the lock is what actually serializes them. Always acquired
+    // before the GIL (lock -> GIL) by every holder, so blocking `lock()` can never deadlock.
     callback_lock: Arc<Mutex<()>>,
 }
 
